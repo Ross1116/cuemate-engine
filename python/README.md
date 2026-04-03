@@ -39,6 +39,12 @@ Build the local TempoCNN Docker image used by the primary BPM backend:
 powershell -ExecutionPolicy Bypass -File .\scripts\build-tempocnn-image.ps1
 ```
 
+Optional: warm-start the persistent TempoCNN service container yourself. The CLI will auto-start it on demand too.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\start-tempocnn-service.ps1
+```
+
 The default TempoCNN graph expected by the CLI lives at `python/models/essentia/deepsquare-k16-3.pb`. Override it with `CUEMATE_TEMPOCNN_MODEL` or `--tempocnn-model` if you want to compare a different `.pb` model.
 
 ## CLI entrypoints
@@ -50,6 +56,8 @@ python -m cuemate_analysis import-playlist --name "My Playlist" .\path\to\audio
 python -m cuemate_analysis analyze-playlist --playlist "My Playlist" --analysis-mode full
 python -m cuemate_analysis analyze-playlist --playlist "My Playlist" --analysis-mode full --tempo-backend tempocnn --tempocnn-accelerator auto --force
 python -m cuemate_analysis analyze-playlist --playlist "My Playlist" --analysis-mode full --tempo-backend baseline --force
+python -m cuemate_analysis analyze-bpm "D:\path\to\track.wav"
+python -m cuemate_analysis analyze-bpm-playlist --playlist "My Playlist"
 python -m cuemate_analysis list-playlist --name "My Playlist"
 python -m cuemate_analysis show-track --track-id trk_example123
 ```
@@ -70,11 +78,15 @@ python -m cuemate_analysis compare-bpm "D:\path\to\track.wav" --tempocnn-model "
 Important notes:
 
 - `tempocnn` is now the primary BPM backend used by `analyze-playlist`
+- `analyze-bpm` and `analyze-bpm-playlist` are the intended BPM-only commands
+- `compare-bpm` remains available as a side-by-side diagnostic tool
 - if TempoCNN is unavailable for a track, analysis falls back to the current librosa baseline automatically and records `baseline_fallback` as the source
 - `benchmark-bpm` now defaults to `baseline,tempocnn`
 - TempoCNN now runs through Docker, and `--tempocnn-accelerator auto` will try GPU before falling back to CPU
 - TempoCNN now handles BPM only; key extraction is no longer part of the TempoCNN container path
-- playlist analysis and benchmarking batch TempoCNN tracks into one container run so the model only loads once per batch
+- `analyze-playlist` still uses the current local chroma-based key fallback; MusicalKeyCNN will be a separate worker later
+- repeated single-track requests now go through a warm TempoCNN service container when possible
+- playlist analysis and benchmarking batch TempoCNN tracks through that warm service so the model stays loaded
 - the default TempoCNN model shipped in the repo is `deepsquare-k16-3.pb`
 - the default local Docker image name is `cuemate-tempocnn:local`, and you can override it with `CUEMATE_TEMPOCNN_IMAGE`
 - if Docker cannot expose a usable GPU cleanly, the TempoCNN notes will say it retried on CPU

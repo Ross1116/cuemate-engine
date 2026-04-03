@@ -84,6 +84,12 @@ Build the local TempoCNN Docker image used by the primary BPM backend:
 powershell -ExecutionPolicy Bypass -File .\scripts\build-tempocnn-image.ps1
 ```
 
+Optional: warm-start the persistent TempoCNN service container yourself. The CLI will auto-start it on demand too.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\start-tempocnn-service.ps1
+```
+
 ## Milestone 1 CLI
 
 Import a local playlist or crate:
@@ -112,6 +118,15 @@ Inspect one analyzed track:
 python -m cuemate_analysis show-track --track-id trk_example123
 ```
 
+Analyze BPM only for one file or an imported playlist:
+
+```powershell
+python -m cuemate_analysis analyze-bpm "D:\path\to\track.wav"
+python -m cuemate_analysis analyze-bpm "D:\path\to\track.wav" --backend baseline
+python -m cuemate_analysis analyze-bpm-playlist --playlist "Fred again"
+python -m cuemate_analysis analyze-bpm-playlist --playlist "Fred again" --limit 5 --output .\data\benchmarks\fred-again-bpm.csv
+```
+
 Compare the current fallback baseline against the primary TempoCNN backend on one file:
 
 ```powershell
@@ -132,7 +147,11 @@ TempoCNN is now the primary tempo path for comparison, benchmarking, and persist
 Speed notes:
 
 - TempoCNN is now used for BPM only; key extraction is no longer part of the TempoCNN Docker path
-- playlist analysis and `benchmark-bpm` batch TempoCNN tracks into one container run, so the model only loads once per batch
+- `analyze-playlist` still derives keys from the current local chroma-based fallback; MusicalKeyCNN will replace that later
+- `analyze-bpm` and `analyze-bpm-playlist` are the intended BPM-only commands
+- `compare-bpm` is the debugging/benchmark command when you want to compare baseline vs TempoCNN directly
+- single-track comparisons now use a warm TempoCNN service container when available, so repeated checks avoid model/container cold starts
+- playlist analysis and `benchmark-bpm` batch TempoCNN tracks into the warm service path, so the model only loads once and stays hot
 - the host-side analyzer still computes the remaining absolute features locally with `librosa`
 
 Manual Docker debug for one track:

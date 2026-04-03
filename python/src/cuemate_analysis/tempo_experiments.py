@@ -7,6 +7,8 @@ from pathlib import Path
 import subprocess
 import time
 from typing import Any
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 import librosa
 
@@ -17,6 +19,8 @@ from cuemate_analysis.config import RuntimeSettings
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_TEMPOCNN_MODEL = REPO_ROOT / "python" / "models" / "essentia" / "deepsquare-k16-3.pb"
 DEFAULT_TEMPOCNN_IMAGE = "cuemate-tempocnn:local"
+DEFAULT_TEMPOCNN_SERVICE_NAME = "cuemate-tempocnn-service"
+DEFAULT_TEMPOCNN_SERVICE_PORT = 47831
 TEMPO_BACKEND_BASELINE = "baseline"
 TEMPO_BACKEND_TEMPOCNN = "tempocnn"
 TEMPO_BACKEND_CHOICES = {TEMPO_BACKEND_BASELINE, TEMPO_BACKEND_TEMPOCNN}
@@ -64,6 +68,22 @@ def resolve_tempocnn_image_name(image_name: str | None = None) -> str:
     return clean
 
 
+def resolve_tempocnn_service_name(service_name: str | None = None) -> str:
+    raw_value = service_name or os.getenv("CUEMATE_TEMPOCNN_SERVICE_NAME") or DEFAULT_TEMPOCNN_SERVICE_NAME
+    clean = raw_value.strip()
+    if not clean:
+        raise ValueError("TempoCNN service name cannot be empty.")
+    return clean
+
+
+def resolve_tempocnn_service_port(port: int | str | None = None) -> int:
+    raw_value = port or os.getenv("CUEMATE_TEMPOCNN_SERVICE_PORT") or DEFAULT_TEMPOCNN_SERVICE_PORT
+    value = int(raw_value)
+    if value <= 0:
+        raise ValueError("TempoCNN service port must be a positive integer.")
+    return value
+
+
 def normalize_accelerator_choice(value: str | None) -> str:
     choice = (value or "auto").strip().lower()
     if choice not in TEMPOCNN_ACCELERATOR_CHOICES:
@@ -102,6 +122,16 @@ def summarize_stderr(stderr: str, *, max_lines: int = 8) -> str:
     trimmed = lines[:max_lines]
     trimmed.append(f"... ({len(lines) - max_lines} more lines omitted)")
     return "\n".join(trimmed)
+
+
+def windows_path_to_container_path(path: Path) -> str:
+    resolved = path.resolve()
+    drive = resolved.drive.rstrip(":").lower()
+    if not drive:
+        raise ValueError(f"Expected a Windows drive path, got: {resolved}")
+    posix_path = resolved.as_posix()
+    tail = posix_path[2:] if len(posix_path) >= 2 and posix_path[1] == ":" else posix_path
+    return f"/host/{drive}{tail}"
 
 
 def docker_volume_spec(path: Path, container_path: str, *, read_only: bool = True) -> str:
@@ -218,6 +248,59 @@ def build_tempocnn_batch_docker_command(
     return command, container_paths
 
 
+def build_tempocnn_service_run_command(
+    drive_letters: list[str],
+    *,
+    image_name: str | None = None,
+    service_name: str | None = None,
+    service_port: int | str | None = None,
+    accelerator: str = "auto",
+) -> list[str]:
+    resolved_image_name = resolve_tempocnn_image_name(image_name)
+    resolved_service_name = resolve_tempocnn_service_name(service_name)
+    resolved_service_port = resolve_tempocnn_service_port(service_port)
+    resolved_accelerator = normalize_accelerator_choice(accelerator)
+
+    command = [
+        "docker",
+        "run",
+        "-d",
+        "--rm",
+        "--name",
+        resolved_service_name,
+        "--publish",
+        f"127.0.0.1:{resolved_service_port}:{resolved_service_port}",
+        "--env",
+        f"TEMPOCNN_SERVICE_PORT={resolved_service_port}",
+        "--env",
+        "TF_CPP_MIN_LOG_LEVEL=3",
+        "--env",
+        "CUEMATE_TEMPOCNN_DEFAULT_MODEL=/workspace/python/models/essentia/deepsquare-k16-3.pb",
+        "--volume",
+        f"{os.fspath(REPO_ROOT.resolve())}:/workspace:ro",
+    ]
+    if resolved_accelerator == "auto":
+        command.extend(["--gpus", "all"])
+    else:
+        command.extend(["--env", "CUDA_VISIBLE_DEVICES=-1"])
+    for drive in sorted({letter.lower() for letter in drive_letters}):
+        source = f"{drive.upper()}:\\"
+        command.extend(
+            [
+                "--mount",
+                f"type=bind,source={source},target=/host/{drive},readonly",
+            ]
+        )
+    command.extend(
+        [
+            resolved_image_name,
+            "python",
+            "/workspace/docker/tempocnn/service.py",
+        ]
+    )
+    return command
+
+
 def run_docker_command(command: list[str], *, timeout: int = 240) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         command,
@@ -226,6 +309,118 @@ def run_docker_command(command: list[str], *, timeout: int = 240) -> subprocess.
         timeout=timeout,
         check=False,
     )
+
+
+def inspect_docker_container(name: str) -> dict[str, Any] | None:
+    completed = run_docker_command(["docker", "inspect", name], timeout=30)
+    if completed.returncode != 0:
+        return None
+    try:
+        payload = json.loads(completed.stdout)
+    except Exception:
+        return None
+    if not payload:
+        return None
+    return payload[0]
+
+
+def remove_docker_container(name: str) -> None:
+    run_docker_command(["docker", "rm", "-f", name], timeout=30)
+
+
+def service_container_matches(
+    details: dict[str, Any],
+    *,
+    drive_letters: list[str],
+    image_name: str,
+) -> bool:
+    if not details.get("State", {}).get("Running"):
+        return False
+    image = str(details.get("Config", {}).get("Image") or "")
+    if image != image_name:
+        return False
+    mounts = details.get("Mounts", [])
+    targets = {str(item.get("Destination") or "") for item in mounts}
+    required_targets = {"/workspace", *{f"/host/{drive.lower()}" for drive in drive_letters}}
+    return required_targets.issubset(targets)
+
+
+def wait_for_tempocnn_service_health(service_port: int, *, timeout_seconds: float = 20.0) -> tuple[bool, str]:
+    health_url = f"http://127.0.0.1:{service_port}/health"
+    deadline = time.time() + timeout_seconds
+    last_error = "service health check timed out"
+    while time.time() < deadline:
+        try:
+            with urllib_request.urlopen(health_url, timeout=3) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            if payload.get("status") == "ok":
+                return True, ""
+            last_error = f"unexpected health payload: {payload}"
+        except Exception as exc:
+            last_error = str(exc)
+        time.sleep(0.5)
+    return False, last_error
+
+
+def ensure_tempocnn_service(
+    *,
+    drive_letters: list[str],
+    image_name: str,
+    accelerator: str,
+    service_name: str,
+    service_port: int,
+) -> tuple[bool, list[str]]:
+    details = inspect_docker_container(service_name)
+    if details is not None and service_container_matches(details, drive_letters=drive_letters, image_name=image_name):
+        healthy, health_error = wait_for_tempocnn_service_health(service_port)
+        if healthy:
+            return True, []
+        remove_docker_container(service_name)
+    if details is not None:
+        remove_docker_container(service_name)
+
+    command = build_tempocnn_service_run_command(
+        drive_letters,
+        image_name=image_name,
+        service_name=service_name,
+        service_port=service_port,
+        accelerator=accelerator,
+    )
+    completed = run_docker_command(command, timeout=120)
+    if completed.returncode != 0:
+        notes = [f"TempoCNN service start failed with exit code {completed.returncode}."]
+        if completed.stderr.strip():
+            notes.append(summarize_stderr(completed.stderr))
+        return False, notes
+
+    healthy, health_error = wait_for_tempocnn_service_health(service_port)
+    if healthy:
+        return True, []
+    return False, [f"TempoCNN service did not become healthy: {health_error}"]
+
+
+def request_tempocnn_service(
+    *,
+    service_port: int,
+    track_paths: list[str],
+    model_path: str,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    request_body = json.dumps({"tracks": track_paths, "model_path": model_path}).encode("utf-8")
+    request = urllib_request.Request(
+        f"http://127.0.0.1:{service_port}/analyze-bpm",
+        data=request_body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib_request.urlopen(request, timeout=max(30, len(track_paths) * 15)) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        return payload, []
+    except urllib_error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        return None, [f"TempoCNN service request failed with HTTP {exc.code}.", body]
+    except Exception as exc:
+        return None, [f"TempoCNN service request failed: {exc}"]
 
 
 def should_retry_on_cpu(stderr: str) -> bool:
@@ -354,6 +549,74 @@ def estimate_tempocnn_bpms(
         accelerator=resolved_accelerator,
     )
 
+    service_notes: list[str] = []
+    model_service_mounts, container_model_path = container_path_for_model(resolved_model_path)
+    use_service = resolved_accelerator == "auto" and not model_service_mounts
+    if use_service:
+        try:
+            service_started = time.perf_counter()
+            container_track_paths = {
+                path: windows_path_to_container_path(path)
+                for path in resolved_paths
+            }
+            service_name = resolve_tempocnn_service_name(None)
+            service_port = resolve_tempocnn_service_port(None)
+            drive_letters = [path.drive.rstrip(":").lower() for path in [*resolved_paths, resolved_model_path]]
+            service_ready, startup_notes = ensure_tempocnn_service(
+                drive_letters=drive_letters,
+                image_name=resolved_image_name,
+                accelerator=resolved_accelerator,
+                service_name=service_name,
+                service_port=service_port,
+            )
+            if service_ready:
+                service_payload, service_error_notes = request_tempocnn_service(
+                    service_port=service_port,
+                    track_paths=[container_track_paths[path] for path in resolved_paths],
+                    model_path=container_model_path,
+                )
+                if service_payload is not None:
+                    service_elapsed_ms = round((time.perf_counter() - service_started) * 1000.0, 1)
+                    tf_physical_gpu_count = service_payload.get("tf_physical_gpu_count")
+                    tf_logical_gpu_count = service_payload.get("tf_logical_gpu_count")
+                    batch_results = {
+                        item.get("track_path"): item for item in service_payload.get("results", [])
+                    }
+                    return {
+                        path: (
+                            build_tempocnn_unavailable_estimate(
+                                elapsed_ms=service_elapsed_ms / max(len(resolved_paths), 1),
+                                notes=["TempoCNN service did not return a result for this track."],
+                            )
+                            if batch_results.get(container_track_paths[path]) is None
+                            else (
+                                build_tempocnn_unavailable_estimate(
+                                    elapsed_ms=service_elapsed_ms / max(len(resolved_paths), 1),
+                                    notes=[f"TempoCNN service failed for this track: {batch_results[container_track_paths[path]]['error']}"],
+                                )
+                                if batch_results[container_track_paths[path]].get("error")
+                                else build_tempocnn_success_estimate(
+                                    {
+                                        **dict(batch_results[container_track_paths[path]]),
+                                        "tf_physical_gpu_count": tf_physical_gpu_count,
+                                        "tf_logical_gpu_count": tf_logical_gpu_count,
+                                    },
+                                    elapsed_ms=service_elapsed_ms / max(len(resolved_paths), 1),
+                                    model_path=resolved_model_path,
+                                    image_name=resolved_image_name,
+                                    notes=["Warm Docker service path."],
+                                    batch_size=len(resolved_paths),
+                                )
+                            )
+                        )
+                        for path in resolved_paths
+                    }
+                service_notes.extend(service_error_notes)
+            else:
+                service_notes.extend(startup_notes)
+        except Exception as exc:
+            service_notes.append(f"TempoCNN service path was unavailable: {exc}")
+
     fallback_note: str | None = None
     try:
         completed = run_docker_command(command, timeout=max(240, len(resolved_paths) * 30))
@@ -425,6 +688,7 @@ def estimate_tempocnn_bpms(
         item_notes: list[str] = []
         if fallback_note:
             item_notes.append(fallback_note)
+        item_notes.extend(service_notes)
         item_notes.append(f"Batch run size: {len(resolved_paths)} track(s).")
         result_map[path] = build_tempocnn_success_estimate(
             item_payload,

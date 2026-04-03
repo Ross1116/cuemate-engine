@@ -6,9 +6,13 @@ from cuemate_analysis.tempo_experiments import (
     TEMPO_BACKEND_TEMPOCNN,
     build_tempocnn_batch_docker_command,
     build_tempocnn_docker_command,
+    build_tempocnn_service_run_command,
     normalize_tempo_backend,
     resolve_tempocnn_image_name,
+    resolve_tempocnn_service_name,
+    resolve_tempocnn_service_port,
     resolve_tempocnn_model_path,
+    windows_path_to_container_path,
 )
 
 
@@ -63,6 +67,14 @@ def test_resolve_tempocnn_image_name_prefers_env_var(monkeypatch) -> None:
     assert resolve_tempocnn_image_name() == "cuemate-tempocnn:gpu"
 
 
+def test_resolve_tempocnn_service_defaults(monkeypatch) -> None:
+    monkeypatch.delenv("CUEMATE_TEMPOCNN_SERVICE_NAME", raising=False)
+    monkeypatch.delenv("CUEMATE_TEMPOCNN_SERVICE_PORT", raising=False)
+
+    assert resolve_tempocnn_service_name() == "cuemate-tempocnn-service"
+    assert resolve_tempocnn_service_port() == 47831
+
+
 def test_build_tempocnn_docker_command_mounts_external_model(tmp_path: Path) -> None:
     track_path = tmp_path / "track.flac"
     model_path = tmp_path / "custom.pb"
@@ -102,3 +114,27 @@ def test_build_tempocnn_batch_docker_command_mounts_multiple_track_directories(t
     assert container_paths[track_a.resolve()].startswith("/input/")
     assert container_paths[track_b.resolve()].startswith("/input/")
     assert container_paths[track_a.resolve()] != container_paths[track_b.resolve()]
+
+
+def test_windows_path_to_container_path_maps_drive_root() -> None:
+    path = Path("D:/Personal Projects/Music/example.wav")
+
+    assert windows_path_to_container_path(path) == "/host/d/Personal Projects/Music/example.wav"
+
+
+def test_build_tempocnn_service_run_command_includes_drive_mounts() -> None:
+    command = build_tempocnn_service_run_command(
+        ["d", "e"],
+        image_name="cuemate-tempocnn:test",
+        service_name="cuemate-tempocnn-service-test",
+        service_port=49000,
+        accelerator="auto",
+    )
+
+    command_text = " ".join(command)
+    assert "cuemate-tempocnn:test" in command
+    assert "--gpus" in command
+    assert "127.0.0.1:49000:49000" in command_text
+    assert "target=/host/d" in command_text
+    assert "target=/host/e" in command_text
+    assert "/workspace/docker/tempocnn/service.py" in command

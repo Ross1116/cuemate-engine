@@ -13,10 +13,13 @@ from cuemate_analysis.config import load_runtime_settings
 from cuemate_analysis.database import Database
 from cuemate_analysis.ingest import discover_audio_files, make_playlist_id, read_track_metadata
 from cuemate_analysis.tempo_experiments import (
+    TEMPO_BACKEND_BASELINE,
+    TEMPO_BACKEND_TEMPOCNN,
     TempoEstimate,
     estimate_baseline_bpm,
-    estimate_beatnet_bpm,
-    estimate_essentia_wsl_bpm,
+    estimate_tempocnn_bpm,
+    normalize_tempo_backend,
+    resolve_tempocnn_model_path,
 )
 
 
@@ -24,22 +27,36 @@ def build_effective_analysis_signature(
     base_signature: str,
     *,
     tempo_backend: str,
-    beatnet_model: int,
+    tempocnn_model: str | None = None,
+    tempocnn_accelerator: str = "auto",
 ) -> str:
-    if tempo_backend == "baseline":
+    normalized_backend = normalize_tempo_backend(tempo_backend)
+    if normalized_backend == TEMPO_BACKEND_BASELINE:
         return base_signature
-    return f"{base_signature}-tempo-{tempo_backend}-m{beatnet_model}"
+    model_name = resolve_tempocnn_model_path(tempocnn_model).stem
+    return f"{base_signature}-tempo-{normalized_backend}-{model_name}-{tempocnn_accelerator}"
+
+
+def parse_tempo_backend(raw: str) -> str:
+    try:
+        return normalize_tempo_backend(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def parse_backend_list(raw: str) -> list[str]:
     backends = [item.strip() for item in raw.split(",") if item.strip()]
-    allowed = {"baseline", "beatnet", "essentia_wsl"}
-    invalid = [item for item in backends if item not in allowed]
-    if invalid:
-        raise argparse.ArgumentTypeError(f"Unsupported backends: {', '.join(invalid)}")
     if not backends:
         raise argparse.ArgumentTypeError("At least one backend must be selected.")
-    return backends
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for backend in backends:
+        canonical_backend = parse_tempo_backend(backend)
+        if canonical_backend in seen:
+            continue
+        seen.add(canonical_backend)
+        normalized.append(canonical_backend)
+    return normalized
 
 
 def summarize_estimate(estimate: TempoEstimate) -> str:
@@ -56,15 +73,17 @@ def run_selected_backend(
     path: Path,
     settings,
     *,
-    beatnet_model: int,
+    tempocnn_model: str | None = None,
+    tempocnn_accelerator: str = "auto",
 ) -> TempoEstimate:
-    if backend == "baseline":
+    normalized_backend = normalize_tempo_backend(backend)
+    if normalized_backend == TEMPO_BACKEND_BASELINE:
         return estimate_baseline_bpm(path, settings)
-    if backend == "beatnet":
-        return estimate_beatnet_bpm(path, model=beatnet_model)
-    if backend == "essentia_wsl":
-        return estimate_essentia_wsl_bpm(path)
-    raise ValueError(f"Unsupported backend: {backend}")
+    return estimate_tempocnn_bpm(
+        path,
+        model_path=tempocnn_model,
+        accelerator=tempocnn_accelerator,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -103,16 +122,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     analyze_parser.add_argument(
         "--tempo-backend",
-        choices=["baseline", "beatnet"],
-        default="baseline",
-        help="Tempo detector backend to use for BPM estimation.",
+        type=parse_tempo_backend,
+        default=TEMPO_BACKEND_TEMPOCNN,
+        help="Tempo backend to use: tempocnn or baseline. Default: tempocnn.",
     )
     analyze_parser.add_argument(
-        "--beatnet-model",
-        type=int,
-        choices=[1, 2, 3],
-        default=1,
-        help="BeatNet model to use when --tempo-backend beatnet is selected.",
+        "--tempocnn-model",
+        help=(
+            "Optional Windows path to a TempoCNN .pb model. "
+            "Defaults to python/models/essentia/deepsquare-k16-3.pb or "
+            "CUEMATE_TEMPOCNN_MODEL if set."
+        ),
+    )
+    analyze_parser.add_argument(
+        "--tempocnn-accelerator",
+        choices=["auto", "cpu"],
+        default="auto",
+        help="WSL TempoCNN accelerator preference. Default: auto.",
     )
 
     list_parser = subparsers.add_parser(
@@ -129,20 +155,27 @@ def build_parser() -> argparse.ArgumentParser:
 
     compare_parser = subparsers.add_parser(
         "compare-bpm",
-        help="Compare the current BPM detector against experimental backends on one file.",
+        help="Compare baseline BPM detection against the primary TempoCNN backend on one file.",
     )
     compare_parser.add_argument("path", help="Audio file to analyze.")
-    compare_parser.add_argument(
-        "--beatnet-model",
-        type=int,
-        choices=[1, 2, 3],
-        default=1,
-        help="BeatNet model to use when BeatNet is available.",
-    )
     compare_parser.add_argument(
         "--json",
         action="store_true",
         help="Emit the comparison payload as JSON.",
+    )
+    compare_parser.add_argument(
+        "--tempocnn-model",
+        help=(
+            "Optional Windows path to a TempoCNN .pb model. "
+            "Defaults to python/models/essentia/deepsquare-k16-3.pb or "
+            "CUEMATE_TEMPOCNN_MODEL if set."
+        ),
+    )
+    compare_parser.add_argument(
+        "--tempocnn-accelerator",
+        choices=["auto", "cpu"],
+        default="auto",
+        help="WSL TempoCNN accelerator preference. Default: auto.",
     )
 
     benchmark_parser = subparsers.add_parser(
@@ -153,15 +186,8 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark_parser.add_argument(
         "--backends",
         type=parse_backend_list,
-        default=["baseline", "essentia_wsl"],
-        help="Comma-separated backend list. Default: baseline,essentia_wsl",
-    )
-    benchmark_parser.add_argument(
-        "--beatnet-model",
-        type=int,
-        choices=[1, 2, 3],
-        default=1,
-        help="BeatNet model to use when beatnet is included.",
+        default=[TEMPO_BACKEND_BASELINE, TEMPO_BACKEND_TEMPOCNN],
+        help="Comma-separated backend list. Default: baseline,tempocnn",
     )
     benchmark_parser.add_argument(
         "--limit",
@@ -172,6 +198,20 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark_parser.add_argument(
         "--output",
         help="Optional output path for a CSV report.",
+    )
+    benchmark_parser.add_argument(
+        "--tempocnn-model",
+        help=(
+            "Optional Windows path to a TempoCNN .pb model. "
+            "Defaults to python/models/essentia/deepsquare-k16-3.pb or "
+            "CUEMATE_TEMPOCNN_MODEL if set."
+        ),
+    )
+    benchmark_parser.add_argument(
+        "--tempocnn-accelerator",
+        choices=["auto", "cpu"],
+        default="auto",
+        help="WSL TempoCNN accelerator preference. Default: auto.",
     )
 
     return parser
@@ -204,7 +244,8 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
     effective_analysis_signature = build_effective_analysis_signature(
         settings.analysis_signature,
         tempo_backend=args.tempo_backend,
-        beatnet_model=args.beatnet_model,
+        tempocnn_model=args.tempocnn_model,
+        tempocnn_accelerator=args.tempocnn_accelerator,
     )
 
     with Database(settings.database_path) as database:
@@ -249,7 +290,8 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
                             "analysis_signature": effective_analysis_signature,
                             "config_signature": settings.config_signature,
                             "tempo_backend": args.tempo_backend,
-                            "beatnet_model": args.beatnet_model,
+                            "tempocnn_model": args.tempocnn_model,
+                            "tempocnn_accelerator": args.tempocnn_accelerator,
                             "skipped": True,
                         },
                         utc_now(),
@@ -264,7 +306,8 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
                     settings,
                     args.analysis_mode,
                     tempo_backend=args.tempo_backend,
-                    beatnet_model=args.beatnet_model,
+                    tempocnn_model=args.tempocnn_model,
+                    tempocnn_accelerator=args.tempocnn_accelerator,
                     analysis_signature=effective_analysis_signature,
                 )
                 database.upsert_track_features(result)
@@ -277,7 +320,8 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
                         "analysis_signature": effective_analysis_signature,
                         "config_signature": settings.config_signature,
                         "tempo_backend": args.tempo_backend,
-                        "beatnet_model": args.beatnet_model,
+                        "tempocnn_model": args.tempocnn_model,
+                        "tempocnn_accelerator": args.tempocnn_accelerator,
                     },
                     utc_now(),
                 )
@@ -332,8 +376,11 @@ def handle_compare_bpm(args: argparse.Namespace) -> int:
 
     metadata = read_track_metadata(path)
     baseline = estimate_baseline_bpm(path, settings)
-    beatnet = estimate_beatnet_bpm(path, model=args.beatnet_model)
-    essentia_wsl = estimate_essentia_wsl_bpm(path)
+    tempocnn = estimate_tempocnn_bpm(
+        path,
+        model_path=args.tempocnn_model,
+        accelerator=args.tempocnn_accelerator,
+    )
 
     payload = {
         "file_path": path.as_posix(),
@@ -341,8 +388,7 @@ def handle_compare_bpm(args: argparse.Namespace) -> int:
         "artist": metadata.artist,
         "tagged_bpm": metadata.bpm_tag,
         "baseline": baseline.to_payload(),
-        "beatnet": beatnet.to_payload(),
-        "essentia_wsl": essentia_wsl.to_payload(),
+        "tempocnn": tempocnn.to_payload(),
     }
 
     if args.json:
@@ -353,25 +399,16 @@ def handle_compare_bpm(args: argparse.Namespace) -> int:
     print(f"Track: {metadata.artist or 'Unknown artist'} - {metadata.title or path.stem}")
     print(f"Tagged BPM: {metadata.bpm_tag if metadata.bpm_tag is not None else 'none'}")
     print(f"Baseline: {summarize_estimate(baseline)} (confidence {baseline.confidence:.2f})")
-    if beatnet.available and beatnet.bpm is not None and beatnet.confidence is not None:
+    if tempocnn.available and tempocnn.bpm is not None and tempocnn.confidence is not None:
         print(
-            f"BeatNet: {summarize_estimate(beatnet)} "
-            f"(confidence {beatnet.confidence:.2f}, beats {beatnet.details['beat_count']})"
+            f"TempoCNN: {summarize_estimate(tempocnn)} "
+            f"(confidence {tempocnn.confidence:.2f}, "
+            f"key {tempocnn.details['key']} {tempocnn.details['scale']})"
         )
     else:
-        print(f"BeatNet: {summarize_estimate(beatnet)}")
-    if essentia_wsl.available and essentia_wsl.bpm is not None and essentia_wsl.confidence is not None:
-        print(
-            f"Essentia WSL: {summarize_estimate(essentia_wsl)} "
-            f"(score {essentia_wsl.confidence:.2f}, "
-            f"key {essentia_wsl.details['key']} {essentia_wsl.details['scale']})"
-        )
-    else:
-        print(f"Essentia WSL: {summarize_estimate(essentia_wsl)}")
+        print(f"TempoCNN: {summarize_estimate(tempocnn)}")
 
-    for note in beatnet.notes:
-        print(f"- {note}")
-    for note in essentia_wsl.notes:
+    for note in tempocnn.notes:
         print(f"- {note}")
     return 0
 
@@ -408,17 +445,19 @@ def handle_benchmark_bpm(args: argparse.Namespace) -> int:
                 backend,
                 path,
                 settings,
-                beatnet_model=args.beatnet_model,
+                tempocnn_model=args.tempocnn_model,
+                tempocnn_accelerator=args.tempocnn_accelerator,
             )
             row_payload[f"{backend}_available"] = estimate.available
             row_payload[f"{backend}_bpm"] = estimate.bpm
             row_payload[f"{backend}_confidence"] = estimate.confidence
             row_payload[f"{backend}_elapsed_ms"] = estimate.elapsed_ms
             row_payload[f"{backend}_notes"] = " | ".join(estimate.notes)
-            if backend == "essentia_wsl":
+            if backend == TEMPO_BACKEND_TEMPOCNN:
                 row_payload[f"{backend}_key"] = estimate.details.get("key")
                 row_payload[f"{backend}_scale"] = estimate.details.get("scale")
                 row_payload[f"{backend}_key_strength"] = estimate.details.get("key_strength")
+                row_payload[f"{backend}_model_name"] = estimate.details.get("model_name")
             line_parts.append(f"{backend}={summarize_estimate(estimate)}")
 
         report_rows.append(row_payload)
@@ -433,7 +472,9 @@ def handle_benchmark_bpm(args: argparse.Namespace) -> int:
             summary.append(f"{backend}: no successful runs")
             continue
         avg_elapsed = sum(float(row[f"{backend}_elapsed_ms"]) for row in successful) / len(successful)
-        avg_bpm = sum(float(row[f"{backend}_bpm"]) for row in successful if row.get(f"{backend}_bpm") is not None) / len(successful)
+        avg_bpm = sum(
+            float(row[f"{backend}_bpm"]) for row in successful if row.get(f"{backend}_bpm") is not None
+        ) / len(successful)
         summary.append(
             f"{backend}: {len(successful)}/{len(report_rows)} ok, avg {avg_bpm:.1f} BPM, avg {avg_elapsed:.1f} ms"
         )

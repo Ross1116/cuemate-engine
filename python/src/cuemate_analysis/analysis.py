@@ -168,25 +168,40 @@ def resolve_bpm_with_backend(
     sr: int,
     *,
     tempo_backend: str,
-    beatnet_model: int,
+    tempocnn_model: str | None = None,
+    tempocnn_accelerator: str = "auto",
 ) -> dict[str, float | str]:
     if tempo_backend == "baseline":
         return resolve_bpm(track.bpm_tag, detect_bpm(y, sr), detected_source="detected")
 
-    if tempo_backend == "beatnet":
-        from cuemate_analysis.tempo_experiments import estimate_beatnet_bpm
+    from cuemate_analysis.tempo_experiments import (
+        TEMPO_BACKEND_TEMPOCNN,
+        estimate_tempocnn_bpm,
+        normalize_tempo_backend,
+    )
 
-        estimate = estimate_beatnet_bpm(track.file_path, model=beatnet_model)
-        if not estimate.available or estimate.bpm is None:
-            detail = estimate.notes[0] if estimate.notes else "BeatNet tempo estimation failed."
-            raise ValueError(detail)
+    normalized_backend = normalize_tempo_backend(tempo_backend)
+    if normalized_backend != TEMPO_BACKEND_TEMPOCNN:
+        raise ValueError(f"Unsupported tempo backend: {tempo_backend}")
+
+    estimate = estimate_tempocnn_bpm(
+        track.file_path,
+        model_path=tempocnn_model,
+        accelerator=tempocnn_accelerator,
+    )
+    if estimate.available and estimate.bpm is not None:
         return resolve_bpm(
             track.bpm_tag,
             {"bpm": float(estimate.bpm), "bpm_confidence": float(estimate.confidence or 0.0)},
-            detected_source="beatnet",
+            detected_source="tempocnn",
         )
 
-    raise ValueError(f"Unsupported tempo backend: {tempo_backend}")
+    baseline = detect_bpm(y, sr)
+    return resolve_bpm(
+        track.bpm_tag,
+        baseline,
+        detected_source="baseline_fallback",
+    )
 
 
 def detect_key(y: np.ndarray, sr: int) -> dict[str, str | int | float]:
@@ -320,8 +335,9 @@ def analyze_track(
     settings: RuntimeSettings,
     analysis_mode: str,
     *,
-    tempo_backend: str = "baseline",
-    beatnet_model: int = 1,
+    tempo_backend: str = "tempocnn",
+    tempocnn_model: str | None = None,
+    tempocnn_accelerator: str = "auto",
     analysis_signature: str | None = None,
 ) -> AnalysisResult:
     y, sr = librosa.load(
@@ -337,7 +353,8 @@ def analyze_track(
         y,
         sr,
         tempo_backend=tempo_backend,
-        beatnet_model=beatnet_model,
+        tempocnn_model=tempocnn_model,
+        tempocnn_accelerator=tempocnn_accelerator,
     )
     key = resolve_key(track.key_tag, detect_key(y, sr))
     energy = extract_energy(y)

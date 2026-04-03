@@ -23,11 +23,6 @@ dependencies = [
 cuemate-analysis = "cuemate_analysis.cli:main"
 
 [project.optional-dependencies]
-experiments = [
-  "BeatNet",
-  "madmom-prebuilt",
-  "PyAudio",
-]
 dev = [
   "grpcio-tools",
   "pytest",

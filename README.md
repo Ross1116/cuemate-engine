@@ -78,6 +78,13 @@ Install the Python analysis CLI in editable mode:
 python -m pip install --user -e ".\python[dev]"
 ```
 
+Optional WSL-side Essentia setup for experimental tempo comparisons:
+
+```powershell
+wsl.exe python3 -m pip install essentia essentia-tensorflow
+wsl.exe python3 -m pip install "tensorflow[and-cuda]"
+```
+
 ## Milestone 1 CLI
 
 Import a local playlist or crate:
@@ -90,7 +97,8 @@ Analyze imported tracks with absolute features only:
 
 ```powershell
 python -m cuemate_analysis analyze-playlist --playlist "My Playlist" --analysis-mode full
-python -m cuemate_analysis analyze-playlist --playlist "My Playlist" --analysis-mode full --tempo-backend beatnet --force
+python -m cuemate_analysis analyze-playlist --playlist "My Playlist" --analysis-mode full --tempo-backend tempocnn --tempocnn-accelerator auto --force
+python -m cuemate_analysis analyze-playlist --playlist "My Playlist" --analysis-mode full --tempo-backend baseline --force
 ```
 
 Inspect playlist analysis state:
@@ -105,21 +113,29 @@ Inspect one analyzed track:
 python -m cuemate_analysis show-track --track-id trk_example123
 ```
 
-Compare the current BPM detector against the experimental BeatNet backend on one file:
+Compare the current fallback baseline against the primary TempoCNN backend on one file:
 
 ```powershell
 python -m cuemate_analysis compare-bpm "D:\path\to\track.wav"
 python -m cuemate_analysis compare-bpm "D:\path\to\track.wav" --json
+python -m cuemate_analysis compare-bpm "D:\path\to\track.wav" --tempocnn-accelerator auto
 ```
 
 Benchmark tempo backends across an imported playlist:
 
 ```powershell
 python -m cuemate_analysis benchmark-bpm --playlist "Fred again"
-python -m cuemate_analysis benchmark-bpm --playlist "Fred again" --backends baseline,essentia_wsl,beatnet --limit 5 --output .\data\benchmarks\fred-again.csv
+python -m cuemate_analysis benchmark-bpm --playlist "Fred again" --backends baseline,tempocnn --limit 5 --output .\data\benchmarks\fred-again.csv
 ```
 
-The BeatNet path is experimental and tempo-only. Essentia is currently exposed through WSL for comparison and benchmarking rather than the default Windows runtime.
+TempoCNN is now the primary tempo path, exposed through WSL for comparison, benchmarking, and persisted tempo analysis rather than the default Windows runtime. The default TempoCNN model path is `python/models/essentia/deepsquare-k16-3.pb`.
+
+GPU notes:
+
+- TempoCNN now defaults to `--tempocnn-accelerator auto` and will try GPU instead of forcing CPU
+- if TempoCNN is unavailable for a track, the analyzer falls back to the current librosa baseline automatically and records `baseline_fallback` as the BPM source
+- on this current Ross-PC setup, the WSL TempoCNN path still falls back to CPU because TensorFlow cannot finish loading the needed GPU libraries yet
+- the librosa baseline remains CPU-bound
 
 ## Intent for the next commits
 

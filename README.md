@@ -1,6 +1,6 @@
 # CueMate Engine
 
-CueMate Engine starts as a monorepo with a hard split between the Python analysis plane and the Go decision plane. This repository is intentionally at a setup-only stage: contract, tooling, workspace config, migration scaffolding, and deployment groundwork are in place, but service and DSP implementation code has not started yet.
+CueMate Engine is a monorepo with a hard split between the Python analysis plane and the Go decision plane. The repository now includes the first Milestone 1 slice from the decision engine plan: local playlist import, absolute feature analysis on PC, and SQLite persistence. Scoring, relative features, windowed features, and the Go API are still deferred.
 
 ## Repository layout
 
@@ -19,8 +19,10 @@ CueMate Engine starts as a monorepo with a hard split between the Python analysi
 - Shared protobuf contract lives at `proto/djengine/scoring/v1/scoring.proto`
 - `buf.yaml` defines `proto/` as the protobuf module root
 - `go/` is its own Go module and is included from the root `go.work`
-- `python/` is configured with a `pyproject.toml` for future analysis-plane packaging
+- `python/` now exposes a Milestone 1 CLI for local ingest and absolute analysis
+- `config/default.json` is the checked-in runtime config baseline for analysis settings
 - `dbmate` is the migration tool for forward-only SQL schema changes
+- `db/` now includes Milestone 1 tables for `tracks`, `playlists`, `playlist_tracks`, `track_features_abs`, and `analysis_jobs`
 - `compose.yaml` currently provides an operations-only migration service
 - Generated artifacts and local env files are kept out of git by default
 
@@ -70,9 +72,41 @@ Run the Docker Compose migration profile with an isolated local Docker config:
 powershell -ExecutionPolicy Bypass -File .\scripts\docker-compose.ps1 --profile ops run --rm migrate
 ```
 
+Install the Python analysis CLI in editable mode:
+
+```powershell
+python -m pip install --user -e ".\python[dev]"
+```
+
+## Milestone 1 CLI
+
+Import a local playlist or crate:
+
+```powershell
+python -m cuemate_analysis import-playlist --name "My Playlist" .\path\to\audio
+```
+
+Analyze imported tracks with absolute features only:
+
+```powershell
+python -m cuemate_analysis analyze-playlist --playlist "My Playlist" --analysis-mode full
+```
+
+Inspect playlist analysis state:
+
+```powershell
+python -m cuemate_analysis list-playlist --name "My Playlist"
+```
+
+Inspect one analyzed track:
+
+```powershell
+python -m cuemate_analysis show-track --track-id trk_example123
+```
+
 ## Intent for the next commits
 
-- add Python scoring-service and analysis-plane packages under `python/src/`
-- add Go API and orchestration packages under `go/cmd/` and `go/internal/`
-- add subsequent migrations as the schema evolves
+- add Milestone 2 relative-feature and windowed-feature tables and refresh logic
+- add the Python gRPC scoring service on top of the persisted analysis data
+- add the Go API and orchestration packages under `go/cmd/` and `go/internal/`
 - add service Dockerfiles only when real app entrypoints exist

@@ -1,12 +1,19 @@
-CREATE TABLE IF NOT EXISTS "schema_migrations" (version varchar(128) primary key);
-CREATE TABLE schema_metadata (
+-- migrate:up
+CREATE TABLE IF NOT EXISTS schema_metadata (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   "key" TEXT NOT NULL UNIQUE,
   value TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
-CREATE TABLE tracks (
+
+INSERT INTO schema_metadata ("key", value)
+VALUES ('schema_version', '2')
+ON CONFLICT("key") DO UPDATE SET
+  value = excluded.value,
+  updated_at = CURRENT_TIMESTAMP;
+
+CREATE TABLE IF NOT EXISTS tracks (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL DEFAULT 'local',
   file_path TEXT NOT NULL UNIQUE,
@@ -19,8 +26,10 @@ CREATE TABLE tracks (
   imported_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
-CREATE INDEX idx_tracks_file_hash ON tracks(file_hash);
-CREATE TABLE playlists (
+
+CREATE INDEX IF NOT EXISTS idx_tracks_file_hash ON tracks(file_hash);
+
+CREATE TABLE IF NOT EXISTS playlists (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL DEFAULT 'local',
   name TEXT NOT NULL UNIQUE,
@@ -28,16 +37,19 @@ CREATE TABLE playlists (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
-CREATE TABLE playlist_tracks (
+
+CREATE TABLE IF NOT EXISTS playlist_tracks (
   playlist_id TEXT NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
   track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
   position INTEGER NOT NULL,
   added_at TEXT NOT NULL,
   PRIMARY KEY (playlist_id, track_id)
 );
-CREATE INDEX idx_playlist_tracks_playlist_position
+
+CREATE INDEX IF NOT EXISTS idx_playlist_tracks_playlist_position
   ON playlist_tracks(playlist_id, position);
-CREATE TABLE track_features_abs (
+
+CREATE TABLE IF NOT EXISTS track_features_abs (
   track_id TEXT PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE,
   user_id TEXT NOT NULL DEFAULT 'local',
   source_file_hash TEXT NOT NULL,
@@ -71,7 +83,8 @@ CREATE TABLE track_features_abs (
   config_signature TEXT NOT NULL,
   scoring_contract_id_at_analysis TEXT
 );
-CREATE TABLE analysis_jobs (
+
+CREATE TABLE IF NOT EXISTS analysis_jobs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   playlist_id TEXT REFERENCES playlists(id) ON DELETE SET NULL,
   track_id TEXT REFERENCES tracks(id) ON DELETE SET NULL,
@@ -89,9 +102,29 @@ CREATE TABLE analysis_jobs (
   started_at TEXT,
   completed_at TEXT
 );
-CREATE INDEX idx_analysis_jobs_status_priority
+
+CREATE INDEX IF NOT EXISTS idx_analysis_jobs_status_priority
   ON analysis_jobs(status, priority DESC, created_at ASC);
--- Dbmate schema migrations
-INSERT INTO "schema_migrations" (version) VALUES
-  ('20260403112734'),
-  ('20260403154500');
+
+PRAGMA journal_mode = WAL;
+
+-- migrate:down
+DROP TABLE IF EXISTS analysis_jobs;
+DROP TABLE IF EXISTS track_features_abs;
+DROP TABLE IF EXISTS playlist_tracks;
+DROP TABLE IF EXISTS playlists;
+DROP TABLE IF EXISTS tracks;
+
+CREATE TABLE IF NOT EXISTS schema_metadata (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  "key" TEXT NOT NULL UNIQUE,
+  value TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO schema_metadata ("key", value)
+VALUES ('schema_version', '1')
+ON CONFLICT("key") DO UPDATE SET
+  value = excluded.value,
+  updated_at = CURRENT_TIMESTAMP;

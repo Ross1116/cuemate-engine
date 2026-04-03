@@ -23,6 +23,7 @@ python/.venv/
 python/.pytest_cache/
 python/.ruff_cache/
 python/.mypy_cache/
+*.egg-info/
 
 # Go
 go/bin/

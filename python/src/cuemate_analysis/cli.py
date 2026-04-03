@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 from pathlib import Path
 import sqlite3
@@ -11,6 +12,59 @@ from cuemate_analysis.analysis import analyze_track, utc_now
 from cuemate_analysis.config import load_runtime_settings
 from cuemate_analysis.database import Database
 from cuemate_analysis.ingest import discover_audio_files, make_playlist_id, read_track_metadata
+from cuemate_analysis.tempo_experiments import (
+    TempoEstimate,
+    estimate_baseline_bpm,
+    estimate_beatnet_bpm,
+    estimate_essentia_wsl_bpm,
+)
+
+
+def build_effective_analysis_signature(
+    base_signature: str,
+    *,
+    tempo_backend: str,
+    beatnet_model: int,
+) -> str:
+    if tempo_backend == "baseline":
+        return base_signature
+    return f"{base_signature}-tempo-{tempo_backend}-m{beatnet_model}"
+
+
+def parse_backend_list(raw: str) -> list[str]:
+    backends = [item.strip() for item in raw.split(",") if item.strip()]
+    allowed = {"baseline", "beatnet", "essentia_wsl"}
+    invalid = [item for item in backends if item not in allowed]
+    if invalid:
+        raise argparse.ArgumentTypeError(f"Unsupported backends: {', '.join(invalid)}")
+    if not backends:
+        raise argparse.ArgumentTypeError("At least one backend must be selected.")
+    return backends
+
+
+def summarize_estimate(estimate: TempoEstimate) -> str:
+    if not estimate.available or estimate.bpm is None:
+        return f"unavailable ({estimate.elapsed_ms:.1f} ms)" if estimate.elapsed_ms is not None else "unavailable"
+    return (
+        f"{estimate.details.get('display_bpm', round(estimate.bpm, 1))} BPM "
+        f"in {estimate.elapsed_ms:.1f} ms"
+    )
+
+
+def run_selected_backend(
+    backend: str,
+    path: Path,
+    settings,
+    *,
+    beatnet_model: int,
+) -> TempoEstimate:
+    if backend == "baseline":
+        return estimate_baseline_bpm(path, settings)
+    if backend == "beatnet":
+        return estimate_beatnet_bpm(path, model=beatnet_model)
+    if backend == "essentia_wsl":
+        return estimate_essentia_wsl_bpm(path)
+    raise ValueError(f"Unsupported backend: {backend}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -47,6 +101,19 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Re-analyze tracks even when the stored analysis signature and file hash match.",
     )
+    analyze_parser.add_argument(
+        "--tempo-backend",
+        choices=["baseline", "beatnet"],
+        default="baseline",
+        help="Tempo detector backend to use for BPM estimation.",
+    )
+    analyze_parser.add_argument(
+        "--beatnet-model",
+        type=int,
+        choices=[1, 2, 3],
+        default=1,
+        help="BeatNet model to use when --tempo-backend beatnet is selected.",
+    )
 
     list_parser = subparsers.add_parser(
         "list-playlist",
@@ -59,6 +126,53 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show imported metadata and absolute features for a track.",
     )
     show_parser.add_argument("--track-id", required=True, help="Track identifier to inspect.")
+
+    compare_parser = subparsers.add_parser(
+        "compare-bpm",
+        help="Compare the current BPM detector against experimental backends on one file.",
+    )
+    compare_parser.add_argument("path", help="Audio file to analyze.")
+    compare_parser.add_argument(
+        "--beatnet-model",
+        type=int,
+        choices=[1, 2, 3],
+        default=1,
+        help="BeatNet model to use when BeatNet is available.",
+    )
+    compare_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit the comparison payload as JSON.",
+    )
+
+    benchmark_parser = subparsers.add_parser(
+        "benchmark-bpm",
+        help="Benchmark tempo backends across an imported playlist.",
+    )
+    benchmark_parser.add_argument("--playlist", required=True, help="Playlist name to benchmark.")
+    benchmark_parser.add_argument(
+        "--backends",
+        type=parse_backend_list,
+        default=["baseline", "essentia_wsl"],
+        help="Comma-separated backend list. Default: baseline,essentia_wsl",
+    )
+    benchmark_parser.add_argument(
+        "--beatnet-model",
+        type=int,
+        choices=[1, 2, 3],
+        default=1,
+        help="BeatNet model to use when beatnet is included.",
+    )
+    benchmark_parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Optional track limit for a faster benchmark pass.",
+    )
+    benchmark_parser.add_argument(
+        "--output",
+        help="Optional output path for a CSV report.",
+    )
 
     return parser
 
@@ -87,6 +201,11 @@ def handle_import_playlist(args: argparse.Namespace) -> int:
 def handle_analyze_playlist(args: argparse.Namespace) -> int:
     settings = load_runtime_settings()
     playlist_name = args.playlist
+    effective_analysis_signature = build_effective_analysis_signature(
+        settings.analysis_signature,
+        tempo_backend=args.tempo_backend,
+        beatnet_model=args.beatnet_model,
+    )
 
     with Database(settings.database_path) as database:
         rows = database.get_playlist_tracks(playlist_name)
@@ -102,7 +221,7 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
                 track_id=row["track_id"],
                 track_path=row["file_path"],
                 analysis_mode=args.analysis_mode,
-                analysis_signature=settings.analysis_signature,
+                analysis_signature=effective_analysis_signature,
                 config_signature=settings.config_signature,
                 source_file_hash=row["file_hash"],
                 priority=total - index,
@@ -118,7 +237,7 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
                     not args.force
                     and existing is not None
                     and existing["source_file_hash"] == track.file_hash
-                    and existing["analysis_signature"] == settings.analysis_signature
+                    and existing["analysis_signature"] == effective_analysis_signature
                     and existing["analysis_mode"] == args.analysis_mode
                 ):
                     duration_seconds = round(time.perf_counter() - start_time, 3)
@@ -127,8 +246,10 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
                         duration_seconds,
                         {
                             "analysis_mode": args.analysis_mode,
-                            "analysis_signature": settings.analysis_signature,
+                            "analysis_signature": effective_analysis_signature,
                             "config_signature": settings.config_signature,
+                            "tempo_backend": args.tempo_backend,
+                            "beatnet_model": args.beatnet_model,
                             "skipped": True,
                         },
                         utc_now(),
@@ -138,7 +259,14 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
                     )
                     continue
 
-                result = analyze_track(track, settings, args.analysis_mode)
+                result = analyze_track(
+                    track,
+                    settings,
+                    args.analysis_mode,
+                    tempo_backend=args.tempo_backend,
+                    beatnet_model=args.beatnet_model,
+                    analysis_signature=effective_analysis_signature,
+                )
                 database.upsert_track_features(result)
                 duration_seconds = round(time.perf_counter() - start_time, 3)
                 database.mark_analysis_job_completed(
@@ -146,14 +274,17 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
                     duration_seconds,
                     {
                         "analysis_mode": args.analysis_mode,
-                        "analysis_signature": settings.analysis_signature,
+                        "analysis_signature": effective_analysis_signature,
                         "config_signature": settings.config_signature,
+                        "tempo_backend": args.tempo_backend,
+                        "beatnet_model": args.beatnet_model,
                     },
                     utc_now(),
                 )
                 processed += 1
                 print(
-                    f"[{index}/{total}] analyzed {track.id} ({track.title}) -> {result.bpm:.1f} BPM, {result.key}"
+                    f"[{index}/{total}] analyzed {track.id} ({track.title}) -> "
+                    f"{result.bpm:.1f} BPM ({result.bpm_source}), {result.key}"
                 )
             except Exception as exc:
                 duration_seconds = round(time.perf_counter() - start_time, 3)
@@ -193,6 +324,137 @@ def handle_show_track(args: argparse.Namespace) -> int:
     return 0
 
 
+def handle_compare_bpm(args: argparse.Namespace) -> int:
+    settings = load_runtime_settings()
+    path = Path(args.path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Audio file was not found: {path}")
+
+    metadata = read_track_metadata(path)
+    baseline = estimate_baseline_bpm(path, settings)
+    beatnet = estimate_beatnet_bpm(path, model=args.beatnet_model)
+    essentia_wsl = estimate_essentia_wsl_bpm(path)
+
+    payload = {
+        "file_path": path.as_posix(),
+        "title": metadata.title,
+        "artist": metadata.artist,
+        "tagged_bpm": metadata.bpm_tag,
+        "baseline": baseline.to_payload(),
+        "beatnet": beatnet.to_payload(),
+        "essentia_wsl": essentia_wsl.to_payload(),
+    }
+
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+
+    print(f"File: {payload['file_path']}")
+    print(f"Track: {metadata.artist or 'Unknown artist'} - {metadata.title or path.stem}")
+    print(f"Tagged BPM: {metadata.bpm_tag if metadata.bpm_tag is not None else 'none'}")
+    print(f"Baseline: {summarize_estimate(baseline)} (confidence {baseline.confidence:.2f})")
+    if beatnet.available and beatnet.bpm is not None and beatnet.confidence is not None:
+        print(
+            f"BeatNet: {summarize_estimate(beatnet)} "
+            f"(confidence {beatnet.confidence:.2f}, beats {beatnet.details['beat_count']})"
+        )
+    else:
+        print(f"BeatNet: {summarize_estimate(beatnet)}")
+    if essentia_wsl.available and essentia_wsl.bpm is not None and essentia_wsl.confidence is not None:
+        print(
+            f"Essentia WSL: {summarize_estimate(essentia_wsl)} "
+            f"(score {essentia_wsl.confidence:.2f}, "
+            f"key {essentia_wsl.details['key']} {essentia_wsl.details['scale']})"
+        )
+    else:
+        print(f"Essentia WSL: {summarize_estimate(essentia_wsl)}")
+
+    for note in beatnet.notes:
+        print(f"- {note}")
+    for note in essentia_wsl.notes:
+        print(f"- {note}")
+    return 0
+
+
+def handle_benchmark_bpm(args: argparse.Namespace) -> int:
+    settings = load_runtime_settings()
+    with Database(settings.database_path) as database:
+        rows = database.get_playlist_tracks(args.playlist)
+        if not rows:
+            raise SystemExit(f"Playlist '{args.playlist}' was not found.")
+
+    if args.limit and args.limit > 0:
+        rows = rows[: args.limit]
+
+    report_rows: list[dict[str, object]] = []
+    print(
+        f"Benchmarking {len(rows)} track(s) from '{args.playlist}' with backends: {', '.join(args.backends)}"
+    )
+
+    for index, row in enumerate(rows, start=1):
+        path = Path(row["file_path"])
+        metadata = read_track_metadata(path)
+        line_parts = [f"[{index}/{len(rows)}] {metadata.title or path.stem}"]
+        row_payload: dict[str, object] = {
+            "track_id": row["track_id"],
+            "title": metadata.title,
+            "artist": metadata.artist,
+            "file_path": path.as_posix(),
+            "tagged_bpm": metadata.bpm_tag,
+        }
+
+        for backend in args.backends:
+            estimate = run_selected_backend(
+                backend,
+                path,
+                settings,
+                beatnet_model=args.beatnet_model,
+            )
+            row_payload[f"{backend}_available"] = estimate.available
+            row_payload[f"{backend}_bpm"] = estimate.bpm
+            row_payload[f"{backend}_confidence"] = estimate.confidence
+            row_payload[f"{backend}_elapsed_ms"] = estimate.elapsed_ms
+            row_payload[f"{backend}_notes"] = " | ".join(estimate.notes)
+            if backend == "essentia_wsl":
+                row_payload[f"{backend}_key"] = estimate.details.get("key")
+                row_payload[f"{backend}_scale"] = estimate.details.get("scale")
+                row_payload[f"{backend}_key_strength"] = estimate.details.get("key_strength")
+            line_parts.append(f"{backend}={summarize_estimate(estimate)}")
+
+        report_rows.append(row_payload)
+        print(" :: ".join(line_parts))
+
+    summary: list[str] = []
+    for backend in args.backends:
+        successful = [
+            row for row in report_rows if row.get(f"{backend}_available") and row.get(f"{backend}_elapsed_ms") is not None
+        ]
+        if not successful:
+            summary.append(f"{backend}: no successful runs")
+            continue
+        avg_elapsed = sum(float(row[f"{backend}_elapsed_ms"]) for row in successful) / len(successful)
+        avg_bpm = sum(float(row[f"{backend}_bpm"]) for row in successful if row.get(f"{backend}_bpm") is not None) / len(successful)
+        summary.append(
+            f"{backend}: {len(successful)}/{len(report_rows)} ok, avg {avg_bpm:.1f} BPM, avg {avg_elapsed:.1f} ms"
+        )
+
+    print("Summary:")
+    for line in summary:
+        print(f"- {line}")
+
+    if args.output:
+        output_path = Path(args.output).expanduser().resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fieldnames: list[str] = sorted({key for row in report_rows for key in row.keys()})
+        with output_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(report_rows)
+        print(f"Wrote CSV report to {output_path}")
+
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -206,6 +468,10 @@ def main(argv: list[str] | None = None) -> int:
             return handle_list_playlist(args)
         if args.command == "show-track":
             return handle_show_track(args)
+        if args.command == "compare-bpm":
+            return handle_compare_bpm(args)
+        if args.command == "benchmark-bpm":
+            return handle_benchmark_bpm(args)
     except sqlite3.OperationalError as exc:
         message = str(exc)
         if "no such table" in message.lower():

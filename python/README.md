@@ -40,6 +40,33 @@ Use the module form so the commands work even when the user-site Scripts directo
 ```powershell
 python -m cuemate_analysis import-playlist --name "My Playlist" .\path\to\audio
 python -m cuemate_analysis analyze-playlist --playlist "My Playlist" --analysis-mode full
+python -m cuemate_analysis analyze-playlist --playlist "My Playlist" --analysis-mode full --tempo-backend beatnet --force
 python -m cuemate_analysis list-playlist --name "My Playlist"
 python -m cuemate_analysis show-track --track-id trk_example123
 ```
+
+## Experimental BPM comparison
+
+Optional local installs for the BeatNet comparison path:
+
+```powershell
+python -m pip install --user BeatNet madmom-prebuilt PyAudio
+```
+
+You can compare the current Milestone 1 BPM detector against an experimental BeatNet-backed estimate on a single file:
+
+```powershell
+python -m cuemate_analysis compare-bpm "D:\path\to\track.wav"
+python -m cuemate_analysis compare-bpm "D:\path\to\track.wav" --json
+python -m cuemate_analysis benchmark-bpm --playlist "Fred again"
+python -m cuemate_analysis benchmark-bpm --playlist "Fred again" --backends baseline,essentia_wsl,beatnet --limit 5 --output .\data\benchmarks\fred-again.csv
+```
+
+Important notes:
+
+- BeatNet is being used as an experimental tempo backend only
+- `analyze-playlist --tempo-backend beatnet` now uses BeatNet for BPM estimation in the persisted analysis path
+- it does not help with key detection
+- the current wrapper uses a local compatibility shim for `madmom-prebuilt` on Windows
+- Essentia is currently reached through WSL for comparison and benchmarking
+- `benchmark-bpm` defaults to `baseline,essentia_wsl` because BeatNet is much slower

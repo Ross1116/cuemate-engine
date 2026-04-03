@@ -90,6 +90,7 @@ Analyze imported tracks with absolute features only:
 
 ```powershell
 python -m cuemate_analysis analyze-playlist --playlist "My Playlist" --analysis-mode full
+python -m cuemate_analysis analyze-playlist --playlist "My Playlist" --analysis-mode full --tempo-backend beatnet --force
 ```
 
 Inspect playlist analysis state:
@@ -103,6 +104,22 @@ Inspect one analyzed track:
 ```powershell
 python -m cuemate_analysis show-track --track-id trk_example123
 ```
+
+Compare the current BPM detector against the experimental BeatNet backend on one file:
+
+```powershell
+python -m cuemate_analysis compare-bpm "D:\path\to\track.wav"
+python -m cuemate_analysis compare-bpm "D:\path\to\track.wav" --json
+```
+
+Benchmark tempo backends across an imported playlist:
+
+```powershell
+python -m cuemate_analysis benchmark-bpm --playlist "Fred again"
+python -m cuemate_analysis benchmark-bpm --playlist "Fred again" --backends baseline,essentia_wsl,beatnet --limit 5 --output .\data\benchmarks\fred-again.csv
+```
+
+The BeatNet path is experimental and tempo-only. Essentia is currently exposed through WSL for comparison and benchmarking rather than the default Windows runtime.
 
 ## Intent for the next commits
 

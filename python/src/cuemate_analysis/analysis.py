@@ -130,7 +130,12 @@ def detect_bpm(y: np.ndarray, sr: int) -> dict[str, float]:
     return {"bpm": max(tempo, 0.0), "bpm_confidence": confidence}
 
 
-def resolve_bpm(tagged_bpm: float | None, detected: dict[str, float]) -> dict[str, float | str]:
+def resolve_bpm(
+    tagged_bpm: float | None,
+    detected: dict[str, float],
+    *,
+    detected_source: str = "detected",
+) -> dict[str, float | str]:
     detected_bpm = float(detected.get("bpm", 0.0))
     detected_confidence = float(detected.get("bpm_confidence", 0.0))
 
@@ -143,7 +148,7 @@ def resolve_bpm(tagged_bpm: float | None, detected: dict[str, float]) -> dict[st
             matched = detected_bpm * best_ratio
             tolerance = 1.0 if math.isclose(best_ratio, 1.0) else 2.0
             if abs(tagged_bpm - matched) <= tolerance:
-                source = "tag+detected"
+                source = f"tag+{detected_source}"
                 confidence = 0.98
         return {"bpm": float(tagged_bpm), "bpm_confidence": confidence, "bpm_source": source}
 
@@ -151,10 +156,37 @@ def resolve_bpm(tagged_bpm: float | None, detected: dict[str, float]) -> dict[st
         return {
             "bpm": detected_bpm,
             "bpm_confidence": max(detected_confidence, 0.55),
-            "bpm_source": "detected",
+            "bpm_source": detected_source,
         }
 
     raise ValueError("Unable to resolve BPM from tags or detection.")
+
+
+def resolve_bpm_with_backend(
+    track: ImportedTrack,
+    y: np.ndarray,
+    sr: int,
+    *,
+    tempo_backend: str,
+    beatnet_model: int,
+) -> dict[str, float | str]:
+    if tempo_backend == "baseline":
+        return resolve_bpm(track.bpm_tag, detect_bpm(y, sr), detected_source="detected")
+
+    if tempo_backend == "beatnet":
+        from cuemate_analysis.tempo_experiments import estimate_beatnet_bpm
+
+        estimate = estimate_beatnet_bpm(track.file_path, model=beatnet_model)
+        if not estimate.available or estimate.bpm is None:
+            detail = estimate.notes[0] if estimate.notes else "BeatNet tempo estimation failed."
+            raise ValueError(detail)
+        return resolve_bpm(
+            track.bpm_tag,
+            {"bpm": float(estimate.bpm), "bpm_confidence": float(estimate.confidence or 0.0)},
+            detected_source="beatnet",
+        )
+
+    raise ValueError(f"Unsupported tempo backend: {tempo_backend}")
 
 
 def detect_key(y: np.ndarray, sr: int) -> dict[str, str | int | float]:
@@ -283,7 +315,15 @@ def extract_full_features(y: np.ndarray, sr: int) -> dict[str, float]:
     }
 
 
-def analyze_track(track: ImportedTrack, settings: RuntimeSettings, analysis_mode: str) -> AnalysisResult:
+def analyze_track(
+    track: ImportedTrack,
+    settings: RuntimeSettings,
+    analysis_mode: str,
+    *,
+    tempo_backend: str = "baseline",
+    beatnet_model: int = 1,
+    analysis_signature: str | None = None,
+) -> AnalysisResult:
     y, sr = librosa.load(
         track.file_path.as_posix(),
         sr=settings.analysis.sample_rate,
@@ -292,7 +332,13 @@ def analyze_track(track: ImportedTrack, settings: RuntimeSettings, analysis_mode
     if y.size == 0:
         raise ValueError(f"No audio samples decoded for {track.file_path}")
 
-    bpm = resolve_bpm(track.bpm_tag, detect_bpm(y, sr))
+    bpm = resolve_bpm_with_backend(
+        track,
+        y,
+        sr,
+        tempo_backend=tempo_backend,
+        beatnet_model=beatnet_model,
+    )
     key = resolve_key(track.key_tag, detect_key(y, sr))
     energy = extract_energy(y)
     loudness = extract_loudness(y, sr)
@@ -336,6 +382,6 @@ def analyze_track(track: ImportedTrack, settings: RuntimeSettings, analysis_mode
         vocals_confidence=None,
         analysis_mode=analysis_mode,
         analyzed_at=utc_now(),
-        analysis_signature=settings.analysis_signature,
+        analysis_signature=analysis_signature or settings.analysis_signature,
         config_signature=settings.config_signature,
     )

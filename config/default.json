@@ -3,6 +3,10 @@
   "analysis": {
     "sample_rate": 22050,
     "mono": true,
+    "key_backend": "musicalkeycnn",
+    "musicalkeycnn_model": "python/models/musicalkeycnn/keynet.pt",
+    "musicalkeycnn_device": "auto",
+    "musicalkeycnn_policy": "full_track",
     "parallel_workers": 4,
     "max_workers_auto": true,
     "per_track_timeout_seconds": 120,

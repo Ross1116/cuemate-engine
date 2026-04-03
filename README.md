@@ -84,10 +84,22 @@ Build the local TempoCNN Docker image used by the primary BPM backend:
 powershell -ExecutionPolicy Bypass -File .\scripts\build-tempocnn-image.ps1
 ```
 
+Build the local MusicalKeyCNN Docker image used by the primary key backend:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build-musicalkeycnn-image.ps1
+```
+
 Optional: warm-start the persistent TempoCNN service container yourself. The CLI will auto-start it on demand too.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\start-tempocnn-service.ps1
+```
+
+Optional: warm-start the persistent MusicalKeyCNN service container yourself. The CLI will auto-start it on demand too.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\start-musicalkeycnn-service.ps1
 ```
 
 ## Milestone 1 CLI
@@ -103,6 +115,8 @@ Analyze imported tracks with absolute features only:
 ```powershell
 python -m cuemate_analysis analyze-playlist --playlist "My Playlist" --analysis-mode full
 python -m cuemate_analysis analyze-playlist --playlist "My Playlist" --analysis-mode full --tempo-backend tempocnn --tempocnn-accelerator auto --force
+python -m cuemate_analysis analyze-playlist --playlist "My Playlist" --analysis-mode full --key-backend musicalkeycnn --musicalkeycnn-device auto --force
+python -m cuemate_analysis analyze-playlist --playlist "My Playlist" --analysis-mode full --key-backend musicalkeycnn --musicalkeycnn-policy full_track --force
 python -m cuemate_analysis analyze-playlist --playlist "My Playlist" --analysis-mode full --tempo-backend baseline --force
 ```
 
@@ -135,6 +149,15 @@ python -m cuemate_analysis compare-bpm "D:\path\to\track.wav" --json
 python -m cuemate_analysis compare-bpm "D:\path\to\track.wav" --tempocnn-accelerator auto
 ```
 
+Compare MusicalKeyCNN policies against tagged keys on one file, or benchmark those policies across a playlist:
+
+```powershell
+python -m cuemate_analysis compare-key "D:\path\to\track.wav"
+python -m cuemate_analysis compare-key "D:\path\to\track.wav" --policies single_excerpt,full_track
+python -m cuemate_analysis benchmark-key --playlist "Fred again"
+python -m cuemate_analysis benchmark-key --playlist "Fred again" --limit 10 --output .\data\benchmarks\fred-again-key.csv
+```
+
 Benchmark tempo backends across an imported playlist:
 
 ```powershell
@@ -147,11 +170,13 @@ TempoCNN is now the primary tempo path for comparison, benchmarking, and persist
 Speed notes:
 
 - TempoCNN is now used for BPM only; key extraction is no longer part of the TempoCNN Docker path
-- `analyze-playlist` still derives keys from the current local chroma-based fallback; MusicalKeyCNN will replace that later
+- MusicalKeyCNN is now the primary key backend for playlist analysis
+- `compare-key` and `benchmark-key` are the intended commands for measuring the MusicalKeyCNN policy tradeoff against tagged keys
 - `analyze-bpm` and `analyze-bpm-playlist` are the intended BPM-only commands
 - `compare-bpm` is the debugging/benchmark command when you want to compare baseline vs TempoCNN directly
 - single-track comparisons now use a warm TempoCNN service container when available, so repeated checks avoid model/container cold starts
 - playlist analysis and `benchmark-bpm` batch TempoCNN tracks into the warm service path, so the model only loads once and stays hot
+- MusicalKeyCNN runs through its own warm Docker worker, separate from the TempoCNN BPM worker
 - the host-side analyzer still computes the remaining absolute features locally with `librosa`
 
 Manual Docker debug for one track:
@@ -174,6 +199,8 @@ GPU notes:
 - if Docker cannot expose a usable GPU cleanly, TempoCNN will retry on CPU and the notes will say so
 - the biggest speed gain comes from batched TempoCNN runs and removing unnecessary key extraction from the TempoCNN container path
 - the librosa baseline remains CPU-bound
+- MusicalKeyCNN now defaults to `full_track`; `balanced` is no longer part of the normal workflow because it did not show a useful speed advantage
+- automatic chroma fallback is disabled for the primary MusicalKeyCNN path; if the model is unavailable, analysis now falls back to a tagged key only when one exists
 
 ## Intent for the next commits
 

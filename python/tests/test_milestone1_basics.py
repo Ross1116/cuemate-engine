@@ -1,12 +1,13 @@
 import numpy as np
 from pathlib import Path
 
-from cuemate_analysis.analysis import resolve_bpm, resolve_bpm_with_backend
-from cuemate_analysis.cli import build_effective_analysis_signature, parse_backend_list
+from cuemate_analysis.analysis import resolve_bpm, resolve_bpm_with_backend, resolve_key_with_backend
+from cuemate_analysis.cli import build_effective_analysis_signature
 from cuemate_analysis.analysis import parse_key_label
 from cuemate_analysis.ingest import discover_audio_files, make_playlist_id, make_track_id
 from cuemate_analysis.models import ImportedTrack
 from cuemate_analysis.tempo_experiments import TempoEstimate
+from cuemate_analysis.key_experiments import KeyEstimate
 
 
 def test_parse_key_label_supports_camelot_and_note_names() -> None:
@@ -41,27 +42,16 @@ def test_resolve_bpm_uses_backend_name_in_source() -> None:
     assert resolved["bpm_source"] == "tag+tempocnn"
 
 
-def test_effective_analysis_signature_stays_plain_for_baseline() -> None:
-    baseline = build_effective_analysis_signature("m1-stable", tempo_backend="baseline")
-
-    assert baseline == "m1-stable"
-
-
-def test_effective_analysis_signature_changes_for_essentia_tempocnn() -> None:
+def test_effective_analysis_signature_includes_production_models() -> None:
     signature = build_effective_analysis_signature(
         "m1-stable",
-        tempo_backend="tempocnn",
         tempocnn_model="D:/models/deepsquare-k16-3.pb",
         tempocnn_accelerator="auto",
+        musicalkeycnn_model="D:/models/keynet.pt",
+        musicalkeycnn_device="auto",
     )
 
-    assert signature == "m1-stable-tempo-tempocnn-deepsquare-k16-3-auto"
-
-
-def test_parse_backend_list_deduplicates_entries() -> None:
-    parsed = parse_backend_list("baseline,tempocnn,tempocnn")
-
-    assert parsed == ["baseline", "tempocnn"]
+    assert signature == "m1-stable-tempo-tempocnn-deepsquare-k16-3-auto-key-musicalkeycnn-keynet-auto-full_track"
 
 
 def test_resolve_bpm_with_backend_falls_back_to_baseline_when_tempocnn_is_unavailable(
@@ -108,3 +98,46 @@ def test_resolve_bpm_with_backend_falls_back_to_baseline_when_tempocnn_is_unavai
 
     assert resolved["bpm"] == 128.0
     assert resolved["bpm_source"] == "baseline_fallback"
+
+
+def test_resolve_key_with_backend_falls_back_to_tag_when_musicalkeycnn_is_unavailable(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    track_path = tmp_path / "track.wav"
+    track_path.write_bytes(b"test")
+    track = ImportedTrack(
+        id="trk_test",
+        file_path=track_path,
+        file_hash="hash",
+        title="Track",
+        artist="Artist",
+        genre=None,
+        duration_seconds=10.0,
+        bpm_tag=None,
+        key_tag="8A",
+    )
+
+    monkeypatch.setattr(
+        "cuemate_analysis.key_experiments.estimate_musicalkeycnn_key",
+        lambda *args, **kwargs: KeyEstimate(
+            backend="musicalkeycnn",
+            key=None,
+            key_number=None,
+            key_letter=None,
+            confidence=None,
+            elapsed_ms=1.0,
+            details={},
+            notes=["MusicalKeyCNN unavailable"],
+            available=False,
+        ),
+    )
+    resolved = resolve_key_with_backend(
+        track,
+        np.zeros(22050, dtype=float),
+        22050,
+        key_backend="musicalkeycnn",
+    )
+
+    assert resolved["key"] == "8A"
+    assert resolved["key_source"] == "tag_only_fallback"

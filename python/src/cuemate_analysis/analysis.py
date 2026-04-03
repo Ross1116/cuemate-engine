@@ -241,13 +241,14 @@ def detect_key(y: np.ndarray, sr: int) -> dict[str, str | int | float]:
 
 def resolve_key(tagged_key: str | None, detected: dict[str, str | int | float]) -> dict[str, str | int | float | None]:
     parsed_tag = parse_key_label(tagged_key)
+    detected_source = str(detected.get("key_source", "chroma"))
 
     if parsed_tag is not None:
         if parsed_tag["key"] == detected["key"]:
             return {
                 **parsed_tag,
                 "key_confidence": 0.92,
-                "key_source": "tag+chroma",
+                "key_source": f"tag+{detected_source}",
                 "key_imported": None,
                 "key_tagged": tagged_key,
                 "key_agreement": 1,
@@ -267,11 +268,80 @@ def resolve_key(tagged_key: str | None, detected: dict[str, str | int | float]) 
         "key_number": detected["key_number"],
         "key_letter": detected["key_letter"],
         "key_confidence": detected["key_confidence"],
-        "key_source": "chroma",
+        "key_source": detected_source,
         "key_imported": None,
         "key_tagged": tagged_key,
         "key_agreement": None,
     }
+
+
+def resolve_tag_only_key(tagged_key: str | None) -> dict[str, str | int | float | None]:
+    parsed_tag = parse_key_label(tagged_key)
+    if parsed_tag is None:
+        raise RuntimeError("MusicalKeyCNN was unavailable and no usable tagged key was found; chroma fallback is disabled.")
+    return {
+        **parsed_tag,
+        "key_confidence": 0.55,
+        "key_source": "tag_only_fallback",
+        "key_imported": None,
+        "key_tagged": tagged_key,
+        "key_agreement": None,
+    }
+
+
+def resolve_key_with_backend(
+    track: ImportedTrack,
+    y: np.ndarray,
+    sr: int,
+    *,
+    key_backend: str,
+    musicalkeycnn_model: str | None = None,
+    musicalkeycnn_image: str | None = None,
+    musicalkeycnn_device: str = "auto",
+    musicalkeycnn_policy: str = "balanced",
+    prefetched_musicalkeycnn_estimate=None,
+) -> dict[str, str | int | float | None]:
+    if key_backend == "chroma":
+        return resolve_key(
+            track.key_tag,
+            {
+                **detect_key(y, sr),
+                "key_source": "chroma",
+            },
+        )
+
+    from cuemate_analysis.key_experiments import (
+        KEY_BACKEND_MUSICALKEYCNN,
+        estimate_musicalkeycnn_key,
+        normalize_key_backend,
+    )
+
+    normalized_backend = normalize_key_backend(key_backend)
+    if normalized_backend != KEY_BACKEND_MUSICALKEYCNN:
+        raise ValueError(f"Unsupported key backend: {key_backend}")
+
+    estimate = prefetched_musicalkeycnn_estimate or estimate_musicalkeycnn_key(
+        track.file_path,
+        model_path=musicalkeycnn_model,
+        image_name=musicalkeycnn_image,
+        device=musicalkeycnn_device,
+        policy=musicalkeycnn_policy,
+    )
+    if estimate.available and estimate.key and estimate.key_number is not None and estimate.key_letter is not None:
+        return resolve_key(
+            track.key_tag,
+            {
+                "key": estimate.key,
+                "key_number": estimate.key_number,
+                "key_letter": estimate.key_letter,
+                "key_confidence": float(estimate.confidence or 0.0),
+                "pitch": estimate.details.get("pitch"),
+                "mode": estimate.details.get("mode"),
+                "key_source": "musicalkeycnn",
+            },
+        )
+
+    return resolve_tag_only_key(track.key_tag)
 
 
 def extract_energy(y: np.ndarray) -> dict[str, float]:
@@ -340,6 +410,12 @@ def analyze_track(
     tempocnn_model: str | None = None,
     tempocnn_accelerator: str = "auto",
     prefetched_tempocnn_estimate=None,
+    key_backend: str | None = None,
+    musicalkeycnn_model: str | None = None,
+    musicalkeycnn_image: str | None = None,
+    musicalkeycnn_device: str | None = None,
+    musicalkeycnn_policy: str | None = None,
+    prefetched_musicalkeycnn_estimate=None,
     analysis_signature: str | None = None,
 ) -> AnalysisResult:
     y, sr = librosa.load(
@@ -359,7 +435,18 @@ def analyze_track(
         tempocnn_accelerator=tempocnn_accelerator,
         prefetched_tempocnn_estimate=prefetched_tempocnn_estimate,
     )
-    key = resolve_key(track.key_tag, detect_key(y, sr))
+    effective_key_backend = key_backend or settings.analysis.key_backend
+    key = resolve_key_with_backend(
+        track,
+        y,
+        sr,
+        key_backend=effective_key_backend,
+        musicalkeycnn_model=musicalkeycnn_model or settings.analysis.key_model_path,
+        musicalkeycnn_image=musicalkeycnn_image,
+        musicalkeycnn_device=musicalkeycnn_device or settings.analysis.key_device,
+        musicalkeycnn_policy=musicalkeycnn_policy or settings.analysis.key_policy,
+        prefetched_musicalkeycnn_estimate=prefetched_musicalkeycnn_estimate,
+    )
     energy = extract_energy(y)
     loudness = extract_loudness(y, sr)
     bass_abs = extract_bass_ratio(y, sr)

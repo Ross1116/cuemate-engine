@@ -12,6 +12,10 @@ from typing import Any
 class AnalysisSettings:
     sample_rate: int
     mono: bool
+    key_backend: str
+    key_model_path: str | None
+    key_device: str
+    key_policy: str
     parallel_workers: int
     max_workers_auto: bool
     per_track_timeout_seconds: int
@@ -93,6 +97,10 @@ def _analysis_signature(config_signature: str, analysis_config: AnalysisSettings
         "seed": analysis_config.analysis_signature_seed,
         "sample_rate": analysis_config.sample_rate,
         "mono": analysis_config.mono,
+        "key_backend": analysis_config.key_backend,
+        "key_model_path": analysis_config.key_model_path,
+        "key_device": analysis_config.key_device,
+        "key_policy": analysis_config.key_policy,
         "fast_pass_enabled": analysis_config.fast_pass_enabled,
     }
     digest = hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
@@ -122,6 +130,10 @@ def load_runtime_settings(repo_root: Path | None = None) -> RuntimeSettings:
     analysis_settings = AnalysisSettings(
         sample_rate=int(analysis_payload.get("sample_rate", 22050)),
         mono=bool(analysis_payload.get("mono", True)),
+        key_backend=str(analysis_payload.get("key_backend", analysis_payload.get("key_model", "musicalkeycnn"))),
+        key_model_path=analysis_payload.get("musicalkeycnn_model"),
+        key_device=str(analysis_payload.get("musicalkeycnn_device", "auto")),
+        key_policy=str(analysis_payload.get("musicalkeycnn_policy", "balanced")),
         parallel_workers=int(analysis_payload.get("parallel_workers", 4)),
         max_workers_auto=bool(analysis_payload.get("max_workers_auto", True)),
         per_track_timeout_seconds=int(analysis_payload.get("per_track_timeout_seconds", 120)),

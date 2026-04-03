@@ -14,6 +14,7 @@ from cuemate_analysis.database import Database
 from cuemate_analysis.ingest import discover_audio_files, make_playlist_id, read_track_metadata
 from cuemate_analysis.key_experiments import (
     MUSICALKEYCNN_POLICY_FULL_TRACK,
+    estimate_musicalkeycnn_keys,
     resolve_musicalkeycnn_model_path,
 )
 from cuemate_analysis.tempo_experiments import (

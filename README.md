@@ -114,10 +114,7 @@ Analyze imported tracks with absolute features only:
 
 ```powershell
 python -m cuemate_analysis analyze-playlist --playlist "My Playlist" --analysis-mode full
-python -m cuemate_analysis analyze-playlist --playlist "My Playlist" --analysis-mode full --tempo-backend tempocnn --tempocnn-accelerator auto --force
-python -m cuemate_analysis analyze-playlist --playlist "My Playlist" --analysis-mode full --key-backend musicalkeycnn --musicalkeycnn-device auto --force
-python -m cuemate_analysis analyze-playlist --playlist "My Playlist" --analysis-mode full --key-backend musicalkeycnn --musicalkeycnn-policy full_track --force
-python -m cuemate_analysis analyze-playlist --playlist "My Playlist" --analysis-mode full --tempo-backend baseline --force
+python -m cuemate_analysis analyze-playlist --playlist "My Playlist" --analysis-mode full --force
 ```
 
 Inspect playlist analysis state:
@@ -136,46 +133,17 @@ Analyze BPM only for one file or an imported playlist:
 
 ```powershell
 python -m cuemate_analysis analyze-bpm "D:\path\to\track.wav"
-python -m cuemate_analysis analyze-bpm "D:\path\to\track.wav" --backend baseline
 python -m cuemate_analysis analyze-bpm-playlist --playlist "Fred again"
 python -m cuemate_analysis analyze-bpm-playlist --playlist "Fred again" --limit 5 --output .\data\benchmarks\fred-again-bpm.csv
 ```
 
-Compare the current fallback baseline against the primary TempoCNN backend on one file:
-
-```powershell
-python -m cuemate_analysis compare-bpm "D:\path\to\track.wav"
-python -m cuemate_analysis compare-bpm "D:\path\to\track.wav" --json
-python -m cuemate_analysis compare-bpm "D:\path\to\track.wav" --tempocnn-accelerator auto
-```
-
-Compare MusicalKeyCNN policies against tagged keys on one file, or benchmark those policies across a playlist:
-
-```powershell
-python -m cuemate_analysis compare-key "D:\path\to\track.wav"
-python -m cuemate_analysis compare-key "D:\path\to\track.wav" --policies single_excerpt,full_track
-python -m cuemate_analysis benchmark-key --playlist "Fred again"
-python -m cuemate_analysis benchmark-key --playlist "Fred again" --limit 10 --output .\data\benchmarks\fred-again-key.csv
-```
-
-Benchmark tempo backends across an imported playlist:
-
-```powershell
-python -m cuemate_analysis benchmark-bpm --playlist "Fred again"
-python -m cuemate_analysis benchmark-bpm --playlist "Fred again" --backends baseline,tempocnn --limit 5 --output .\data\benchmarks\fred-again.csv
-```
-
-TempoCNN is now the primary tempo path for comparison, benchmarking, and persisted tempo analysis. The default TempoCNN model path is `python/models/essentia/deepsquare-k16-3.pb`, and the default local Docker image name is `cuemate-tempocnn:local`.
-
 Speed notes:
 
-- TempoCNN is now used for BPM only; key extraction is no longer part of the TempoCNN Docker path
-- MusicalKeyCNN is now the primary key backend for playlist analysis
-- `compare-key` and `benchmark-key` are the intended commands for measuring the MusicalKeyCNN policy tradeoff against tagged keys
+- TempoCNN is now used for BPM only
+- MusicalKeyCNN is the primary key backend for playlist analysis
 - `analyze-bpm` and `analyze-bpm-playlist` are the intended BPM-only commands
-- `compare-bpm` is the debugging/benchmark command when you want to compare baseline vs TempoCNN directly
-- single-track comparisons now use a warm TempoCNN service container when available, so repeated checks avoid model/container cold starts
-- playlist analysis and `benchmark-bpm` batch TempoCNN tracks into the warm service path, so the model only loads once and stays hot
+- TempoCNN and MusicalKeyCNN both use warm Docker workers so repeated analysis avoids model cold starts
+- playlist analysis batches TempoCNN and MusicalKeyCNN work so the models stay loaded
 - MusicalKeyCNN runs through its own warm Docker worker, separate from the TempoCNN BPM worker
 - the host-side analyzer still computes the remaining absolute features locally with `librosa`
 
@@ -193,14 +161,13 @@ docker run --rm --gpus all `
 
 GPU notes:
 
-- TempoCNN now defaults to `--tempocnn-accelerator auto` and will try GPU instead of forcing CPU
 - if TempoCNN is unavailable for a track, the analyzer falls back to the current librosa baseline automatically and records `baseline_fallback` as the BPM source
 - the primary TempoCNN runtime now uses Docker rather than WSL
 - if Docker cannot expose a usable GPU cleanly, TempoCNN will retry on CPU and the notes will say so
-- the biggest speed gain comes from batched TempoCNN runs and removing unnecessary key extraction from the TempoCNN container path
+- the biggest speed gains come from batched TempoCNN runs and keeping both model workers warm
 - the librosa baseline remains CPU-bound
-- MusicalKeyCNN now defaults to `full_track`; `balanced` is no longer part of the normal workflow because it did not show a useful speed advantage
-- automatic chroma fallback is disabled for the primary MusicalKeyCNN path; if the model is unavailable, analysis now falls back to a tagged key only when one exists
+- MusicalKeyCNN now uses `full_track` as the settled production path
+- automatic chroma fallback is disabled; if MusicalKeyCNN is unavailable, analysis falls back to a tagged key only when one exists
 
 ## Intent for the next commits
 

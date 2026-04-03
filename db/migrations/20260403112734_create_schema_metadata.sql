@@ -1,5 +1,12 @@
 -- migrate:up
+CREATE TABLE IF NOT EXISTS schema_metadata (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  "key" TEXT NOT NULL UNIQUE,
+  value TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 
 
 -- migrate:down
-
+DROP TABLE IF EXISTS schema_metadata;

@@ -30,6 +30,20 @@ For a clean Windows bootstrap from a fresh clone, follow:
 
 - [Bootstrap on Windows](d:/Personal%20Projects/CueMate/cuemate-engine/docs/bootstrap-windows.md)
 
+## Environment setup
+
+Before running migrations or services, copy `.env.example` to `.env` and adjust any values needed for your machine:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+This is required because [compose.yaml](d:/Personal%20Projects/CueMate/cuemate-engine/compose.yaml) uses `env_file: - .env`. Make sure `.env` exists before running commands like:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\docker-compose.ps1 --profile ops run --rm migrate
+```
+
 ## Useful commands
 
 Validate the protobuf contract:
@@ -60,5 +74,5 @@ powershell -ExecutionPolicy Bypass -File .\scripts\docker-compose.ps1 --profile 
 
 - add Python scoring-service and analysis-plane packages under `python/src/`
 - add Go API and orchestration packages under `go/cmd/` and `go/internal/`
-- add the first SQLite migration files in `db/migrations/`
+- add subsequent migrations as the schema evolves
 - add service Dockerfiles only when real app entrypoints exist

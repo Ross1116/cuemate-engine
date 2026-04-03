@@ -19,7 +19,7 @@ This repository is intentionally local-first.
 
 ## What we are explicitly not doing yet
 
-- No hosted primary Postgres.
-- No Kubernetes.
-- No cloud-first deployment assumption.
-- No separate scoring implementation outside the Python service.
+- Hosted primary Postgres is out of scope.
+- Kubernetes will not be used.
+- We do not assume cloud-first deployments.
+- Scoring remains inside the Python service.

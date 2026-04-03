@@ -1,5 +1,38 @@
 param()
 
+function Invoke-ExternalCommand {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$FilePath,
+    [string[]]$Arguments = @()
+  )
+
+  $stdoutPath = [System.IO.Path]::GetTempFileName()
+  $stderrPath = [System.IO.Path]::GetTempFileName()
+
+  try {
+    $process = Start-Process -FilePath $FilePath -ArgumentList $Arguments -NoNewWindow -Wait -PassThru -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+    $stdout = Get-Content $stdoutPath -Raw -ErrorAction SilentlyContinue
+    $stderr = Get-Content $stderrPath -Raw -ErrorAction SilentlyContinue
+
+    if ($null -eq $stdout) { $stdout = '' }
+    if ($null -eq $stderr) { $stderr = '' }
+
+    $combined = ((@($stdout.TrimEnd(), $stderr.TrimEnd())) | Where-Object { $_ }) -join "`n"
+    $firstLine = ($combined -split "`r?`n" | Where-Object { $_ } | Select-Object -First 1)
+    if (-not $firstLine) {
+      $firstLine = '[no output]'
+    }
+
+    return [pscustomobject]@{
+      ExitCode = $process.ExitCode
+      Output = $firstLine
+    }
+  } finally {
+    Remove-Item $stdoutPath, $stderrPath -ErrorAction SilentlyContinue
+  }
+}
+
 $checks = @(
   @{ Name = 'git'; Command = 'git'; Args = @('--version') },
   @{ Name = 'go'; Command = 'go'; Args = @('version') },
@@ -18,8 +51,13 @@ foreach ($check in $checks) {
   }
 
   try {
-    $output = & $cmd.Source @($check.Args) 2>&1 | Select-Object -First 1
-    Write-Output ('[ok] ' + $check.Name + ' -> ' + $output)
+    $result = Invoke-ExternalCommand -FilePath $cmd.Source -Arguments $check.Args
+    $output = $result.Output
+    if ($result.ExitCode -ne 0) {
+      Write-Output ('[warning] ' + $check.Name + ' found but failed to execute (exit ' + $result.ExitCode + '): ' + $output)
+    } else {
+      Write-Output ('[ok] ' + $check.Name + ' -> ' + $output)
+    }
   } catch {
     Write-Output ('[warning] ' + $check.Name + ' found but failed to execute: ' + $_.Exception.Message)
   }
@@ -32,16 +70,34 @@ if (Test-Path '.env') {
 }
 
 try {
-  $dockerInfo = docker info 2>&1 | Select-Object -First 1
-  Write-Output ('[ok] docker daemon reachable -> ' + $dockerInfo)
+  $dockerResult = Invoke-ExternalCommand -FilePath 'docker' -Arguments @('info')
+  $dockerInfo = $dockerResult.Output
+  if ($dockerResult.ExitCode -eq 0) {
+    Write-Output ('[ok] docker daemon reachable -> ' + $dockerInfo)
+  } else {
+    Write-Output ('[warning] docker daemon not reachable -> ' + $dockerInfo)
+  }
 } catch {
-  Write-Output '[warning] docker daemon not reachable'
+  $dockerInfo = $_.Exception.Message
+  Write-Output ('[warning] docker daemon not reachable -> ' + $dockerInfo)
 }
 
-if (Test-Path 'C:\Program Files\Tailscale\tailscale.exe') {
+$tailscaleCmd = if (Test-Path 'C:\Program Files\Tailscale\tailscale.exe' -PathType Leaf) {
+  'C:\Program Files\Tailscale\tailscale.exe'
+} else {
+  $tsCommand = Get-Command tailscale -ErrorAction SilentlyContinue
+  if ($tsCommand) { $tsCommand.Source }
+}
+
+if ($tailscaleCmd) {
   try {
-    $ts = & 'C:\Program Files\Tailscale\tailscale.exe' status 2>&1 | Select-Object -First 1
-    Write-Output ('[ok] tailscale status -> ' + $ts)
+    $tailscaleResult = Invoke-ExternalCommand -FilePath $tailscaleCmd -Arguments @('status')
+    $ts = $tailscaleResult.Output
+    if ($tailscaleResult.ExitCode -eq 0) {
+      Write-Output ('[ok] tailscale status -> ' + $ts)
+    } else {
+      Write-Output ('[warning] tailscale installed but status returned exit ' + $tailscaleResult.ExitCode + ' -> ' + $ts)
+    }
   } catch {
     Write-Output '[warning] tailscale installed but status could not be read from this shell'
   }

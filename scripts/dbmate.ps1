@@ -10,7 +10,7 @@ $candidates = @(
   (Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages\amacneil.dbmate_Microsoft.Winget.Source_8wekyb3d8bbwe\dbmate.exe')
 )
 
-$dbmate = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+$dbmate = $candidates | Where-Object { Test-Path $_ -PathType Leaf } | Select-Object -First 1
 if (-not $dbmate) {
   throw 'Could not find a usable dbmate executable.'
 }
@@ -18,7 +18,7 @@ if (-not $dbmate) {
 Push-Location $repoRoot
 try {
   & $dbmate '--migrations-dir' 'db/migrations' '--schema-file' 'db/schema.sql' @DbmateArgs
-  exit $LASTEXITCODE
+  return $LASTEXITCODE
 } finally {
   Pop-Location
 }

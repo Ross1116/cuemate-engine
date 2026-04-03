@@ -24,12 +24,24 @@ CueMate Engine starts as a monorepo with a hard split between the Python analysi
 - `compose.yaml` currently provides an operations-only migration service
 - Generated artifacts and local env files are kept out of git by default
 
+## Start here on a fresh machine
+
+For a clean Windows bootstrap from a fresh clone, follow:
+
+- [Bootstrap on Windows](d:/Personal%20Projects/CueMate/cuemate-engine/docs/bootstrap-windows.md)
+
 ## Useful commands
 
 Validate the protobuf contract:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\compile-proto.ps1
+```
+
+Check local prerequisites:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\check-prereqs.ps1
 ```
 
 Run dbmate from the repo root with the correct migration paths:

@@ -33,11 +33,10 @@ From the repository root:
 python -m pip install --user -e ".\python[dev]"
 ```
 
-Optional WSL-side Essentia setup for experimental tempo comparisons:
+Build the local TempoCNN Docker image used by the primary BPM backend:
 
 ```powershell
-wsl.exe python3 -m pip install essentia essentia-tensorflow
-wsl.exe python3 -m pip install "tensorflow[and-cuda]"
+powershell -ExecutionPolicy Bypass -File .\scripts\build-tempocnn-image.ps1
 ```
 
 The default TempoCNN graph expected by the CLI lives at `python/models/essentia/deepsquare-k16-3.pb`. Override it with `CUEMATE_TEMPOCNN_MODEL` or `--tempocnn-model` if you want to compare a different `.pb` model.
@@ -73,7 +72,22 @@ Important notes:
 - `tempocnn` is now the primary BPM backend used by `analyze-playlist`
 - if TempoCNN is unavailable for a track, analysis falls back to the current librosa baseline automatically and records `baseline_fallback` as the source
 - `benchmark-bpm` now defaults to `baseline,tempocnn`
-- WSL TempoCNN now defaults to `--tempocnn-accelerator auto`, which will try GPU before falling back to CPU
+- TempoCNN now runs through Docker, and `--tempocnn-accelerator auto` will try GPU before falling back to CPU
+- TempoCNN now handles BPM only; key extraction is no longer part of the TempoCNN container path
+- playlist analysis and benchmarking batch TempoCNN tracks into one container run so the model only loads once per batch
 - the default TempoCNN model shipped in the repo is `deepsquare-k16-3.pb`
-- in the current Ross-PC setup, the WSL TempoCNN path still reports CPU fallback because TensorFlow cannot finish loading the required GPU libraries yet
+- the default local Docker image name is `cuemate-tempocnn:local`, and you can override it with `CUEMATE_TEMPOCNN_IMAGE`
+- if Docker cannot expose a usable GPU cleanly, the TempoCNN notes will say it retried on CPU
 - `librosa`-based baseline analysis remains CPU-bound
+
+Manual Docker debug for one track:
+
+```powershell
+docker run --rm --gpus all `
+  -v "${PWD}:/workspace:ro" `
+  -v "D:\Personal Projects\Music:/audio:ro" `
+  cuemate-tempocnn:local `
+  python /workspace/docker/tempocnn/run_tempocnn.py `
+  "/audio/Fred again/Fred again.. - ..FEISTY.flac" `
+  "/workspace/python/models/essentia/deepsquare-k16-3.pb"
+```

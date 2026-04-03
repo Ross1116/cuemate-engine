@@ -18,6 +18,7 @@ from cuemate_analysis.tempo_experiments import (
     TempoEstimate,
     estimate_baseline_bpm,
     estimate_tempocnn_bpm,
+    estimate_tempocnn_bpms,
     normalize_tempo_backend,
     resolve_tempocnn_model_path,
 )
@@ -73,12 +74,17 @@ def run_selected_backend(
     path: Path,
     settings,
     *,
+    prefetched_tempocnn_estimates: dict[Path, TempoEstimate] | None = None,
     tempocnn_model: str | None = None,
     tempocnn_accelerator: str = "auto",
 ) -> TempoEstimate:
     normalized_backend = normalize_tempo_backend(backend)
     if normalized_backend == TEMPO_BACKEND_BASELINE:
         return estimate_baseline_bpm(path, settings)
+    if prefetched_tempocnn_estimates is not None:
+        prefetched = prefetched_tempocnn_estimates.get(path.resolve())
+        if prefetched is not None:
+            return prefetched
     return estimate_tempocnn_bpm(
         path,
         model_path=tempocnn_model,
@@ -138,7 +144,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--tempocnn-accelerator",
         choices=["auto", "cpu"],
         default="auto",
-        help="WSL TempoCNN accelerator preference. Default: auto.",
+        help="TempoCNN Docker accelerator preference. Default: auto.",
     )
 
     list_parser = subparsers.add_parser(
@@ -175,7 +181,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--tempocnn-accelerator",
         choices=["auto", "cpu"],
         default="auto",
-        help="WSL TempoCNN accelerator preference. Default: auto.",
+        help="TempoCNN Docker accelerator preference. Default: auto.",
     )
 
     benchmark_parser = subparsers.add_parser(
@@ -211,7 +217,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--tempocnn-accelerator",
         choices=["auto", "cpu"],
         default="auto",
-        help="WSL TempoCNN accelerator preference. Default: auto.",
+        help="TempoCNN Docker accelerator preference. Default: auto.",
     )
 
     return parser
@@ -253,9 +259,34 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
         if not rows:
             raise SystemExit(f"Playlist '{playlist_name}' was not found. Import it first.")
 
+        prepared_tracks = [
+            {
+                "row": row,
+                "track": read_track_metadata(Path(row["file_path"])),
+            }
+            for row in rows
+        ]
+        prefetched_tempocnn_estimates: dict[Path, TempoEstimate] = {}
+        if args.tempo_backend == TEMPO_BACKEND_TEMPOCNN:
+            pending_paths = [
+                item["track"].file_path
+                for item in prepared_tracks
+                if args.force
+                or item["row"]["source_file_hash"] != item["track"].file_hash
+                or item["row"]["analysis_signature"] != effective_analysis_signature
+                or item["row"]["analysis_mode"] != args.analysis_mode
+            ]
+            prefetched_tempocnn_estimates = estimate_tempocnn_bpms(
+                pending_paths,
+                model_path=args.tempocnn_model,
+                accelerator=args.tempocnn_accelerator,
+            )
+
         total = len(rows)
         processed = 0
-        for index, row in enumerate(rows, start=1):
+        for index, item in enumerate(prepared_tracks, start=1):
+            row = item["row"]
+            track = item["track"]
             created_at = utc_now()
             job_id = database.create_analysis_job(
                 playlist_id=row["playlist_id"],
@@ -271,15 +302,12 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
             start_time = time.perf_counter()
             database.mark_analysis_job_started(job_id, created_at)
             try:
-                track = read_track_metadata(Path(row["file_path"]))
                 database.upsert_track(track, utc_now())
-                existing = database.get_existing_analysis(track.id)
                 if (
                     not args.force
-                    and existing is not None
-                    and existing["source_file_hash"] == track.file_hash
-                    and existing["analysis_signature"] == effective_analysis_signature
-                    and existing["analysis_mode"] == args.analysis_mode
+                    and row["source_file_hash"] == track.file_hash
+                    and row["analysis_signature"] == effective_analysis_signature
+                    and row["analysis_mode"] == args.analysis_mode
                 ):
                     duration_seconds = round(time.perf_counter() - start_time, 3)
                     database.mark_analysis_job_completed(
@@ -308,6 +336,7 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
                     tempo_backend=args.tempo_backend,
                     tempocnn_model=args.tempocnn_model,
                     tempocnn_accelerator=args.tempocnn_accelerator,
+                    prefetched_tempocnn_estimate=prefetched_tempocnn_estimates.get(track.file_path.resolve()),
                     analysis_signature=effective_analysis_signature,
                 )
                 database.upsert_track_features(result)
@@ -402,8 +431,7 @@ def handle_compare_bpm(args: argparse.Namespace) -> int:
     if tempocnn.available and tempocnn.bpm is not None and tempocnn.confidence is not None:
         print(
             f"TempoCNN: {summarize_estimate(tempocnn)} "
-            f"(confidence {tempocnn.confidence:.2f}, "
-            f"key {tempocnn.details['key']} {tempocnn.details['scale']})"
+            f"(confidence {tempocnn.confidence:.2f})"
         )
     else:
         print(f"TempoCNN: {summarize_estimate(tempocnn)}")
@@ -428,6 +456,14 @@ def handle_benchmark_bpm(args: argparse.Namespace) -> int:
         f"Benchmarking {len(rows)} track(s) from '{args.playlist}' with backends: {', '.join(args.backends)}"
     )
 
+    prefetched_tempocnn_estimates: dict[Path, TempoEstimate] | None = None
+    if TEMPO_BACKEND_TEMPOCNN in args.backends:
+        prefetched_tempocnn_estimates = estimate_tempocnn_bpms(
+            [Path(row["file_path"]) for row in rows],
+            model_path=args.tempocnn_model,
+            accelerator=args.tempocnn_accelerator,
+        )
+
     for index, row in enumerate(rows, start=1):
         path = Path(row["file_path"])
         metadata = read_track_metadata(path)
@@ -445,6 +481,7 @@ def handle_benchmark_bpm(args: argparse.Namespace) -> int:
                 backend,
                 path,
                 settings,
+                prefetched_tempocnn_estimates=prefetched_tempocnn_estimates,
                 tempocnn_model=args.tempocnn_model,
                 tempocnn_accelerator=args.tempocnn_accelerator,
             )
@@ -454,10 +491,8 @@ def handle_benchmark_bpm(args: argparse.Namespace) -> int:
             row_payload[f"{backend}_elapsed_ms"] = estimate.elapsed_ms
             row_payload[f"{backend}_notes"] = " | ".join(estimate.notes)
             if backend == TEMPO_BACKEND_TEMPOCNN:
-                row_payload[f"{backend}_key"] = estimate.details.get("key")
-                row_payload[f"{backend}_scale"] = estimate.details.get("scale")
-                row_payload[f"{backend}_key_strength"] = estimate.details.get("key_strength")
                 row_payload[f"{backend}_model_name"] = estimate.details.get("model_name")
+                row_payload[f"{backend}_batch_size"] = estimate.details.get("batch_size")
             line_parts.append(f"{backend}={summarize_estimate(estimate)}")
 
         report_rows.append(row_payload)

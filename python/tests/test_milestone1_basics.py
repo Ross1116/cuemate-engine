@@ -58,8 +58,8 @@ def test_effective_analysis_signature_changes_for_essentia_tempocnn() -> None:
     assert signature == "m1-stable-tempo-tempocnn-deepsquare-k16-3-auto"
 
 
-def test_parse_backend_list_normalizes_tempocnn_alias_and_deduplicates() -> None:
-    parsed = parse_backend_list("baseline,tempocnn,essentia_wsl_tempocnn")
+def test_parse_backend_list_deduplicates_entries() -> None:
+    parsed = parse_backend_list("baseline,tempocnn,tempocnn")
 
     assert parsed == ["baseline", "tempocnn"]
 

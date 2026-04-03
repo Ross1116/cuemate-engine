@@ -170,6 +170,7 @@ def resolve_bpm_with_backend(
     tempo_backend: str,
     tempocnn_model: str | None = None,
     tempocnn_accelerator: str = "auto",
+    prefetched_tempocnn_estimate=None,
 ) -> dict[str, float | str]:
     if tempo_backend == "baseline":
         return resolve_bpm(track.bpm_tag, detect_bpm(y, sr), detected_source="detected")
@@ -184,7 +185,7 @@ def resolve_bpm_with_backend(
     if normalized_backend != TEMPO_BACKEND_TEMPOCNN:
         raise ValueError(f"Unsupported tempo backend: {tempo_backend}")
 
-    estimate = estimate_tempocnn_bpm(
+    estimate = prefetched_tempocnn_estimate or estimate_tempocnn_bpm(
         track.file_path,
         model_path=tempocnn_model,
         accelerator=tempocnn_accelerator,
@@ -338,6 +339,7 @@ def analyze_track(
     tempo_backend: str = "tempocnn",
     tempocnn_model: str | None = None,
     tempocnn_accelerator: str = "auto",
+    prefetched_tempocnn_estimate=None,
     analysis_signature: str | None = None,
 ) -> AnalysisResult:
     y, sr = librosa.load(
@@ -355,6 +357,7 @@ def analyze_track(
         tempo_backend=tempo_backend,
         tempocnn_model=tempocnn_model,
         tempocnn_accelerator=tempocnn_accelerator,
+        prefetched_tempocnn_estimate=prefetched_tempocnn_estimate,
     )
     key = resolve_key(track.key_tag, detect_key(y, sr))
     energy = extract_energy(y)

@@ -78,11 +78,10 @@ Install the Python analysis CLI in editable mode:
 python -m pip install --user -e ".\python[dev]"
 ```
 
-Optional WSL-side Essentia setup for experimental tempo comparisons:
+Build the local TempoCNN Docker image used by the primary BPM backend:
 
 ```powershell
-wsl.exe python3 -m pip install essentia essentia-tensorflow
-wsl.exe python3 -m pip install "tensorflow[and-cuda]"
+powershell -ExecutionPolicy Bypass -File .\scripts\build-tempocnn-image.ps1
 ```
 
 ## Milestone 1 CLI
@@ -128,13 +127,33 @@ python -m cuemate_analysis benchmark-bpm --playlist "Fred again"
 python -m cuemate_analysis benchmark-bpm --playlist "Fred again" --backends baseline,tempocnn --limit 5 --output .\data\benchmarks\fred-again.csv
 ```
 
-TempoCNN is now the primary tempo path, exposed through WSL for comparison, benchmarking, and persisted tempo analysis rather than the default Windows runtime. The default TempoCNN model path is `python/models/essentia/deepsquare-k16-3.pb`.
+TempoCNN is now the primary tempo path for comparison, benchmarking, and persisted tempo analysis. The default TempoCNN model path is `python/models/essentia/deepsquare-k16-3.pb`, and the default local Docker image name is `cuemate-tempocnn:local`.
+
+Speed notes:
+
+- TempoCNN is now used for BPM only; key extraction is no longer part of the TempoCNN Docker path
+- playlist analysis and `benchmark-bpm` batch TempoCNN tracks into one container run, so the model only loads once per batch
+- the host-side analyzer still computes the remaining absolute features locally with `librosa`
+
+Manual Docker debug for one track:
+
+```powershell
+docker run --rm --gpus all `
+  -v "${PWD}:/workspace:ro" `
+  -v "D:\Personal Projects\Music:/audio:ro" `
+  cuemate-tempocnn:local `
+  python /workspace/docker/tempocnn/run_tempocnn.py `
+  "/audio/Fred again/Fred again.. - ..FEISTY.flac" `
+  "/workspace/python/models/essentia/deepsquare-k16-3.pb"
+```
 
 GPU notes:
 
 - TempoCNN now defaults to `--tempocnn-accelerator auto` and will try GPU instead of forcing CPU
 - if TempoCNN is unavailable for a track, the analyzer falls back to the current librosa baseline automatically and records `baseline_fallback` as the BPM source
-- on this current Ross-PC setup, the WSL TempoCNN path still falls back to CPU because TensorFlow cannot finish loading the needed GPU libraries yet
+- the primary TempoCNN runtime now uses Docker rather than WSL
+- if Docker cannot expose a usable GPU cleanly, TempoCNN will retry on CPU and the notes will say so
+- the biggest speed gain comes from batched TempoCNN runs and removing unnecessary key extraction from the TempoCNN container path
 - the librosa baseline remains CPU-bound
 
 ## Intent for the next commits

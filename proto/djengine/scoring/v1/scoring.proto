@@ -1,0 +1,148 @@
+syntax = "proto3";
+
+package djengine.scoring.v1;
+
+import "google/protobuf/empty.proto";
+
+option go_package = "github.com/Ross1116/cuemate-engine/go/gen/djengine/scoring/v1;scoringv1";
+
+service ScoringService {
+  rpc GetRecommendations(RecommendationRequest) returns (RecommendationResponse);
+  rpc ScoreCandidate(ScoreCandidateRequest) returns (ScoreCandidateResponse);
+  rpc GetScoringMetadata(google.protobuf.Empty) returns (ScoringMetadataResponse);
+}
+
+message SignatureMetadata {
+  string analysis_signature = 1;
+  string scoring_contract_id = 2;
+  string config_signature = 3;
+}
+
+message CompatibilityStatus {
+  bool exact_match = 1;
+  bool compatible = 2;
+  bool requires_reanalysis = 3;
+  string reason = 4;
+  repeated string notes = 5;
+}
+
+message WindowMetrics {
+  double energy = 1;
+  double bass_occupancy = 2;
+  double vocal_occupancy = 3;
+  double harmonic_density = 4;
+  double rhythmic_density = 5;
+  double cleanliness = 6;
+  map<string, double> metrics = 7;
+}
+
+message TrackContext {
+  string track_id = 1;
+  string analysis_id = 2;
+  SignatureMetadata signatures = 3;
+  double bpm = 4;
+  string musical_key = 5;
+  double energy = 6;
+  double loudness_lufs = 7;
+  repeated string tags = 8;
+  map<string, string> attributes = 9;
+}
+
+message CandidateContext {
+  TrackContext track = 1;
+  WindowMetrics intro_window = 2;
+  WindowMetrics outro_window = 3;
+  string intensity_band = 4;
+  repeated string role_hints = 5;
+  map<string, string> attributes = 6;
+}
+
+message HistoryEntry {
+  string track_id = 1;
+  string relation = 2;
+  int32 plays_ago = 3;
+  double elapsed_since_play_seconds = 4;
+}
+
+message LaneGroup {
+  string lane_id = 1;
+  string display_name = 2;
+  string summary = 3;
+}
+
+message SetContext {
+  string session_id = 1;
+  string current_track_id = 2;
+  double current_track_position_seconds = 3;
+  double target_mix_in_seconds = 4;
+  repeated HistoryEntry history = 5;
+  map<string, string> attributes = 6;
+}
+
+message WeightAdaptation {
+  string adaptation_id = 1;
+  map<string, double> component_weights = 2;
+  string explanation = 3;
+}
+
+message ScoredCandidate {
+  CandidateContext candidate = 1;
+  double final_score = 2;
+  LaneGroup lane_group = 3;
+  repeated string advisory_hints = 4;
+  map<string, double> score_components = 5;
+  string explanation = 6;
+  double confidence = 7;
+  repeated string confidence_notes = 8;
+}
+
+message RecommendationRequest {
+  SetContext set_context = 1;
+  TrackContext current_track = 2;
+  repeated CandidateContext candidates = 3;
+  int32 max_results = 4;
+  SignatureMetadata expected_signatures = 5;
+  WeightAdaptation requested_weight_adaptation = 6;
+}
+
+message RecommendationResponse {
+  repeated ScoredCandidate recommendations = 1;
+  SignatureMetadata active_signatures = 2;
+  CompatibilityStatus compatibility = 3;
+  WeightAdaptation applied_weight_adaptation = 4;
+  string recommendations_status = 5;
+  string note = 6;
+}
+
+message ScoreCandidateRequest {
+  SetContext set_context = 1;
+  TrackContext current_track = 2;
+  CandidateContext candidate = 3;
+  SignatureMetadata expected_signatures = 4;
+  WeightAdaptation requested_weight_adaptation = 5;
+}
+
+message ScoreCandidateResponse {
+  ScoredCandidate scored_candidate = 1;
+  SignatureMetadata active_signatures = 2;
+  CompatibilityStatus compatibility = 3;
+  WeightAdaptation applied_weight_adaptation = 4;
+}
+
+message ComponentMetadata {
+  string component_id = 1;
+  string description = 2;
+  double weight = 3;
+}
+
+message ScoringMetadataResponse {
+  SignatureMetadata active_signatures = 1;
+  repeated string compatible_analysis_signatures = 2;
+  repeated string compatible_config_signatures = 3;
+  repeated ComponentMetadata components = 4;
+  repeated LaneGroup supported_lane_groups = 5;
+  map<string, bool> capability_flags = 6;
+  bool healthy = 7;
+  string engine_version = 8;
+  string status_note = 9;
+}

@@ -1,1 +1,30 @@
 Decision_Engine_Plan.md
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+python/.venv/
+python/.pytest_cache/
+python/.ruff_cache/
+python/.mypy_cache/
+
+# Go
+go/bin/
+go/coverage.out
+
+# Build artifacts
+dist/
+build/
+tmp/

@@ -1,0 +1,3 @@
+# Keep this directory in the repo, but ignore all local database files.
+*
+!.gitignore

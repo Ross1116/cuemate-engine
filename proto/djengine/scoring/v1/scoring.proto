@@ -2,14 +2,12 @@ syntax = "proto3";
 
 package djengine.scoring.v1;
 
-import "google/protobuf/empty.proto";
-
 option go_package = "github.com/Ross1116/cuemate-engine/go/gen/djengine/scoring/v1;scoringv1";
 
 service ScoringService {
-  rpc GetRecommendations(RecommendationRequest) returns (RecommendationResponse);
+  rpc GetRecommendations(GetRecommendationsRequest) returns (GetRecommendationsResponse);
   rpc ScoreCandidate(ScoreCandidateRequest) returns (ScoreCandidateResponse);
-  rpc GetScoringMetadata(google.protobuf.Empty) returns (ScoringMetadataResponse);
+  rpc GetScoringMetadata(GetScoringMetadataRequest) returns (GetScoringMetadataResponse);
 }
 
 message SignatureMetadata {
@@ -96,7 +94,7 @@ message ScoredCandidate {
   repeated string confidence_notes = 8;
 }
 
-message RecommendationRequest {
+message GetRecommendationsRequest {
   SetContext set_context = 1;
   TrackContext current_track = 2;
   repeated CandidateContext candidates = 3;
@@ -105,7 +103,7 @@ message RecommendationRequest {
   WeightAdaptation requested_weight_adaptation = 6;
 }
 
-message RecommendationResponse {
+message GetRecommendationsResponse {
   repeated ScoredCandidate recommendations = 1;
   SignatureMetadata active_signatures = 2;
   CompatibilityStatus compatibility = 3;
@@ -129,13 +127,15 @@ message ScoreCandidateResponse {
   WeightAdaptation applied_weight_adaptation = 4;
 }
 
+message GetScoringMetadataRequest {}
+
 message ComponentMetadata {
   string component_id = 1;
   string description = 2;
   double weight = 3;
 }
 
-message ScoringMetadataResponse {
+message GetScoringMetadataResponse {
   SignatureMetadata active_signatures = 1;
   repeated string compatible_analysis_signatures = 2;
   repeated string compatible_config_signatures = 3;

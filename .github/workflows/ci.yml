@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  proto:
+    name: proto
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Buf
+        uses: bufbuild/buf-setup-action@v1
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Buf lint
+        run: buf lint
+
+      - name: Protoc compile check
+        run: |
+          mkdir -p /tmp/cuemate
+          protoc \
+            --proto_path=proto \
+            --descriptor_set_out=/tmp/cuemate/scoring.pb \
+            proto/djengine/scoring/v1/scoring.proto
+
+  go:
+    name: go
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: go
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
+
+      - name: Go test
+        shell: bash
+        run: |
+          if find . -type f -name '*.go' -not -path './gen/*' | grep -q .; then
+            go test ./...
+          else
+            echo "No Go source files yet; skipping go test."
+          fi
+
+  python:
+    name: python
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Python scaffold checks
+        shell: bash
+        run: |
+          python -m compileall python/src python/tests
+          if find python -type f -name '*.py' | grep -q .; then
+            python -m pip install --upgrade pip
+            python -m pip install ruff
+            ruff check python/src python/tests
+          else
+            echo "No Python source files yet; skipping Ruff."
+          fi

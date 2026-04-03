@@ -1,0 +1,37 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: en-US
+
+early_access: false
+
+reviews:
+  profile: chill
+  high_level_summary: true
+  high_level_summary_placeholder: '@coderabbitai summary'
+  review_status: true
+  collapse_walkthrough: false
+  request_changes_workflow: false
+  auto_review:
+    enabled: true
+    drafts: false
+  path_filters:
+    - '!data/**'
+    - '!go/gen/**'
+    - '!python/generated/**'
+  path_instructions:
+    - path: 'proto/**/*.proto'
+      instructions: |
+        Focus on protobuf contract clarity, naming consistency, backward compatibility, and avoiding language-specific leakage into the shared API.
+    - path: 'go/**'
+      instructions: |
+        Focus on API behavior, timeouts, error handling, and keeping scoring logic out of the Go plane.
+    - path: 'python/**'
+      instructions: |
+        Focus on deterministic analysis behavior, artifact compatibility, reproducibility, and correctness of the scoring service.
+  tools:
+    actionlint:
+      enabled: true
+    yamllint:
+      enabled: true
+
+chat:
+  auto_reply: true

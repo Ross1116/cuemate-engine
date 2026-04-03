@@ -12,12 +12,12 @@ from cuemate_analysis.analysis import analyze_track, utc_now
 from cuemate_analysis.config import load_runtime_settings
 from cuemate_analysis.database import Database
 from cuemate_analysis.ingest import discover_audio_files, make_playlist_id, read_track_metadata
-from cuemate_analysis.key_experiments import (
+from cuemate_analysis.key_backend import (
     MUSICALKEYCNN_POLICY_FULL_TRACK,
     estimate_musicalkeycnn_keys,
     resolve_musicalkeycnn_model_path,
 )
-from cuemate_analysis.tempo_experiments import (
+from cuemate_analysis.tempo_backend import (
     TempoEstimate,
     estimate_tempocnn_bpms,
     resolve_tempocnn_model_path,

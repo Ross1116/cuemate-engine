@@ -6,8 +6,8 @@ from cuemate_analysis.cli import build_effective_analysis_signature
 from cuemate_analysis.analysis import parse_key_label
 from cuemate_analysis.ingest import discover_audio_files, make_playlist_id, make_track_id
 from cuemate_analysis.models import ImportedTrack
-from cuemate_analysis.tempo_experiments import TempoEstimate
-from cuemate_analysis.key_experiments import KeyEstimate
+from cuemate_analysis.tempo_backend import TempoEstimate
+from cuemate_analysis.key_backend import KeyEstimate
 
 
 def test_parse_key_label_supports_camelot_and_note_names() -> None:
@@ -73,7 +73,7 @@ def test_resolve_bpm_with_backend_falls_back_to_baseline_when_tempocnn_is_unavai
     )
 
     monkeypatch.setattr(
-        "cuemate_analysis.tempo_experiments.estimate_tempocnn_bpm",
+        "cuemate_analysis.tempo_backend.estimate_tempocnn_bpm",
         lambda *args, **kwargs: TempoEstimate(
             backend="tempocnn",
             bpm=None,
@@ -119,7 +119,7 @@ def test_resolve_key_with_backend_falls_back_to_tag_when_musicalkeycnn_is_unavai
     )
 
     monkeypatch.setattr(
-        "cuemate_analysis.key_experiments.estimate_musicalkeycnn_key",
+        "cuemate_analysis.key_backend.estimate_musicalkeycnn_key",
         lambda *args, **kwargs: KeyEstimate(
             backend="musicalkeycnn",
             key=None,

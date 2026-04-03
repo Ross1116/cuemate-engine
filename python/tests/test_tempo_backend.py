@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 
-from cuemate_analysis.tempo_experiments import (
+from cuemate_analysis.tempo_backend import (
     DEFAULT_TEMPOCNN_MODEL,
     TEMPO_BACKEND_TEMPOCNN,
     build_tempocnn_batch_docker_command,

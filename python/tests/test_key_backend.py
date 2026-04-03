@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from cuemate_analysis.key_experiments import (
+from cuemate_analysis.key_backend import (
     DEFAULT_MUSICALKEYCNN_MODEL,
     KEY_BACKEND_MUSICALKEYCNN,
     MUSICALKEYCNN_POLICY_FULL_TRACK,

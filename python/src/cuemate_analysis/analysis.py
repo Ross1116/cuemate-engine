@@ -175,7 +175,7 @@ def resolve_bpm_with_backend(
     if tempo_backend == "baseline":
         return resolve_bpm(track.bpm_tag, detect_bpm(y, sr), detected_source="detected")
 
-    from cuemate_analysis.tempo_experiments import (
+    from cuemate_analysis.tempo_backend import (
         TEMPO_BACKEND_TEMPOCNN,
         estimate_tempocnn_bpm,
         normalize_tempo_backend,
@@ -298,7 +298,7 @@ def resolve_key_with_backend(
     musicalkeycnn_model: str | None = None,
     musicalkeycnn_image: str | None = None,
     musicalkeycnn_device: str = "auto",
-    musicalkeycnn_policy: str = "balanced",
+    musicalkeycnn_policy: str = "full_track",
     prefetched_musicalkeycnn_estimate=None,
 ) -> dict[str, str | int | float | None]:
     if key_backend == "chroma":
@@ -310,7 +310,7 @@ def resolve_key_with_backend(
             },
         )
 
-    from cuemate_analysis.key_experiments import (
+    from cuemate_analysis.key_backend import (
         KEY_BACKEND_MUSICALKEYCNN,
         estimate_musicalkeycnn_key,
         normalize_key_backend,

@@ -1,4 +1,8 @@
 Decision_Engine_Plan.md
+.env
+.env.local
+.docker-local/
+.local-tools/
 
 # OS / editor
 .DS_Store

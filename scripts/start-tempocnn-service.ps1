@@ -7,6 +7,52 @@ $servicePort = if ($env:CUEMATE_TEMPOCNN_SERVICE_PORT) { $env:CUEMATE_TEMPOCNN_S
 $driveRoots = if ($env:CUEMATE_TEMPOCNN_DRIVES) { $env:CUEMATE_TEMPOCNN_DRIVES } else { "d" }
 $accelerator = if ($env:CUEMATE_TEMPOCNN_ACCELERATOR) { $env:CUEMATE_TEMPOCNN_ACCELERATOR } else { "auto" }
 
+function Start-TempoContainer {
+    param(
+        [string[]]$DockerCommand
+    )
+
+    $output = & docker @DockerCommand 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        return @{
+            Success = $false
+            Output = $output
+            ExitCode = $LASTEXITCODE
+        }
+    }
+
+    $containerId = ($output | Select-Object -First 1)
+    if ($null -ne $containerId) {
+        $containerId = $containerId.Trim()
+    }
+    return @{
+        Success = $true
+        Output = $output
+        ExitCode = 0
+        ContainerId = $containerId
+    }
+}
+
+function Convert-TempoCommandToCpu {
+    param(
+        [string[]]$DockerCommand,
+        [string]$ImageTag
+    )
+
+    $converted = @()
+    for ($i = 0; $i -lt $DockerCommand.Count; $i++) {
+        if ($DockerCommand[$i] -eq "--gpus" -and $i + 1 -lt $DockerCommand.Count) {
+            $i++
+            continue
+        }
+        if ($DockerCommand[$i] -eq $ImageTag) {
+            $converted += @("--env", "CUDA_VISIBLE_DEVICES=-1")
+        }
+        $converted += $DockerCommand[$i]
+    }
+    return $converted
+}
+
 $existingContainerId = (& docker ps -a --filter "name=^$serviceName$" --format "{{.ID}}") | Select-Object -First 1
 if ($existingContainerId) {
     & docker rm -f $serviceName | Out-Null
@@ -41,10 +87,31 @@ $command += @(
 
 Push-Location $repoRoot
 try {
-    $containerId = (& docker @command | Select-Object -First 1).Trim()
-    if ($LASTEXITCODE -ne 0) {
-        exit $LASTEXITCODE
+    $launch = Start-TempoContainer -DockerCommand $command
+    if (-not $launch.Success) {
+        $retryOnCpu = $false
+        if ($accelerator -eq "auto") {
+            $stderrText = [string]::Join("`n", @($launch.Output))
+            if (
+                $stderrText -match "could not select device driver" -or
+                $stderrText -match "capabilities:\s*\[\[gpu\]\]" -or
+                $stderrText -match "nvidia-container-runtime" -or
+                $stderrText -match "unknown flag:\s*--gpus"
+            ) {
+                $retryOnCpu = $true
+            }
+        }
+        if (-not $retryOnCpu) {
+            exit $launch.ExitCode
+        }
+
+        $cpuCommand = Convert-TempoCommandToCpu -DockerCommand $command -ImageTag $imageTag
+        $launch = Start-TempoContainer -DockerCommand $cpuCommand
+        if (-not $launch.Success) {
+            exit $launch.ExitCode
+        }
     }
+    $containerId = $launch.ContainerId
 
     $deadline = (Get-Date).AddSeconds(20)
     $healthUrl = "http://127.0.0.1:$servicePort/health"

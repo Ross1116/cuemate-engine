@@ -6,6 +6,7 @@ import json
 import logging
 import os
 from pathlib import Path, PurePath
+import shutil
 import subprocess
 import time
 from typing import Any
@@ -137,6 +138,23 @@ def container_path_for_model(model_path: Path) -> tuple[list[str], str]:
     return ([], f"/workspace/{relative.as_posix()}")
 
 
+def host_gpu_available() -> bool:
+    nvidia_smi = shutil.which("nvidia-smi")
+    if not nvidia_smi:
+        return False
+    try:
+        completed = subprocess.run(
+            [nvidia_smi, "-L"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except Exception:
+        return False
+    return completed.returncode == 0 and bool((completed.stdout or "").strip())
+
+
 def build_musicalkeycnn_model_identity(model_path: Path) -> str:
     stat_result = model_path.stat()
     return f"{model_path.resolve().as_posix()}:{int(stat_result.st_mtime_ns)}:{int(stat_result.st_size)}"
@@ -180,6 +198,11 @@ def build_musicalkeycnn_service_run_command(
     ]
     if resolved_device == "cuda":
         command.extend(["--gpus", "all"])
+    elif resolved_device == "auto":
+        if host_gpu_available():
+            command.extend(["--gpus", "all"])
+        else:
+            command.extend(["--env", "CUDA_VISIBLE_DEVICES=-1"])
     elif resolved_device == "cpu":
         command.extend(["--env", "CUDA_VISIBLE_DEVICES=-1"])
     for drive in sorted({letter.lower() for letter in drive_letters}):
@@ -316,6 +339,10 @@ def ensure_musicalkeycnn_service(
     healthy, health_error = wait_for_musicalkeycnn_service_health(service_port)
     if healthy:
         return True, []
+    try:
+        remove_docker_container(service_name)
+    except Exception as exc:
+        logger.debug("Failed to clean up unhealthy MusicalKeyCNN service container '%s'.", service_name, exc_info=exc)
     return False, [f"MusicalKeyCNN service did not become healthy: {health_error}"]
 
 
@@ -582,43 +609,69 @@ def estimate_musicalkeycnn_keys(
         }
 
     started = time.perf_counter()
-    container_track_paths = {path: windows_path_to_container_path(path) for path in pending_paths}
-    service_ready, startup_notes = ensure_musicalkeycnn_service(
-        model_path=resolved_model_path,
-        image_name=resolved_image_name,
-        device=normalized_device,
-        service_name=service_name,
-        service_port=service_port,
-        drive_letters=[path.drive.rstrip(":").lower() for path in [*pending_paths, resolved_model_path]],
-    )
+    container_track_paths: dict[Path, str] = {}
+    unavailable_estimates: dict[Path, KeyEstimate] = {}
+    service_candidate_paths: list[Path] = []
+    for path in pending_paths:
+        try:
+            container_track_paths[path] = windows_path_to_container_path(path)
+            service_candidate_paths.append(path)
+        except Exception as exc:
+            unavailable_estimates[path] = build_musicalkeycnn_unavailable_estimate(
+                elapsed_ms=None,
+                notes=[f"Could not map track path into the MusicalKeyCNN container: {exc}"],
+            )
+
+    if not service_candidate_paths:
+        return {**cached_estimates, **unavailable_estimates}
+
+    try:
+        drive_letters = sorted(
+            {
+                path.drive.rstrip(":").lower()
+                for path in [*service_candidate_paths, resolved_model_path]
+                if path.drive
+            }
+        )
+        service_ready, startup_notes = ensure_musicalkeycnn_service(
+            model_path=resolved_model_path,
+            image_name=resolved_image_name,
+            device=normalized_device,
+            service_name=service_name,
+            service_port=service_port,
+            drive_letters=drive_letters,
+        )
+    except Exception as exc:
+        startup_notes = [f"MusicalKeyCNN service startup failed: {exc}"]
+        service_ready = False
     if not service_ready:
         uncached_unavailable = {
             path: build_musicalkeycnn_unavailable_estimate(elapsed_ms=None, notes=startup_notes)
-            for path in pending_paths
+            for path in service_candidate_paths
         }
-        return {**cached_estimates, **uncached_unavailable}
+        return {**cached_estimates, **unavailable_estimates, **uncached_unavailable}
 
     service_payload, request_notes = request_musicalkeycnn_service(
         service_port=service_port,
-        track_paths=[container_track_paths[path] for path in pending_paths],
+        track_paths=[container_track_paths[path] for path in service_candidate_paths],
         model_path=(
             container_path_for_model(resolved_model_path)[1]
         ),
         device=normalized_device,
         policy=normalized_policy,
     )
-    elapsed_ms = round((time.perf_counter() - started) * 1000.0 / max(len(pending_paths), 1), 1)
+    elapsed_ms = round((time.perf_counter() - started) * 1000.0 / max(len(service_candidate_paths), 1), 1)
     if service_payload is None:
         notes = [*startup_notes, *request_notes]
         uncached_unavailable = {
             path: build_musicalkeycnn_unavailable_estimate(elapsed_ms=elapsed_ms, notes=notes)
-            for path in pending_paths
+            for path in service_candidate_paths
         }
-        return {**cached_estimates, **uncached_unavailable}
+        return {**cached_estimates, **unavailable_estimates, **uncached_unavailable}
 
     results_by_track = {str(item.get("track_path")): item for item in service_payload.get("results", [])}
     estimates: dict[Path, KeyEstimate] = {}
-    for path in pending_paths:
+    for path in service_candidate_paths:
         item = results_by_track.get(container_track_paths[path])
         if item is None:
             estimates[path] = build_musicalkeycnn_unavailable_estimate(
@@ -645,10 +698,10 @@ def estimate_musicalkeycnn_keys(
             device=normalized_device,
             policy=normalized_policy,
             notes=["Warm Docker service path."],
-            batch_size=len(pending_paths),
+            batch_size=len(service_candidate_paths),
         )
     persist_musicalkeycnn_estimates(estimates, cache_descriptors)
-    return {**cached_estimates, **estimates}
+    return {**cached_estimates, **unavailable_estimates, **estimates}
 
 
 def estimate_musicalkeycnn_key(

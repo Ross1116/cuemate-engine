@@ -52,7 +52,8 @@ def test_windows_path_to_container_path_maps_drive_root() -> None:
     assert windows_path_to_container_path(path) == "/host/d/Personal Projects/Music/example.wav"
 
 
-def test_build_musicalkeycnn_service_run_command_includes_drive_mounts() -> None:
+def test_build_musicalkeycnn_service_run_command_includes_drive_mounts(monkeypatch) -> None:
+    monkeypatch.setattr("cuemate_analysis.key_backend.host_gpu_available", lambda: False)
     command = build_musicalkeycnn_service_run_command(
         ["d", "e"],
         image_name="cuemate-musicalkeycnn:test",

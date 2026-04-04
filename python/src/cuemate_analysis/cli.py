@@ -665,13 +665,19 @@ def handle_analyze_bpm(args: argparse.Namespace) -> int:
 
 
 def handle_analyze_bpm_key(args: argparse.Namespace) -> int:
+    settings = load_runtime_settings()
     path = Path(args.path).expanduser().resolve()
     if not path.is_file():
         raise FileNotFoundError(f"Audio file was not found: {path}")
 
     metadata = read_track_metadata(path)
     bpm_estimate = estimate_tempocnn_bpms([path])[path.resolve()]
-    key_estimate = estimate_musicalkeycnn_keys([path])[path.resolve()]
+    key_estimate = estimate_musicalkeycnn_keys(
+        [path],
+        model_path=settings.analysis.key_model_path,
+        device=settings.analysis.key_device,
+        policy=settings.analysis.key_policy,
+    )[path.resolve()]
     payload = build_bpm_key_payload(path, metadata, bpm_estimate, key_estimate)
 
     if args.json:

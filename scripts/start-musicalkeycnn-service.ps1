@@ -6,6 +6,7 @@ $ErrorActionPreference = "Stop"
 
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $repoRootPath = [System.IO.Path]::GetFullPath([string]$repoRoot)
+$repoRootPrefix = $repoRootPath.TrimEnd('\', '/')
 $imageTag = if ($env:CUEMATE_MUSICALKEYCNN_IMAGE) { $env:CUEMATE_MUSICALKEYCNN_IMAGE } else { "cuemate-musicalkeycnn:local" }
 $serviceName = if ($env:CUEMATE_MUSICALKEYCNN_SERVICE_NAME) { $env:CUEMATE_MUSICALKEYCNN_SERVICE_NAME } else { "cuemate-musicalkeycnn-service" }
 $servicePort = if ($env:CUEMATE_MUSICALKEYCNN_SERVICE_PORT) { $env:CUEMATE_MUSICALKEYCNN_SERVICE_PORT } else { "47832" }
@@ -24,8 +25,12 @@ if (-not [string]::IsNullOrWhiteSpace($CheckpointPath)) {
     $resolvedCheckpointPath = Resolve-Path $CheckpointPath
     $resolvedCheckpointFullPath = [System.IO.Path]::GetFullPath([string]$resolvedCheckpointPath)
 
-    if ($resolvedCheckpointFullPath.StartsWith($repoRootPath, [System.StringComparison]::OrdinalIgnoreCase)) {
-        $relativePath = $resolvedCheckpointFullPath.Substring($repoRootPath.Length).TrimStart('\', '/')
+    if (
+        $resolvedCheckpointFullPath.Equals($repoRootPrefix, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $resolvedCheckpointFullPath.StartsWith($repoRootPrefix + "\", [System.StringComparison]::OrdinalIgnoreCase) -or
+        $resolvedCheckpointFullPath.StartsWith($repoRootPrefix + "/", [System.StringComparison]::OrdinalIgnoreCase)
+    ) {
+        $relativePath = $resolvedCheckpointFullPath.Substring($repoRootPrefix.Length).TrimStart('\', '/')
         $modelPathInContainer = "/workspace/" + ($relativePath -replace "\\", "/")
     }
     else {
@@ -58,6 +63,25 @@ if ($device -eq "cpu") {
 elseif ($device -eq "cuda") {
     $command += @("--gpus", "all")
 }
+elseif ($device -eq "auto") {
+    $gpuAvailable = $false
+    $nvidiaSmi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
+    if ($nvidiaSmi) {
+        try {
+            & $nvidiaSmi.Source "-L" | Out-Null
+            $gpuAvailable = ($LASTEXITCODE -eq 0)
+        }
+        catch {
+            $gpuAvailable = $false
+        }
+    }
+    if ($gpuAvailable) {
+        $command += @("--gpus", "all")
+    }
+    else {
+        $command += @("--env", "CUDA_VISIBLE_DEVICES=-1")
+    }
+}
 
 foreach ($modelArg in $modelVolumeArgs) {
     $command += $modelArg
@@ -77,9 +101,13 @@ $command += @(
 
 Push-Location $repoRoot
 try {
-    $containerId = (& docker @command | Select-Object -First 1).Trim()
+    $rawOutput = & docker @command
     if ($LASTEXITCODE -ne 0) {
         exit $LASTEXITCODE
+    }
+    $containerId = ($rawOutput | Select-Object -First 1)
+    if ($null -ne $containerId) {
+        $containerId = $containerId.Trim()
     }
 
     $deadline = (Get-Date).AddSeconds(20)

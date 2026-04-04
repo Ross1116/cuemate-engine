@@ -1,0 +1,162 @@
+from __future__ import annotations
+
+import hashlib
+import os
+from pathlib import Path
+from typing import Iterable
+
+from mutagen import File as MutagenFile
+
+from cuemate_analysis.models import ImportedTrack
+
+
+SUPPORTED_AUDIO_EXTENSIONS = {
+    ".aac",
+    ".aif",
+    ".aiff",
+    ".flac",
+    ".m4a",
+    ".mp3",
+    ".ogg",
+    ".wav",
+}
+
+
+def _normalized_path_identity(path: Path) -> str:
+    return os.path.normcase(str(path.resolve()))
+
+
+def discover_audio_files(paths: Iterable[str | Path]) -> list[Path]:
+    discovered: dict[str, Path] = {}
+    for raw_path in paths:
+        path = Path(raw_path).expanduser()
+        if not path.exists():
+            raise FileNotFoundError(f"Input path does not exist: {path}")
+
+        if path.is_dir():
+            candidates = [candidate for candidate in path.rglob("*") if candidate.is_file()]
+        else:
+            candidates = [path]
+
+        for candidate in candidates:
+            if candidate.suffix.lower() not in SUPPORTED_AUDIO_EXTENSIONS:
+                continue
+            resolved = candidate.resolve()
+            discovered[_normalized_path_identity(resolved)] = resolved
+
+    return sorted(discovered.values(), key=_normalized_path_identity)
+
+
+def make_track_id(path: Path) -> str:
+    normalized = _normalized_path_identity(path).encode("utf-8")
+    return f"trk_{hashlib.sha1(normalized).hexdigest()[:16]}"
+
+
+def make_playlist_id(name: str) -> str:
+    normalized = name.strip().encode("utf-8")
+    return f"plt_{hashlib.sha1(normalized).hexdigest()[:16]}"
+
+
+def compute_file_hash(path: Path) -> str:
+    digest = hashlib.sha1()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _first_value(source: object) -> str | None:
+    if source is None:
+        return None
+    if isinstance(source, list):
+        for item in source:
+            if item is None:
+                continue
+            value = str(item).strip()
+            if value:
+                return value
+        return None
+    value = str(source).strip()
+    return value or None
+
+
+def _first_tag(tags: object, names: Iterable[str]) -> str | None:
+    if tags is None:
+        return None
+
+    if hasattr(tags, "get"):
+        for name in names:
+            try:
+                value = tags.get(name)
+            except Exception:
+                value = None
+            parsed = _first_value(value)
+            if parsed:
+                return parsed
+
+    if isinstance(tags, dict):
+        lowered = {str(key).lower(): value for key, value in tags.items()}
+        for name in names:
+            parsed = _first_value(lowered.get(name.lower()))
+            if parsed:
+                return parsed
+
+    return None
+
+
+def _parse_float(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def read_track_metadata(path: Path) -> ImportedTrack:
+    return read_track_metadata_with_overrides(path)
+
+
+def read_track_metadata_with_overrides(
+    path: Path,
+    *,
+    bpm_imported: float | None = None,
+    key_imported: str | None = None,
+    title_override: str | None = None,
+    artist_override: str | None = None,
+    genre_override: str | None = None,
+    import_source: str = "local_files",
+) -> ImportedTrack:
+    resolved = path.resolve()
+    audio_easy = MutagenFile(resolved, easy=True)
+    audio_full = MutagenFile(resolved)
+
+    duration_seconds: float | None = None
+    if audio_full is not None and getattr(audio_full, "info", None) is not None:
+        duration = getattr(audio_full.info, "length", None)
+        if duration is not None:
+            duration_seconds = float(duration)
+
+    easy_tags = getattr(audio_easy, "tags", None) if audio_easy is not None else None
+    full_tags = getattr(audio_full, "tags", None) if audio_full is not None else None
+
+    title = title_override or _first_tag(easy_tags, ["title"]) or _first_tag(full_tags, ["title"]) or resolved.stem
+    artist = artist_override or _first_tag(easy_tags, ["artist", "albumartist"]) or _first_tag(full_tags, ["artist", "albumartist"])
+    genre = genre_override or _first_tag(easy_tags, ["genre"]) or _first_tag(full_tags, ["genre"])
+    bpm_tag = _parse_float(_first_tag(easy_tags, ["bpm", "tbpm"]) or _first_tag(full_tags, ["bpm", "tbpm"]))
+    key_tag = _first_tag(easy_tags, ["initialkey", "key", "tkey"]) or _first_tag(full_tags, ["initialkey", "key", "tkey"])
+
+    return ImportedTrack(
+        id=make_track_id(resolved),
+        file_path=resolved,
+        file_hash=compute_file_hash(resolved),
+        title=title,
+        artist=artist,
+        genre=genre,
+        duration_seconds=duration_seconds,
+        bpm_imported=bpm_imported,
+        bpm_tag=bpm_tag,
+        key_imported=key_imported,
+        key_tag=key_tag,
+        import_source=import_source,
+    )

@@ -5,23 +5,24 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "cuemate-analysis"
 version = "0.1.0"
-description = "CueMate analysis-plane scaffolding."
+description = "CueMate analysis-plane ingest and absolute-analysis tools."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
   "protobuf>=6",
   "grpcio>=1.70",
+  "mutagen>=1.47,<2.0",
+  "librosa>=0.10.2,<1.0",
+  "numpy>=1.26,<2.0",
+  "scipy>=1.13,<2.0",
+  "pyloudnorm>=0.1.1,<1.0",
+  "soundfile>=0.12.1,<1.0",
 ]
 
+[project.scripts]
+cuemate-analysis = "cuemate_analysis.cli:main"
+
 [project.optional-dependencies]
-analysis = [
-  "mutagen",
-  "librosa",
-  "numpy",
-  "scipy",
-  "pyloudnorm",
-  "soundfile",
-]
 dev = [
   "grpcio-tools",
   "pytest",

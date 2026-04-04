@@ -23,6 +23,10 @@ python/.venv/
 python/.pytest_cache/
 python/.ruff_cache/
 python/.mypy_cache/
+*.egg-info/
+tf-gpu/
+venv/
+.env/
 
 # Go
 go/bin/
@@ -32,3 +36,5 @@ go/coverage.out
 dist/
 build/
 tmp/
+data/*.db
+data/*.db-*

@@ -78,7 +78,7 @@ Install the Python analysis CLI in editable mode:
 python -m pip install --user -e ".\python[dev]"
 ```
 
-Build the local TempoCNN Docker image used by the primary BPM backend:
+Build the shared TensorFlow/Essentia Docker image used by the TempoCNN BPM backend and the Essentia semantic lane:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\build-tempocnn-image.ps1
@@ -96,7 +96,7 @@ Build the local Essentia semantics Docker image used by the semantic absolute-fe
 powershell -ExecutionPolicy Bypass -File .\scripts\build-essentia-semantics-image.ps1
 ```
 
-Optional: warm-start the persistent TempoCNN service container yourself. The CLI will auto-start it on demand too.
+Optional: warm-start the shared TensorFlow/Essentia service yourself. The CLI will auto-start it on demand too.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\start-tempocnn-service.ps1
@@ -138,12 +138,20 @@ python -m cuemate_analysis import-dj-playlist --source traktor --library "D:\Exp
 python -m cuemate_analysis import-dj-playlist --source serato --library "D:\Music\_Serato_\Subcrates" --playlist "Club Set"
 ```
 
-Analyze imported tracks with absolute features only:
+Analyze imported tracks through the staged pipeline:
 
 ```powershell
-python -m cuemate_analysis analyze-playlist --playlist "My Playlist" --analysis-mode full
+python -m cuemate_analysis analyze-playlist --playlist "My Playlist"
+python -m cuemate_analysis analyze-playlist --playlist "My Playlist" --analysis-mode staged --force
+python -m cuemate_analysis run-analysis-worker --limit 25
 python -m cuemate_analysis analyze-playlist --playlist "My Playlist" --analysis-mode full --force
 ```
+
+Stage semantics:
+
+- `fast_pass`: persist BPM + key only into `track_features_fast`
+- `staged` (default): persist fast BPM + key immediately and queue full enrichment in `analysis_jobs`
+- `full`: run the same fast stage, then wait for enrichment and canonical relative refresh before returning
 
 Inspect playlist analysis state:
 
@@ -173,13 +181,14 @@ python -m cuemate_analysis analyze-bpm-key-playlist --playlist "Fred again"
 python -m cuemate_analysis analyze-bpm-key-playlist --playlist "Fred again" --limit 5 --output .\data\benchmarks\fred-again-bpm-key.csv
 ```
 
-Compute the experimental Phase 1 relative-context preview from persisted absolute features:
+Inspect the canonical persisted relative-context layer:
 
 ```powershell
 python -m cuemate_analysis analyze-relative-playlist --playlist "Fred again"
 python -m cuemate_analysis analyze-relative-playlist --playlist "Fred again" --limit 12 --json
 python -m cuemate_analysis analyze-relative-playlist --playlist "Fred again" --energy-source heuristic_legacy
 python -m cuemate_analysis analyze-relative-playlist --playlist "Fred again" --output .\data\benchmarks\fred-again-relative.csv
+python -m cuemate_analysis refresh-relative-playlist --playlist "Fred again"
 ```
 
 Experiment with multiple absolute-energy candidates on a real playlist without changing persisted analysis rows:
@@ -195,6 +204,7 @@ Download the Essentia semantic model bundle and inspect Essentia semantic output
 python -m cuemate_analysis download-essentia-semantic-models
 python -m cuemate_analysis analyze-essentia-playlist --playlist "Fred again" --limit 12
 python -m cuemate_analysis analyze-relative-playlist --playlist "Fred again" --energy-source canonical
+python -m cuemate_analysis prewarm-model-services
 ```
 
 Purge persisted TempoCNN and MusicalKeyCNN caches, and clear the warm service state so the next run is fully fresh:
@@ -205,15 +215,21 @@ python -m cuemate_analysis purge-model-cache --backend tempocnn
 python -m cuemate_analysis purge-model-cache --playlist "Fred again"
 ```
 
-Speed notes:
+Pipeline notes:
 
+- staged analysis is now the default playlist-analysis mode
+- `track_features_fast` stores fast-stage BPM + key results for immediate visual feedback
+- `analysis_jobs` now acts as the local enrichment queue for staged analysis
+- `run-analysis-worker` processes queued enrichment jobs and then refreshes canonical relative data
 - TempoCNN is now used for BPM only
 - MusicalKeyCNN is the primary key backend for playlist analysis
+- TempoCNN and Essentia semantics now share one warm TensorFlow/Essentia Docker service
 - exported Rekordbox/Traktor BPM and key metadata are now imported into the local track catalog and used during analysis resolution
 - Serato crate import currently contributes playlist membership and local file paths only; it does not provide BPM/key metadata yet
 - `analyze-bpm` and `analyze-bpm-playlist` are the intended BPM-only commands
 - `analyze-bpm-key` and `analyze-bpm-key-playlist` are the intended fast paths when you only want BPM + key
-- `analyze-relative-playlist` is a read-only experimental Milestone 2 Phase 1 preview; it computes relative context from `track_features_abs` and does not persist new tables yet
+- `analyze-relative-playlist` now reads the canonical persisted relative layer by default and auto-refreshes it when rows are missing or stale
+- `refresh-relative-playlist` explicitly refreshes canonical `track_features_rel` and `playlist_stats` for one playlist
 - `analyze-energy-playlist` is a read-only experimental workbench for comparing absolute-energy formulas on real playlists before promoting one into the production analyzer
 - `download-essentia-semantic-models` and `analyze-essentia-playlist` are the new model-acquisition and read-only inspection surfaces for Essentia semantic absolute features
 - full playlist analysis now persists:
@@ -226,14 +242,15 @@ Speed notes:
 - TempoCNN, MusicalKeyCNN, and Essentia semantics all use warm Docker workers so repeated analysis avoids model cold starts
 - both warm workers now cache results for unchanged files, so rerunning the same BPM/key playlist pass is dramatically faster
 - those persistent caches live in `data/inference-cache.db` and can be purged on demand with `purge-model-cache`
-- playlist analysis batches TempoCNN and MusicalKeyCNN work so the models stay loaded
-- MusicalKeyCNN runs through its own warm Docker worker, separate from the TempoCNN BPM worker
+- playlist analysis surfaces BPM/key quickly, then enriches semantics and canonical absolute/relative data in the background or inline depending on analysis mode
+- MusicalKeyCNN runs through its own warm PyTorch Docker worker, separate from the shared TensorFlow/Essentia BPM + semantic worker
 - the host-side analyzer still computes the remaining DSP-native primitives locally with `librosa`
 - current canonical absolute-feature split:
   - DSP-native primitives: `loudness_lufs`, `loudness_norm`, `bass_abs`, `time_signature`, `time_signature_confidence`
-  - DSP-native support signals: `energy_heuristic_abs`, `energy_sustained`, `energy_peak`, `drums_abs`, `harmonic_abs`, `groove_abs`
+  - DSP-native support signals: `energy_heuristic_abs`, `energy_sustained`, `energy_peak`
   - model-backed semantics: `danceability_abs`, `arousal_abs`, `valence_abs`, `mood_aggressive_abs`, `mood_party_abs`, `mood_relaxed_abs`
   - canonical fused intensity: `energy_abs`
+  - optional support descriptors: `drums_abs`, `harmonic_abs`, `groove_abs`
 
 Manual Docker debug for one track:
 
@@ -250,16 +267,16 @@ docker run --rm --gpus all `
 GPU notes:
 
 - if TempoCNN is unavailable for a track, the analyzer falls back to the current librosa baseline automatically and records `baseline_fallback` as the BPM source
-- the primary TempoCNN runtime now uses Docker rather than WSL
+- the primary TempoCNN runtime now uses the shared TensorFlow/Essentia Docker service rather than a standalone worker
 - if Docker cannot expose a usable GPU cleanly, TempoCNN will retry on CPU and the notes will say so
-- the biggest speed gains come from batched TempoCNN runs and keeping both model workers warm
+- the biggest speed gains come from keeping the shared TensorFlow/Essentia service and the MusicalKeyCNN worker warm
 - the librosa baseline remains CPU-bound
 - MusicalKeyCNN now uses `full_track` as the settled production path
 - automatic chroma fallback is disabled; if MusicalKeyCNN is unavailable, analysis falls back to a tagged key only when one exists
 
 ## Intent for the next commits
 
-- add Milestone 2 relative-feature tables and refresh logic
+- add the Milestone 3 recommendation/scoring core on top of canonical absolute + relative data
 - add the Python gRPC scoring service on top of the persisted analysis data
 - add the Go API and orchestration packages under `go/cmd/` and `go/internal/`
 - add service Dockerfiles only when real app entrypoints exist

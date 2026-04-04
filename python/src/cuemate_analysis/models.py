@@ -87,3 +87,28 @@ class AnalysisResult:
         payload = asdict(self)
         payload["user_id"] = "local"
         return payload
+
+
+@dataclass(frozen=True)
+class FastAnalysisResult:
+    track_id: str
+    source_file_hash: str
+    bpm: float
+    bpm_confidence: float
+    bpm_source: str
+    key: str
+    key_number: int
+    key_letter: str
+    key_confidence: float
+    key_source: str
+    key_imported: str | None
+    key_tagged: str | None
+    key_agreement: int | None
+    analyzed_at: str
+    analysis_signature: str
+    config_signature: str
+
+    def to_db_row(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["user_id"] = "local"
+        return payload

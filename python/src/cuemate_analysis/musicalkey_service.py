@@ -179,7 +179,7 @@ def main() -> int:
         except Exception as exc:
             logger.exception("Failed to warm default MusicalKeyCNN model '%s': %s", default_model, exc)
             raise
-    server = ThreadingHTTPServer(("127.0.0.1", port), MusicalKeyHandler)
+    server = ThreadingHTTPServer(("0.0.0.0", port), MusicalKeyHandler)
     server.serve_forever()
     return 0
 

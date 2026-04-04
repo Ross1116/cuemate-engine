@@ -12,7 +12,7 @@ import pyloudnorm as pyln
 
 from cuemate_analysis.config import RuntimeSettings
 from cuemate_analysis.essentia_semantic_backend import EssentiaSemanticEstimate
-from cuemate_analysis.models import AnalysisResult, ImportedTrack
+from cuemate_analysis.models import AnalysisResult, FastAnalysisResult, ImportedTrack
 
 
 PITCH_CLASSES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
@@ -889,6 +889,77 @@ def compute_dsp_lane_result(
         return DspLaneResult.failure(track_id=track.id, error=exc, elapsed_ms=elapsed_ms)
 
 
+def build_fast_analysis_result(
+    track: ImportedTrack,
+    settings: RuntimeSettings,
+    *,
+    prefetched_tempocnn_estimate=None,
+    prefetched_musicalkeycnn_estimate=None,
+    analysis_signature: str | None = None,
+) -> FastAnalysisResult:
+    if prefetched_tempocnn_estimate is not None and prefetched_tempocnn_estimate.available and prefetched_tempocnn_estimate.bpm is not None:
+        bpm = resolve_bpm(
+            track.bpm_imported,
+            track.bpm_tag,
+            {
+                "bpm": float(prefetched_tempocnn_estimate.bpm),
+                "bpm_confidence": float(prefetched_tempocnn_estimate.confidence or 0.0),
+            },
+            detected_source="tempocnn",
+        )
+    elif track.bpm_imported or track.bpm_tag:
+        bpm = resolve_bpm(
+            track.bpm_imported,
+            track.bpm_tag,
+            {"bpm": 0.0, "bpm_confidence": 0.0},
+            detected_source="metadata_only",
+        )
+    else:
+        raise ValueError("Fast analysis requires either TempoCNN BPM or imported/tagged BPM.")
+
+    if (
+        prefetched_musicalkeycnn_estimate is not None
+        and prefetched_musicalkeycnn_estimate.available
+        and prefetched_musicalkeycnn_estimate.key
+        and prefetched_musicalkeycnn_estimate.key_number is not None
+        and prefetched_musicalkeycnn_estimate.key_letter is not None
+    ):
+        key = resolve_key(
+            track.key_tag,
+            track.key_imported,
+            {
+                "key": prefetched_musicalkeycnn_estimate.key,
+                "key_number": prefetched_musicalkeycnn_estimate.key_number,
+                "key_letter": prefetched_musicalkeycnn_estimate.key_letter,
+                "key_confidence": float(prefetched_musicalkeycnn_estimate.confidence or 0.0),
+                "pitch": prefetched_musicalkeycnn_estimate.details.get("pitch"),
+                "mode": prefetched_musicalkeycnn_estimate.details.get("mode"),
+                "key_source": "musicalkeycnn",
+            },
+        )
+    else:
+        key = resolve_tag_only_key(track.key_tag, track.key_imported)
+
+    return FastAnalysisResult(
+        track_id=track.id,
+        source_file_hash=track.file_hash,
+        bpm=float(bpm["bpm"]),
+        bpm_confidence=float(bpm["bpm_confidence"]),
+        bpm_source=str(bpm["bpm_source"]),
+        key=str(key["key"]),
+        key_number=int(key["key_number"]),
+        key_letter=str(key["key_letter"]),
+        key_confidence=float(key["key_confidence"]),
+        key_source=str(key["key_source"]),
+        key_imported=key["key_imported"],
+        key_tagged=key["key_tagged"],
+        key_agreement=key["key_agreement"],
+        analyzed_at=utc_now(),
+        analysis_signature=analysis_signature or settings.analysis_signature,
+        config_signature=settings.config_signature,
+    )
+
+
 def build_analysis_result(
     track: ImportedTrack,
     settings: RuntimeSettings,
@@ -968,14 +1039,12 @@ def build_analysis_result(
             cal_aggressive = cal.calibrate("mood_aggressive_abs", float(mood_aggressive_abs))
             energy_essentia_fused = clamp(
                 (0.34 * cal_arousal)
-                + (0.18 * cal_danceability)
-                + (0.16 * cal_party)
+                + (0.24 * cal_danceability)
+                + (0.18 * cal_party)
                 + (0.14 * (1.0 - cal_relaxed))
-                + (0.08 * cal_aggressive)
-                + (0.04 * float(dsp_result.loudness["loudness_norm"]))
-                + (0.03 * float(dsp_result.full_features["drums_abs"] or 0.0))
-                + (0.02 * float(dsp_result.full_features["groove_abs"] or 0.0))
-                + (0.01 * float(dsp_result.bass_abs or 0.0))
+                + (0.05 * cal_aggressive)
+                + (0.03 * float(dsp_result.loudness["loudness_norm"]))
+                + (0.02 * float(dsp_result.bass_abs or 0.0))
             )
             if energy_essentia_fused < 0.30:
                 energy_essentia_bucket = "low"

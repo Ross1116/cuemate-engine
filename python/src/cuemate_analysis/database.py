@@ -6,7 +6,7 @@ import re
 import sqlite3
 from typing import Any, Iterable
 
-from cuemate_analysis.models import AnalysisResult, ImportedTrack
+from cuemate_analysis.models import AnalysisResult, FastAnalysisResult, ImportedTrack
 
 
 class Database:
@@ -101,6 +101,13 @@ class Database:
             (name,),
         ).fetchone()
 
+    def get_playlist_name_by_id(self, playlist_id: str) -> str | None:
+        row = self.connection.execute(
+            "SELECT name FROM playlists WHERE id = ?",
+            (playlist_id,),
+        ).fetchone()
+        return str(row[0]) if row is not None else None
+
     def get_playlist_tracks(self, playlist_name: str) -> list[sqlite3.Row]:
         return self.connection.execute(
             """
@@ -118,6 +125,21 @@ class Database:
               t.imported_bpm,
               t.imported_key,
               t.import_source,
+              ff.analysis_signature AS fast_analysis_signature,
+              ff.config_signature AS fast_config_signature,
+              ff.source_file_hash AS fast_source_file_hash,
+              ff.bpm AS fast_bpm,
+              ff.bpm_confidence AS fast_bpm_confidence,
+              ff.bpm_source AS fast_bpm_source,
+              ff.key AS fast_key,
+              ff.key_number AS fast_key_number,
+              ff.key_letter AS fast_key_letter,
+              ff.key_confidence AS fast_key_confidence,
+              ff.key_source AS fast_key_source,
+              ff.key_imported AS fast_key_imported,
+              ff.key_tagged AS fast_key_tagged,
+              ff.key_agreement AS fast_key_agreement,
+              ff.analyzed_at AS fast_analyzed_at,
               f.analysis_mode,
               f.analysis_signature,
               f.config_signature,
@@ -144,6 +166,7 @@ class Database:
             FROM playlists p
             JOIN playlist_tracks pt ON pt.playlist_id = p.id
             JOIN tracks t ON t.id = pt.track_id
+            LEFT JOIN track_features_fast ff ON ff.track_id = t.id
             LEFT JOIN track_features_abs f ON f.track_id = t.id
             WHERE p.name = ?
             ORDER BY pt.position ASC
@@ -214,6 +237,12 @@ class Database:
             (track_id,),
         ).fetchone()
 
+    def get_existing_fast_analysis(self, track_id: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM track_features_fast WHERE track_id = ?",
+            (track_id,),
+        ).fetchone()
+
     def create_analysis_job(
         self,
         *,
@@ -231,14 +260,51 @@ class Database:
             cursor = self.connection.execute(
                 """
                 INSERT INTO analysis_jobs (
-                  playlist_id, track_id, track_path, status, priority, analysis_mode,
+                  playlist_id, track_id, track_path, job_kind, status, priority, analysis_mode,
                   analysis_signature, config_signature, source_file_hash, created_at
-                ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, 'full', 'pending', ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     playlist_id,
                     track_id,
                     track_path,
+                    priority,
+                    analysis_mode,
+                    analysis_signature,
+                    config_signature,
+                    source_file_hash,
+                    created_at,
+                ),
+            )
+        return int(cursor.lastrowid)
+
+    def create_analysis_job_with_kind(
+        self,
+        *,
+        playlist_id: str | None,
+        track_id: str,
+        track_path: str,
+        job_kind: str,
+        analysis_mode: str,
+        analysis_signature: str,
+        config_signature: str,
+        source_file_hash: str,
+        priority: int,
+        created_at: str,
+    ) -> int:
+        with self.connection:
+            cursor = self.connection.execute(
+                """
+                INSERT INTO analysis_jobs (
+                  playlist_id, track_id, track_path, job_kind, status, priority, analysis_mode,
+                  analysis_signature, config_signature, source_file_hash, created_at
+                ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    playlist_id,
+                    track_id,
+                    track_path,
+                    job_kind,
                     priority,
                     analysis_mode,
                     analysis_signature,
@@ -371,6 +437,42 @@ class Database:
                 payload,
             )
 
+    def upsert_track_fast_features(self, result: FastAnalysisResult) -> None:
+        payload = result.to_db_row()
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO track_features_fast (
+                  track_id, user_id, source_file_hash, bpm, bpm_confidence, bpm_source,
+                  key, key_number, key_letter, key_confidence, key_source,
+                  key_imported, key_tagged, key_agreement,
+                  analyzed_at, analysis_signature, config_signature
+                ) VALUES (
+                  :track_id, :user_id, :source_file_hash, :bpm, :bpm_confidence, :bpm_source,
+                  :key, :key_number, :key_letter, :key_confidence, :key_source,
+                  :key_imported, :key_tagged, :key_agreement,
+                  :analyzed_at, :analysis_signature, :config_signature
+                )
+                ON CONFLICT(track_id) DO UPDATE SET
+                  source_file_hash = excluded.source_file_hash,
+                  bpm = excluded.bpm,
+                  bpm_confidence = excluded.bpm_confidence,
+                  bpm_source = excluded.bpm_source,
+                  key = excluded.key,
+                  key_number = excluded.key_number,
+                  key_letter = excluded.key_letter,
+                  key_confidence = excluded.key_confidence,
+                  key_source = excluded.key_source,
+                  key_imported = excluded.key_imported,
+                  key_tagged = excluded.key_tagged,
+                  key_agreement = excluded.key_agreement,
+                  analyzed_at = excluded.analyzed_at,
+                  analysis_signature = excluded.analysis_signature,
+                  config_signature = excluded.config_signature
+                """,
+                payload,
+            )
+
     def get_track_details(self, track_id: str) -> dict[str, Any] | None:
         row = self.connection.execute(
             """
@@ -387,6 +489,21 @@ class Database:
               t.import_source,
               t.imported_at,
               t.updated_at,
+              ff.source_file_hash AS fast_source_file_hash,
+              ff.bpm AS fast_bpm,
+              ff.bpm_confidence AS fast_bpm_confidence,
+              ff.bpm_source AS fast_bpm_source,
+              ff.key AS fast_key,
+              ff.key_number AS fast_key_number,
+              ff.key_letter AS fast_key_letter,
+              ff.key_confidence AS fast_key_confidence,
+              ff.key_source AS fast_key_source,
+              ff.key_imported AS fast_key_imported,
+              ff.key_tagged AS fast_key_tagged,
+              ff.key_agreement AS fast_key_agreement,
+              ff.analysis_signature AS fast_analysis_signature,
+              ff.config_signature AS fast_config_signature,
+              ff.analyzed_at AS fast_analyzed_at,
               f.source_file_hash,
               f.bpm,
               f.bpm_confidence,
@@ -430,6 +547,7 @@ class Database:
               f.scoring_contract_id_at_analysis,
               f.analyzed_at
             FROM tracks t
+            LEFT JOIN track_features_fast ff ON ff.track_id = t.id
             LEFT JOIN track_features_abs f ON f.track_id = t.id
             WHERE t.id = ?
             """,
@@ -438,6 +556,54 @@ class Database:
         if row is None:
             return None
         return {key: row[key] for key in row.keys()}
+
+    def get_track_row(self, track_id: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            """
+            SELECT
+              t.id,
+              t.file_path,
+              t.file_hash,
+              t.title,
+              t.artist,
+              t.genre,
+              t.duration_seconds,
+              t.imported_bpm,
+              t.imported_key,
+              t.import_source
+            FROM tracks t
+            WHERE t.id = ?
+            """,
+            (track_id,),
+        ).fetchone()
+
+    def get_pending_analysis_jobs(
+        self,
+        *,
+        job_kind: str | None = None,
+        limit: int = 100,
+    ) -> list[sqlite3.Row]:
+        if job_kind is not None:
+            return self.connection.execute(
+                """
+                SELECT *
+                FROM analysis_jobs
+                WHERE status = 'pending' AND job_kind = ?
+                ORDER BY priority DESC, created_at ASC
+                LIMIT ?
+                """,
+                (job_kind, limit),
+            ).fetchall()
+        return self.connection.execute(
+            """
+            SELECT *
+            FROM analysis_jobs
+            WHERE status = 'pending'
+            ORDER BY priority DESC, created_at ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
 
     # ------------------------------------------------------------------
     # Canonical relative persistence (Phase 2)

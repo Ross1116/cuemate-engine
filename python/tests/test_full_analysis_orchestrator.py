@@ -46,6 +46,12 @@ def _settings() -> SimpleNamespace:
         essentia_semantic_image="cuemate-essentia-semantics:local",
         essentia_semantic_model_family_policy="best_per_task",
         essentia_semantic_model_root="python/models/essentia_semantics",
+        essentia_semantic_default_excerpt_seconds=60.0,
+        essentia_semantic_multisample_excerpt_seconds=30.0,
+        essentia_semantic_trigger_mismatch_threshold=0.22,
+        essentia_semantic_trigger_confidence_threshold=0.58,
+        essentia_semantic_trigger_structure_rms_cv=0.45,
+        essentia_semantic_trigger_outlier_zscore=1.35,
     )
     return SimpleNamespace(
         analysis=analysis,
@@ -77,6 +83,7 @@ class _FakeDatabase:
         self.completed: list[dict[str, object]] = []
         self.failed: list[dict[str, object]] = []
         self.saved_results: list[AnalysisResult] = []
+        self.saved_fast_results: list[object] = []
         self._next_job_id = 1
 
     def __enter__(self):
@@ -93,6 +100,11 @@ class _FakeDatabase:
         self._next_job_id += 1
         return job_id
 
+    def create_analysis_job_with_kind(self, **kwargs):
+        job_id = self._next_job_id
+        self._next_job_id += 1
+        return job_id
+
     def mark_analysis_job_started(self, job_id: int, started_at: str) -> None:
         return None
 
@@ -101,6 +113,16 @@ class _FakeDatabase:
 
     def upsert_track_features(self, result: AnalysisResult) -> None:
         self.saved_results.append(result)
+
+    def upsert_track_fast_features(self, result) -> None:
+        self.saved_fast_results.append(result)
+
+    def get_table_columns(self, table_name: str):
+        if table_name == "track_features_abs":
+            return {"energy_heuristic_abs"}
+        if table_name == "track_features_fast":
+            return {"track_id"}
+        return set()
 
     def mark_analysis_job_completed(
         self,
@@ -155,6 +177,7 @@ def test_handle_analyze_essentia_playlist_chunks_text_output(monkeypatch, capsys
                 mood_aggressive_abs=0.4,
                 mood_party_abs=0.6,
                 mood_relaxed_abs=0.2,
+                semantic_confidence=0.7,
                 energy_essentia_fused=0.65,
                 energy_essentia_bucket="drive",
                 elapsed_ms=25.0,
@@ -241,6 +264,7 @@ def test_handle_analyze_playlist_marks_degraded_rows_with_lane_status(monkeypatc
             mood_aggressive_abs=0.4,
             mood_party_abs=0.6,
             mood_relaxed_abs=0.2,
+            semantic_confidence=0.7,
             energy_essentia_fused=0.65,
             energy_essentia_bucket="drive",
             elapsed_ms=20.0,
@@ -256,6 +280,7 @@ def test_handle_analyze_playlist_marks_degraded_rows_with_lane_status(monkeypatc
             mood_aggressive_abs=None,
             mood_party_abs=None,
             mood_relaxed_abs=None,
+            semantic_confidence=None,
             energy_essentia_fused=None,
             energy_essentia_bucket=None,
             elapsed_ms=20.0,
@@ -332,7 +357,7 @@ def test_handle_analyze_playlist_marks_degraded_rows_with_lane_status(monkeypatc
     monkeypatch.setattr("cuemate_analysis.cli.run_dsp_lane", lambda prepared, *_: dsp_results)
     monkeypatch.setattr("cuemate_analysis.cli.run_tempo_lane", lambda prepared, *_: tempo_results)
     monkeypatch.setattr("cuemate_analysis.cli.run_key_lane", lambda prepared, *_: key_results)
-    monkeypatch.setattr("cuemate_analysis.cli.run_essentia_lane", lambda prepared, *_: essentia_results)
+    monkeypatch.setattr("cuemate_analysis.cli.run_essentia_lane", lambda prepared, *_, **__: essentia_results)
     monkeypatch.setattr("cuemate_analysis.cli.build_analysis_result", fake_build_analysis_result)
 
     exit_code = handle_analyze_playlist(
@@ -342,9 +367,12 @@ def test_handle_analyze_playlist_marks_degraded_rows_with_lane_status(monkeypatc
 
     assert exit_code == 0
     assert len(fake_db.saved_results) == 2
-    assert not fake_db.failed
+    assert fake_db.failed
     assert "degraded: missing tempocnn, essentia_semantics" in captured
-    assert fake_db.completed[0]["timing_breakdown"]["degraded"] is False
-    assert fake_db.completed[1]["timing_breakdown"]["degraded"] is True
-    assert fake_db.completed[1]["timing_breakdown"]["missing_lanes"] == ["tempocnn", "essentia_semantics"]
-    assert fake_db.completed[1]["timing_breakdown"]["lane_status"]["musicalkeycnn"] == "cached"
+    enrichment_completions = [
+        item for item in fake_db.completed if "degraded" in item["timing_breakdown"]
+    ]
+    assert enrichment_completions[0]["timing_breakdown"]["degraded"] is False
+    assert enrichment_completions[1]["timing_breakdown"]["degraded"] is True
+    assert enrichment_completions[1]["timing_breakdown"]["missing_lanes"] == ["tempocnn", "essentia_semantics"]
+    assert enrichment_completions[1]["timing_breakdown"]["lane_status"]["musicalkeycnn"] == "cached"

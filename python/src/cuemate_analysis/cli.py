@@ -14,6 +14,7 @@ import time
 from cuemate_analysis.analysis import (
     DspLaneResult,
     build_analysis_result,
+    build_fast_analysis_result,
     compute_dsp_lane_result,
     utc_now,
 )
@@ -25,9 +26,12 @@ from cuemate_analysis.essentia_semantic_backend import (
     build_essentia_semantic_manifest_signature,
     build_essentia_semantic_model_manifest,
     download_essentia_semantic_models,
+    ensure_essentia_semantic_service,
     estimate_essentia_semantic_batch,
     purge_essentia_semantic_cache,
     resolve_essentia_semantic_model_root,
+    resolve_essentia_semantic_service_name,
+    resolve_essentia_semantic_service_port,
 )
 from cuemate_analysis.energy_experiments import analyze_energy_path
 from cuemate_analysis.energy_features import EnergyFeatureVector, energy_consensus
@@ -40,9 +44,13 @@ from cuemate_analysis.ingest import (
 from cuemate_analysis.key_backend import (
     KeyEstimate,
     MUSICALKEYCNN_POLICY_FULL_TRACK,
+    ensure_musicalkeycnn_service,
     estimate_musicalkeycnn_keys,
     purge_musicalkeycnn_cache,
+    resolve_musicalkeycnn_image_name,
     resolve_musicalkeycnn_model_path,
+    resolve_musicalkeycnn_service_name,
+    resolve_musicalkeycnn_service_port,
 )
 from cuemate_analysis.persistent_inference_cache import resolve_inference_cache_path
 from cuemate_analysis.relative_context import (
@@ -54,9 +62,13 @@ from cuemate_analysis.relative_context import (
 )
 from cuemate_analysis.tempo_backend import (
     TempoEstimate,
+    ensure_tempocnn_service,
     estimate_tempocnn_bpms,
     purge_tempocnn_cache,
+    resolve_tempocnn_image_name,
     resolve_tempocnn_model_path,
+    resolve_tempocnn_service_name,
+    resolve_tempocnn_service_port,
 )
 
 TEMPOCNN_PROGRESS_BATCH_SIZE = 8
@@ -232,6 +244,12 @@ def prefetch_essentia_semantic_estimates(rows, settings) -> dict[Path, EssentiaS
         device=settings.analysis.essentia_semantic_device,
         family_policy=settings.analysis.essentia_semantic_model_family_policy,
         auxiliary_features_by_path=auxiliary_features_by_path,
+        default_excerpt_seconds=settings.analysis.essentia_semantic_default_excerpt_seconds,
+        multisample_excerpt_seconds=settings.analysis.essentia_semantic_multisample_excerpt_seconds,
+        mismatch_threshold=settings.analysis.essentia_semantic_trigger_mismatch_threshold,
+        confidence_threshold=settings.analysis.essentia_semantic_trigger_confidence_threshold,
+        structure_rms_cv_threshold=settings.analysis.essentia_semantic_trigger_structure_rms_cv,
+        outlier_zscore_threshold=settings.analysis.essentia_semantic_trigger_outlier_zscore,
     )
 
 
@@ -320,6 +338,7 @@ def build_failed_essentia_estimate(error_message: str) -> EssentiaSemanticEstima
         mood_aggressive_abs=None,
         mood_party_abs=None,
         mood_relaxed_abs=None,
+        semantic_confidence=None,
         energy_essentia_fused=None,
         energy_essentia_bucket=None,
         elapsed_ms=None,
@@ -348,9 +367,15 @@ def prepare_analysis_chunk(rows) -> tuple[list[PreparedTrack], list[tuple[object
     return prepared_tracks, failures
 
 
-def build_essentia_auxiliary_features_by_path(items) -> tuple[list[Path], dict[Path, dict[str, object]]]:
+def build_essentia_auxiliary_features_by_path(
+    items,
+    *,
+    dsp_results: dict[Path, DspLaneResult] | None = None,
+) -> tuple[list[Path], dict[Path, dict[str, object]]]:
     auxiliary_features_by_path: dict[Path, dict[str, object]] = {}
     paths: list[Path] = []
+    proxy_values: dict[Path, float] = {}
+    structure_values: dict[Path, float] = {}
     for item in items:
         row = item.row if isinstance(item, PreparedTrack) else item
         path = (item.resolved_path if isinstance(item, PreparedTrack) else Path(row["file_path"]).resolve())
@@ -362,12 +387,44 @@ def build_essentia_auxiliary_features_by_path(items) -> tuple[list[Path], dict[P
                 return None
             return row[key]
 
+        dsp_result = (dsp_results or {}).get(path)
+        loudness_norm = optional_value("loudness_norm")
+        bass_abs = optional_value("bass_abs")
+        if dsp_result is not None and dsp_result.available:
+            if loudness_norm is None and dsp_result.loudness is not None:
+                loudness_norm = dsp_result.loudness.get("loudness_norm")
+            if bass_abs is None:
+                bass_abs = dsp_result.bass_abs
+            if dsp_result.energy is not None and dsp_result.loudness is not None:
+                proxy_values[path] = float(
+                    (0.75 * float(dsp_result.energy.get("energy_abs", 0.0)))
+                    + (0.15 * float(dsp_result.loudness.get("loudness_norm", 0.0)))
+                    + (0.10 * float(dsp_result.bass_abs or 0.0))
+                )
+            if dsp_result.artifacts is not None and dsp_result.artifacts.rms.size:
+                rms_mean = float(dsp_result.artifacts.rms.mean())
+                if rms_mean > 1e-9:
+                    structure_values[path] = float(dsp_result.artifacts.rms.std() / rms_mean)
+
         auxiliary_features_by_path[path] = {
-            "loudness_norm": optional_value("loudness_norm"),
+            "loudness_norm": loudness_norm,
             "drums_abs": optional_value("drums_abs"),
             "groove_abs": optional_value("groove_abs"),
-            "bass_abs": optional_value("bass_abs"),
+            "bass_abs": bass_abs,
         }
+
+    if proxy_values:
+        proxy_mean = sum(proxy_values.values()) / len(proxy_values)
+        proxy_variance = sum((value - proxy_mean) ** 2 for value in proxy_values.values()) / max(len(proxy_values), 1)
+        proxy_std = proxy_variance ** 0.5
+        for path, payload in auxiliary_features_by_path.items():
+            payload["dsp_proxy_energy"] = proxy_values.get(path)
+            payload["structure_rms_cv"] = structure_values.get(path)
+            value = proxy_values.get(path)
+            if value is not None and proxy_std > 1e-9:
+                payload["playlist_outlier_score"] = abs(value - proxy_mean) / proxy_std
+            else:
+                payload["playlist_outlier_score"] = 0.0
     return paths, auxiliary_features_by_path
 
 
@@ -430,12 +487,17 @@ def run_essentia_lane(
     prepared_tracks: list[PreparedTrack],
     settings,
     analysis_mode: str,
+    *,
+    dsp_results: dict[Path, DspLaneResult] | None = None,
 ) -> dict[Path, EssentiaSemanticEstimate]:
     if analysis_mode != "full" or not settings.analysis.essentia_semantics_enabled or not prepared_tracks:
         return {}
     results: dict[Path, EssentiaSemanticEstimate] = {}
     for chunk in chunk_items(prepared_tracks, settings.analysis.essentia_chunk_size):
-        chunk_paths, auxiliary_features_by_path = build_essentia_auxiliary_features_by_path(chunk)
+        chunk_paths, auxiliary_features_by_path = build_essentia_auxiliary_features_by_path(
+            chunk,
+            dsp_results=dsp_results,
+        )
         try:
             results.update(
                 estimate_essentia_semantic_batch(
@@ -445,6 +507,12 @@ def run_essentia_lane(
                     device=settings.analysis.essentia_semantic_device,
                     family_policy=settings.analysis.essentia_semantic_model_family_policy,
                     auxiliary_features_by_path=auxiliary_features_by_path,
+                    default_excerpt_seconds=settings.analysis.essentia_semantic_default_excerpt_seconds,
+                    multisample_excerpt_seconds=settings.analysis.essentia_semantic_multisample_excerpt_seconds,
+                    mismatch_threshold=settings.analysis.essentia_semantic_trigger_mismatch_threshold,
+                    confidence_threshold=settings.analysis.essentia_semantic_trigger_confidence_threshold,
+                    structure_rms_cv_threshold=settings.analysis.essentia_semantic_trigger_structure_rms_cv,
+                    outlier_zscore_threshold=settings.analysis.essentia_semantic_trigger_outlier_zscore,
                 )
             )
         except Exception as exc:
@@ -535,6 +603,25 @@ def should_skip_analysis(
     )
 
 
+def should_skip_fast_analysis(
+    row,
+    track,
+    *,
+    effective_analysis_signature: str,
+    config_signature: str,
+    force: bool,
+) -> bool:
+    if force:
+        return False
+    return (
+        row.get("fast_source_file_hash") == track.file_hash
+        and row.get("fast_analysis_signature") == effective_analysis_signature
+        and row.get("fast_config_signature") == config_signature
+        and row.get("fast_bpm") is not None
+        and row.get("fast_key") is not None
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cuemate-analysis",
@@ -601,8 +688,8 @@ def build_parser() -> argparse.ArgumentParser:
     analyze_parser.add_argument("--playlist", required=True, help="Playlist name to analyze.")
     analyze_parser.add_argument(
         "--analysis-mode",
-        choices=["fast_pass", "full"],
-        default="full",
+        choices=["fast_pass", "staged", "full"],
+        default="staged",
         help="Analysis depth to run.",
     )
     analyze_parser.add_argument(
@@ -689,14 +776,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     analyze_relative_playlist_parser = subparsers.add_parser(
         "analyze-relative-playlist",
-        help="Compute experimental playlist-relative context from persisted absolute features.",
+        help="Inspect canonical playlist-relative context from persisted relative tables.",
     )
     analyze_relative_playlist_parser.add_argument("--playlist", required=True, help="Playlist name to analyze.")
     analyze_relative_playlist_parser.add_argument(
         "--limit",
         type=int,
         default=0,
-        help="Optional track limit for a faster experimental subset pass.",
+        help="Optional output limit for a smaller playlist slice preview.",
     )
     analyze_relative_playlist_parser.add_argument(
         "--json",
@@ -736,6 +823,26 @@ def build_parser() -> argparse.ArgumentParser:
     refresh_relative_playlist_parser.add_argument(
         "--output",
         help="Optional output path for a CSV report.",
+    )
+
+    run_worker_parser = subparsers.add_parser(
+        "run-analysis-worker",
+        help="Process pending staged enrichment jobs from the local analysis queue.",
+    )
+    run_worker_parser.add_argument(
+        "--limit",
+        type=int,
+        default=100,
+        help="Maximum pending jobs to process in one pass.",
+    )
+
+    prewarm_parser = subparsers.add_parser(
+        "prewarm-model-services",
+        help="Start and prewarm the shared TF/Essentia and MusicalKeyCNN services.",
+    )
+    prewarm_parser.add_argument(
+        "--path",
+        help="Optional audio file to use for warmup requests. Falls back to service health warmup when omitted.",
     )
 
     analyze_energy_playlist_parser = subparsers.add_parser(
@@ -784,7 +891,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     purge_cache_parser = subparsers.add_parser(
         "purge-model-cache",
-        help="Purge persisted TempoCNN and MusicalKeyCNN caches and clear warm service state.",
+        help="Purge persisted model inference caches; keep warm services unless --clear-warm-services is set.",
     )
     purge_cache_parser.add_argument(
         "--backend",
@@ -801,6 +908,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         help="Optional file path to purge. Can be passed multiple times.",
+    )
+    purge_cache_parser.add_argument(
+        "--clear-warm-services",
+        action="store_true",
+        help="Also remove the warm Docker model services so the next run is a true cold start.",
     )
 
     benchmark_dsp_parser = subparsers.add_parser(
@@ -835,6 +947,158 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     return parser
+
+
+def build_fast_job_timing_breakdown(
+    *,
+    settings,
+    effective_analysis_signature: str,
+) -> dict[str, object]:
+    return {
+        "job_kind": "fast_pass",
+        "analysis_signature": effective_analysis_signature,
+        "config_signature": settings.config_signature,
+        "tempo_backend": "tempocnn",
+        "key_backend": "musicalkeycnn",
+        "stage_state": "fast_ready",
+    }
+
+
+def _refresh_relative_for_playlists(database: Database, settings, playlist_ids: set[str]) -> None:
+    for playlist_id in sorted(playlist_ids):
+        playlist_name = database.get_playlist_name_by_id(playlist_id)
+        if not playlist_name:
+            continue
+        rel_rows = database.get_playlist_relative_inputs(playlist_name)
+        rel_inputs = [row_to_relative_track_input(row) for row in rel_rows]
+        refresh_canonical_relative_playlist(
+            rel_inputs,
+            settings,
+            playlist_name=playlist_name,
+            playlist_id=playlist_id,
+            database=database,
+            timestamp=utc_now(),
+        )
+        print(f"Refreshed canonical relative data for '{playlist_name}'.")
+
+
+def _process_enrichment_batch(
+    *,
+    pending_items: list[dict[str, object]],
+    settings,
+    database: Database,
+    effective_analysis_signature: str,
+    expected_essentia_semantic_signature: str,
+    print_progress: bool = True,
+) -> tuple[int, list[str], list[DspLaneResult], list[TempoEstimate], list[KeyEstimate], list[EssentiaSemanticEstimate]]:
+    if not pending_items:
+        return 0, [], [], [], [], []
+
+    pending_prepared = [item["prepared"] for item in pending_items]
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        dsp_future = executor.submit(run_dsp_lane, pending_prepared, settings, "fast_pass")
+        prefetched_tempocnn_estimates = run_tempo_lane(pending_prepared, settings)
+        prefetched_musicalkeycnn_estimates = run_key_lane(pending_prepared, settings)
+        prefetched_dsp_results = dsp_future.result()
+        prefetched_essentia_semantic_estimates = run_essentia_lane(
+            pending_prepared,
+            settings,
+            "full",
+            dsp_results=prefetched_dsp_results,
+        )
+
+    processed = 0
+    updated_track_ids: list[str] = []
+    dsp_diagnostics: list[DspLaneResult] = []
+    tempo_diagnostics: list[TempoEstimate] = []
+    key_diagnostics: list[KeyEstimate] = []
+    essentia_diagnostics: list[EssentiaSemanticEstimate] = []
+
+    for item in pending_items:
+        prepared = item["prepared"]
+        track = prepared.track
+        index = int(item.get("display_index", prepared.position))
+        total = int(item.get("display_total", len(pending_items)))
+        start_time = float(item["start_time"])
+        job_id = int(item["job_id"])
+        resolved_path = prepared.resolved_path
+
+        dsp_result = prefetched_dsp_results.get(resolved_path)
+        tempo_estimate = prefetched_tempocnn_estimates.get(resolved_path)
+        key_estimate = prefetched_musicalkeycnn_estimates.get(resolved_path)
+        essentia_estimate = prefetched_essentia_semantic_estimates.get(resolved_path)
+
+        if dsp_result is not None:
+            dsp_diagnostics.append(dsp_result)
+        if tempo_estimate is not None:
+            tempo_diagnostics.append(tempo_estimate)
+        if key_estimate is not None:
+            key_diagnostics.append(key_estimate)
+        if essentia_estimate is not None:
+            essentia_diagnostics.append(essentia_estimate)
+
+        try:
+            if dsp_result is None or not dsp_result.available:
+                raise ValueError(dsp_result.error if dsp_result is not None and dsp_result.error else "DSP lane failed.")
+
+            result = build_analysis_result(
+                track,
+                settings,
+                "full",
+                dsp_result=dsp_result,
+                tempo_backend="tempocnn",
+                tempocnn_accelerator="auto",
+                prefetched_tempocnn_estimate=tempo_estimate,
+                key_backend="musicalkeycnn",
+                musicalkeycnn_model=settings.analysis.key_model_path,
+                musicalkeycnn_device=settings.analysis.key_device,
+                musicalkeycnn_policy=settings.analysis.key_policy,
+                prefetched_musicalkeycnn_estimate=key_estimate,
+                prefetched_essentia_semantic_estimate=essentia_estimate,
+                analysis_signature=effective_analysis_signature,
+            )
+            lane_status = {
+                "dsp": estimate_lane_status(dsp_result),
+                "tempocnn": estimate_lane_status(tempo_estimate),
+                "musicalkeycnn": estimate_lane_status(key_estimate),
+                "essentia_semantics": estimate_lane_status(
+                    essentia_estimate,
+                    disabled=not settings.analysis.essentia_semantics_enabled,
+                ),
+            }
+            missing_lanes = [lane for lane, status in lane_status.items() if status == "failed"]
+            degraded = bool(missing_lanes)
+            database.upsert_track_features(result)
+            updated_track_ids.append(track.id)
+            duration_seconds = round(time.perf_counter() - start_time, 3)
+            database.mark_analysis_job_completed(
+                job_id,
+                duration_seconds,
+                build_job_timing_breakdown(
+                    args=argparse.Namespace(analysis_mode="full"),
+                    settings=settings,
+                    effective_analysis_signature=effective_analysis_signature,
+                    expected_essentia_semantic_signature=expected_essentia_semantic_signature,
+                    lane_status=lane_status,
+                    degraded=degraded,
+                    missing_lanes=missing_lanes,
+                ),
+                utc_now(),
+            )
+            processed += 1
+            if print_progress:
+                degraded_suffix = f" (degraded: missing {', '.join(missing_lanes)})" if degraded else ""
+                print(
+                    f"[{index}/{total}] analyzed {track.id} ({track.title}){degraded_suffix} -> "
+                    f"{result.bpm:.1f} BPM ({result.bpm_source}), {result.key} ({result.key_source})"
+                )
+        except Exception as exc:
+            duration_seconds = round(time.perf_counter() - start_time, 3)
+            database.mark_analysis_job_failed(job_id, str(exc), duration_seconds, utc_now())
+            if print_progress:
+                print(f"[{index}/{total}] failed {track.id}: {exc}", file=sys.stderr)
+
+    return processed, updated_track_ids, dsp_diagnostics, tempo_diagnostics, key_diagnostics, essentia_diagnostics
 
 
 def handle_import_playlist(args: argparse.Namespace) -> int:
@@ -959,6 +1223,12 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
                     f"{', '.join(missing_columns)}. Apply migrations first with "
                     "powershell -ExecutionPolicy Bypass -File .\\scripts\\docker-compose.ps1 --profile ops run --rm migrate"
                 )
+            fast_columns = database.get_table_columns("track_features_fast")
+            if "track_id" not in fast_columns:
+                raise SystemExit(
+                    "The local database schema is out of date and is missing the track_features_fast table. Apply migrations first with "
+                    "powershell -ExecutionPolicy Bypass -File .\\scripts\\docker-compose.ps1 --profile ops run --rm migrate"
+                )
         rows = database.get_playlist_tracks(playlist_name)
         if not rows:
             raise SystemExit(f"Playlist '{playlist_name}' was not found. Import it first.")
@@ -971,169 +1241,147 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
         tempo_diagnostics: list[TempoEstimate] = []
         key_diagnostics: list[KeyEstimate] = []
         essentia_diagnostics: list[EssentiaSemanticEstimate] = []
+        pending_enrichment_items: list[dict[str, object]] = []
         for chunk in chunk_items(rows, settings.analysis.full_chunk_size):
             prepared_tracks, prepare_failures = prepare_analysis_chunk(chunk)
             for row, error_message in prepare_failures:
                 index = int(row["position"])
                 print(f"[{index}/{total}] failed {row['track_id']}: {error_message}", file=sys.stderr)
 
-            pending_items: list[dict[str, object]] = []
+            if not prepared_tracks:
+                continue
+
+            prefetched_tempocnn_estimates = run_tempo_lane(prepared_tracks, settings)
+            prefetched_musicalkeycnn_estimates = run_key_lane(prepared_tracks, settings)
             for prepared in prepared_tracks:
                 row = prepared.row
                 track = prepared.track
                 index = prepared.position
-                start_time = time.perf_counter()
-                created_at = utc_now()
-                job_id = database.create_analysis_job(
-                    playlist_id=row["playlist_id"],
-                    track_id=row["track_id"],
-                    track_path=row["file_path"],
-                    analysis_mode=args.analysis_mode,
-                    analysis_signature=effective_analysis_signature,
-                    config_signature=settings.config_signature,
-                    source_file_hash=track.file_hash,
-                    priority=total - index,
-                    created_at=created_at,
-                )
-                database.mark_analysis_job_started(job_id, created_at)
                 database.upsert_track(track, utc_now())
+
+                if not should_skip_fast_analysis(
+                    row,
+                    track,
+                    effective_analysis_signature=effective_analysis_signature,
+                    config_signature=settings.config_signature,
+                    force=args.force,
+                ):
+                    fast_job_id = database.create_analysis_job_with_kind(
+                        playlist_id=row["playlist_id"],
+                        track_id=row["track_id"],
+                        track_path=row["file_path"],
+                        job_kind="fast_pass",
+                        analysis_mode="fast_pass",
+                        analysis_signature=effective_analysis_signature,
+                        config_signature=settings.config_signature,
+                        source_file_hash=track.file_hash,
+                        priority=total - index,
+                        created_at=utc_now(),
+                    )
+                    fast_started = time.perf_counter()
+                    database.mark_analysis_job_started(fast_job_id, utc_now())
+                    try:
+                        fast_result = build_fast_analysis_result(
+                            track,
+                            settings,
+                            prefetched_tempocnn_estimate=prefetched_tempocnn_estimates.get(prepared.resolved_path),
+                            prefetched_musicalkeycnn_estimate=prefetched_musicalkeycnn_estimates.get(prepared.resolved_path),
+                            analysis_signature=effective_analysis_signature,
+                        )
+                        database.upsert_track_fast_features(fast_result)
+                        database.mark_analysis_job_completed(
+                            fast_job_id,
+                            round(time.perf_counter() - fast_started, 3),
+                            build_fast_job_timing_breakdown(
+                                settings=settings,
+                                effective_analysis_signature=effective_analysis_signature,
+                            ),
+                            utc_now(),
+                        )
+                        if args.analysis_mode in {"fast_pass", "staged"}:
+                            print(
+                                f"[{index}/{total}] fast_ready {track.id} ({track.title}) -> "
+                                f"{fast_result.bpm:.1f} BPM ({fast_result.bpm_source}), {fast_result.key} ({fast_result.key_source})"
+                            )
+                    except Exception as exc:
+                        database.mark_analysis_job_failed(
+                            fast_job_id,
+                            str(exc),
+                            round(time.perf_counter() - fast_started, 3),
+                            utc_now(),
+                        )
+                        print(f"[{index}/{total}] failed {track.id}: {exc}", file=sys.stderr)
+                        if args.analysis_mode in {"fast_pass", "staged"}:
+                            continue
+                elif args.analysis_mode == "fast_pass":
+                    print(f"[{index}/{total}] skipped {track.id} ({track.title}) - fast analysis is already current")
+
+                if args.analysis_mode == "fast_pass":
+                    continue
+
                 if should_skip_analysis(
                     row,
                     track,
                     effective_analysis_signature=effective_analysis_signature,
                     config_signature=settings.config_signature,
-                    analysis_mode=args.analysis_mode,
+                    analysis_mode="full",
                     force=args.force,
                     expected_essentia_semantic_signature=expected_essentia_semantic_signature,
                 ):
-                    duration_seconds = round(time.perf_counter() - start_time, 3)
-                    database.mark_analysis_job_completed(
-                        job_id,
-                        duration_seconds,
-                        build_job_timing_breakdown(
-                            args=args,
-                            settings=settings,
-                            effective_analysis_signature=effective_analysis_signature,
-                            expected_essentia_semantic_signature=expected_essentia_semantic_signature,
-                            skipped=True,
-                        ),
-                        utc_now(),
-                    )
-                    print(f"[{index}/{total}] skipped {track.id} ({track.title}) - analysis is already current")
+                    if args.analysis_mode == "full":
+                        print(f"[{index}/{total}] skipped {track.id} ({track.title}) - analysis is already current")
                     continue
-                pending_items.append(
+
+                job_id = database.create_analysis_job_with_kind(
+                    playlist_id=row["playlist_id"],
+                    track_id=row["track_id"],
+                    track_path=row["file_path"],
+                    job_kind="enrichment",
+                    analysis_mode="full",
+                    analysis_signature=effective_analysis_signature,
+                    config_signature=settings.config_signature,
+                    source_file_hash=track.file_hash,
+                    priority=total - index,
+                    created_at=utc_now(),
+                )
+                pending_enrichment_items.append(
                     {
                         "prepared": prepared,
                         "job_id": job_id,
-                        "start_time": start_time,
+                        "start_time": time.perf_counter(),
+                        "display_index": index,
+                        "display_total": total,
                     }
                 )
 
-            if not pending_items:
-                continue
+        if args.analysis_mode == "staged":
+            print(f"Queued {len(pending_enrichment_items)} enrichment job(s) for '{playlist_name}'.")
+            return 0
 
-            pending_prepared = [item["prepared"] for item in pending_items]
-            with ThreadPoolExecutor(max_workers=4) as executor:
-                dsp_future = executor.submit(run_dsp_lane, pending_prepared, settings, args.analysis_mode)
-                tempo_future = executor.submit(run_tempo_lane, pending_prepared, settings)
-                key_future = executor.submit(run_key_lane, pending_prepared, settings)
-                essentia_future = executor.submit(run_essentia_lane, pending_prepared, settings, args.analysis_mode)
-                prefetched_dsp_results = dsp_future.result()
-                prefetched_tempocnn_estimates = tempo_future.result()
-                prefetched_musicalkeycnn_estimates = key_future.result()
-                prefetched_essentia_semantic_estimates = essentia_future.result()
-
-            for item in pending_items:
-                prepared = item["prepared"]
-                row = prepared.row
-                track = prepared.track
-                index = prepared.position
-                start_time = float(item["start_time"])
-                job_id = int(item["job_id"])
-                resolved_path = prepared.resolved_path
-
-                dsp_result = prefetched_dsp_results.get(resolved_path)
-                tempo_estimate = prefetched_tempocnn_estimates.get(resolved_path)
-                key_estimate = prefetched_musicalkeycnn_estimates.get(resolved_path)
-                essentia_estimate = prefetched_essentia_semantic_estimates.get(resolved_path)
-
-                if dsp_result is not None:
-                    dsp_diagnostics.append(dsp_result)
-                if tempo_estimate is not None:
-                    tempo_diagnostics.append(tempo_estimate)
-                if key_estimate is not None:
-                    key_diagnostics.append(key_estimate)
-                if essentia_estimate is not None:
-                    essentia_diagnostics.append(essentia_estimate)
-
-                try:
-                    if dsp_result is None or not dsp_result.available:
-                        raise ValueError(
-                            dsp_result.error if dsp_result is not None and dsp_result.error else "DSP lane failed."
-                        )
-
-                    result = build_analysis_result(
-                        track,
-                        settings,
-                        args.analysis_mode,
-                        dsp_result=dsp_result,
-                        tempo_backend="tempocnn",
-                        tempocnn_accelerator="auto",
-                        prefetched_tempocnn_estimate=tempo_estimate,
-                        key_backend="musicalkeycnn",
-                        musicalkeycnn_model=settings.analysis.key_model_path,
-                        musicalkeycnn_device=settings.analysis.key_device,
-                        musicalkeycnn_policy=settings.analysis.key_policy,
-                        prefetched_musicalkeycnn_estimate=key_estimate,
-                        prefetched_essentia_semantic_estimate=essentia_estimate,
-                        analysis_signature=effective_analysis_signature,
-                    )
-                    lane_status = {
-                        "dsp": estimate_lane_status(dsp_result),
-                        "tempocnn": estimate_lane_status(tempo_estimate),
-                        "musicalkeycnn": estimate_lane_status(key_estimate),
-                        "essentia_semantics": estimate_lane_status(
-                            essentia_estimate,
-                            disabled=(args.analysis_mode != "full" or not settings.analysis.essentia_semantics_enabled),
-                        ),
-                    }
-                    missing_lanes = [lane for lane, status in lane_status.items() if status == "failed"]
-                    degraded = bool(missing_lanes)
-                    database.upsert_track_features(result)
-                    updated_track_ids.append(track.id)
-                    duration_seconds = round(time.perf_counter() - start_time, 3)
-                    database.mark_analysis_job_completed(
-                        job_id,
-                        duration_seconds,
-                        build_job_timing_breakdown(
-                            args=args,
-                            settings=settings,
-                            effective_analysis_signature=effective_analysis_signature,
-                            expected_essentia_semantic_signature=expected_essentia_semantic_signature,
-                            lane_status=lane_status,
-                            degraded=degraded,
-                            missing_lanes=missing_lanes,
-                        ),
-                        utc_now(),
-                    )
-                    processed += 1
-                    degraded_suffix = ""
-                    if degraded:
-                        degraded_suffix = f" (degraded: missing {', '.join(missing_lanes)})"
-                    print(
-                        f"[{index}/{total}] analyzed {track.id} ({track.title}){degraded_suffix} -> "
-                        f"{result.bpm:.1f} BPM ({result.bpm_source}), {result.key} ({result.key_source})"
-                    )
-                except Exception as exc:
-                    duration_seconds = round(time.perf_counter() - start_time, 3)
-                    database.mark_analysis_job_failed(job_id, str(exc), duration_seconds, utc_now())
-                    print(f"[{index}/{total}] failed {track.id}: {exc}", file=sys.stderr)
+        if args.analysis_mode == "full":
+            for item in pending_enrichment_items:
+                database.mark_analysis_job_started(int(item["job_id"]), utc_now())
+            (
+                processed,
+                updated_track_ids,
+                dsp_diagnostics,
+                tempo_diagnostics,
+                key_diagnostics,
+                essentia_diagnostics,
+            ) = _process_enrichment_batch(
+                pending_items=pending_enrichment_items,
+                settings=settings,
+                database=database,
+                effective_analysis_signature=effective_analysis_signature,
+                expected_essentia_semantic_signature=expected_essentia_semantic_signature,
+                print_progress=True,
+            )
 
     print(f"Completed playlist analysis for '{playlist_name}'. Updated {processed} track(s).")
-    print_backend_diagnostics("DSP local lane", dsp_diagnostics, requested_device="cpu")
-    print_backend_diagnostics("TempoCNN", tempo_diagnostics, requested_device="auto")
-    print_backend_diagnostics("MusicalKeyCNN", key_diagnostics, requested_device=settings.analysis.key_device)
     if args.analysis_mode == "full":
+        print_backend_diagnostics("DSP local lane", dsp_diagnostics, requested_device="cpu")
+        print_backend_diagnostics("TempoCNN", tempo_diagnostics, requested_device="auto")
+        print_backend_diagnostics("MusicalKeyCNN", key_diagnostics, requested_device=settings.analysis.key_device)
         print_backend_diagnostics(
             "Essentia semantics",
             essentia_diagnostics,
@@ -1141,34 +1389,17 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
         )
 
     if args.analysis_mode == "full" and processed > 0 and playlist_id:
-        with Database(settings.database_path) as database:
-            # Refresh canonical relative rows for the analyzed playlist.
-            if hasattr(database, "get_playlist_relative_inputs"):
-                try:
-                    rel_rows = database.get_playlist_relative_inputs(playlist_name)
-                    rel_inputs = [row_to_relative_track_input(row) for row in rel_rows]
-                    refresh_canonical_relative_playlist(
-                        rel_inputs,
-                        settings,
-                        playlist_name=playlist_name,
-                        playlist_id=playlist_id,
-                        database=database,
-                        timestamp=utc_now(),
-                    )
-                    print(f"Refreshed canonical relative data for '{playlist_name}'.")
-                except Exception as exc:
-                    print(f"Warning: canonical relative refresh failed for '{playlist_name}': {exc}", file=sys.stderr)
-
-            # Mark all other playlists containing changed tracks as stale.
-            if (
-                updated_track_ids
-                and hasattr(database, "get_playlists_containing_tracks")
-                and hasattr(database, "mark_playlists_stale")
-            ):
-                linked = database.get_playlists_containing_tracks(updated_track_ids)
+        with Database(settings.database_path) as post_db:
+            try:
+                if hasattr(post_db, "get_playlist_name_by_id"):
+                    _refresh_relative_for_playlists(post_db, settings, {playlist_id})
+            except Exception as exc:
+                print(f"Warning: canonical relative refresh failed for '{playlist_name}': {exc}", file=sys.stderr)
+            if updated_track_ids and hasattr(post_db, "get_playlists_containing_tracks") and hasattr(post_db, "mark_playlists_stale"):
+                linked = post_db.get_playlists_containing_tracks(updated_track_ids)
                 stale_targets = [pid for pid in linked if pid != playlist_id]
                 if stale_targets:
-                    database.mark_playlists_stale(stale_targets, "absolute_track_changed", utc_now())
+                    post_db.mark_playlists_stale(stale_targets, "absolute_track_changed", utc_now())
                     print(f"Marked {len(stale_targets)} linked playlist(s) stale.")
 
     return 0
@@ -1187,6 +1418,8 @@ def handle_list_playlist(args: argparse.Namespace) -> int:
             artist = row["artist"] or "Unknown artist"
             if row["analyzed_at"]:
                 summary = f"{row['analysis_mode']} | {row['bpm']:.1f} BPM | {row['key']}"
+            elif row["fast_analyzed_at"]:
+                summary = f"fast_ready | {row['fast_bpm']:.1f} BPM | {row['fast_key']}"
             else:
                 summary = "not analyzed"
             print(f"{row['position']:02d}. {artist} - {title} [{row['track_id']}] :: {summary}")
@@ -1199,6 +1432,11 @@ def handle_show_track(args: argparse.Namespace) -> int:
         details = database.get_track_details(args.track_id)
         if details is None:
             raise SystemExit(f"Track '{args.track_id}' was not found.")
+    details["analysis_state"] = (
+        "full_ready" if details.get("analyzed_at")
+        else "fast_ready" if details.get("fast_analyzed_at")
+        else "metadata_only"
+    )
     details["energy_summary"] = {
         "heuristic": details.get("energy_abs"),
         "heuristic_legacy": details.get("energy_heuristic_abs"),
@@ -2004,11 +2242,20 @@ def handle_purge_model_cache(args: argparse.Namespace) -> int:
     deleted_essentia_semantics = 0
 
     if args.backend in {"all", "tempocnn"}:
-        deleted_tempocnn = purge_tempocnn_cache(file_paths=deduped_paths or None)
+        deleted_tempocnn = purge_tempocnn_cache(
+            file_paths=deduped_paths or None,
+            clear_warm_service=args.clear_warm_services,
+        )
     if args.backend in {"all", "musicalkeycnn"}:
-        deleted_musicalkeycnn = purge_musicalkeycnn_cache(file_paths=deduped_paths or None)
+        deleted_musicalkeycnn = purge_musicalkeycnn_cache(
+            file_paths=deduped_paths or None,
+            clear_warm_service=args.clear_warm_services,
+        )
     if args.backend in {"all", "essentia_semantics"}:
-        deleted_essentia_semantics = purge_essentia_semantic_cache(file_paths=deduped_paths or None)
+        deleted_essentia_semantics = purge_essentia_semantic_cache(
+            file_paths=deduped_paths or None,
+            clear_warm_service=args.clear_warm_services,
+        )
 
     scope_label = "all cached tracks"
     if deduped_paths:
@@ -2017,15 +2264,174 @@ def handle_purge_model_cache(args: argparse.Namespace) -> int:
     print(f"Purged model inference cache for {scope_label}.")
     if args.backend in {"all", "tempocnn"}:
         print(f"- TempoCNN rows removed: {deleted_tempocnn}")
-        print("- TempoCNN warm service state cleared")
+        print(
+            "- TempoCNN warm service state cleared"
+            if args.clear_warm_services
+            else "- TempoCNN warm service state preserved"
+        )
     if args.backend in {"all", "musicalkeycnn"}:
         print(f"- MusicalKeyCNN rows removed: {deleted_musicalkeycnn}")
-        print("- MusicalKeyCNN warm service state cleared")
+        print(
+            "- MusicalKeyCNN warm service state cleared"
+            if args.clear_warm_services
+            else "- MusicalKeyCNN warm service state preserved"
+        )
     if args.backend in {"all", "essentia_semantics"}:
         print(f"- Essentia semantics rows removed: {deleted_essentia_semantics}")
-        print("- Essentia semantics warm service state cleared")
+        print(
+            "- Essentia semantics warm service state cleared"
+            if args.clear_warm_services
+            else "- Essentia semantics warm service state preserved"
+        )
     print(f"- Persistent cache DB: {resolve_inference_cache_path()}")
     print("- Re-run analysis with --force if you want stored playlist analysis rows refreshed too.")
+    return 0
+
+
+def handle_run_analysis_worker(args: argparse.Namespace) -> int:
+    settings = load_runtime_settings()
+    expected_essentia_semantic_signature = resolve_expected_essentia_semantic_signature(settings)
+    effective_analysis_signature = build_effective_analysis_signature(
+        settings.analysis_signature,
+        tempocnn_accelerator="auto",
+        musicalkeycnn_model=settings.analysis.key_model_path,
+        musicalkeycnn_device=settings.analysis.key_device,
+        musicalkeycnn_policy=settings.analysis.key_policy,
+        essentia_semantic_signature=expected_essentia_semantic_signature,
+    )
+
+    with Database(settings.database_path) as database:
+        jobs = database.get_pending_analysis_jobs(job_kind="enrichment", limit=args.limit)
+        if not jobs:
+            print("No pending enrichment jobs were found.")
+            return 0
+
+        pending_items: list[dict[str, object]] = []
+        for offset, job in enumerate(jobs, start=1):
+            track_row = database.get_track_row(str(job["track_id"]))
+            if track_row is None:
+                database.mark_analysis_job_failed(int(job["id"]), "Track metadata was missing.", 0.0, utc_now())
+                continue
+            track = read_track_metadata_with_overrides(
+                Path(str(track_row["file_path"])),
+                bpm_imported=track_row["imported_bpm"],
+                key_imported=track_row["imported_key"],
+                title_override=track_row["title"],
+                artist_override=track_row["artist"],
+                genre_override=track_row["genre"],
+                import_source=track_row["import_source"] or "local_files",
+            )
+            prepared = PreparedTrack(
+                row={"playlist_id": job["playlist_id"], "track_id": job["track_id"], "file_path": track.file_path.as_posix()},
+                track=track,
+                position=offset,
+                resolved_path=track.file_path.resolve(),
+            )
+            database.mark_analysis_job_started(int(job["id"]), utc_now())
+            pending_items.append(
+                {
+                    "prepared": prepared,
+                    "job_id": int(job["id"]),
+                    "start_time": time.perf_counter(),
+                    "display_index": offset,
+                    "display_total": len(jobs),
+                }
+            )
+
+        (
+            processed,
+            updated_track_ids,
+            _dsp,
+            _tempo,
+            _key,
+            _essentia,
+        ) = _process_enrichment_batch(
+            pending_items=pending_items,
+            settings=settings,
+            database=database,
+            effective_analysis_signature=effective_analysis_signature,
+            expected_essentia_semantic_signature=expected_essentia_semantic_signature,
+            print_progress=True,
+        )
+
+        touched_playlists = {
+            str(job["playlist_id"])
+            for job in jobs
+            if job["playlist_id"] is not None
+        }
+        if touched_playlists:
+            _refresh_relative_for_playlists(database, settings, touched_playlists)
+        if updated_track_ids:
+            linked = database.get_playlists_containing_tracks(updated_track_ids)
+            stale_targets = [pid for pid in linked if pid not in touched_playlists]
+            if stale_targets:
+                database.mark_playlists_stale(stale_targets, "absolute_track_changed", utc_now())
+                print(f"Marked {len(stale_targets)} linked playlist(s) stale.")
+
+    print(f"Processed {processed} enrichment job(s).")
+    return 0
+
+
+def handle_prewarm_model_services(args: argparse.Namespace) -> int:
+    settings = load_runtime_settings()
+    warm_path = None
+    if args.path:
+        warm_path = Path(args.path).expanduser().resolve()
+        if not warm_path.is_file():
+            raise FileNotFoundError(f"Warmup path was not found: {warm_path}")
+
+    if warm_path is not None:
+        estimate_tempocnn_bpms([warm_path])
+        estimate_musicalkeycnn_keys(
+            [warm_path],
+            model_path=settings.analysis.key_model_path,
+            device=settings.analysis.key_device,
+            policy=settings.analysis.key_policy,
+        )
+        estimate_essentia_semantic_batch(
+            [warm_path],
+            model_root=settings.analysis.essentia_semantic_model_root,
+            image_name=settings.analysis.essentia_semantic_image,
+            device=settings.analysis.essentia_semantic_device,
+            family_policy=settings.analysis.essentia_semantic_model_family_policy,
+        )
+    else:
+        tempocnn_ready, tempocnn_notes = ensure_tempocnn_service(
+            drive_letters=[],
+            image_name=resolve_tempocnn_image_name(None),
+            accelerator="auto",
+            service_name=resolve_tempocnn_service_name(None),
+            service_port=resolve_tempocnn_service_port(None),
+        )
+        if not tempocnn_ready:
+            raise SystemExit("\n".join(tempocnn_notes) or "TempoCNN service warmup failed.")
+        key_ready, key_notes = ensure_musicalkeycnn_service(
+            model_path=resolve_musicalkeycnn_model_path(settings.analysis.key_model_path),
+            image_name=resolve_musicalkeycnn_image_name(None),
+            device=settings.analysis.key_device,
+            service_name=resolve_musicalkeycnn_service_name(None),
+            service_port=resolve_musicalkeycnn_service_port(None),
+            drive_letters=[],
+        )
+        if not key_ready:
+            raise SystemExit("\n".join(key_notes) or "MusicalKeyCNN service warmup failed.")
+        if settings.analysis.essentia_semantics_enabled:
+            semantic_ready, semantic_notes = ensure_essentia_semantic_service(
+                model_root=resolve_essentia_semantic_model_root(
+                    settings.analysis.essentia_semantic_model_root
+                ),
+                image_name=settings.analysis.essentia_semantic_image,
+                device=settings.analysis.essentia_semantic_device,
+                family_policy=settings.analysis.essentia_semantic_model_family_policy,
+                service_name=resolve_essentia_semantic_service_name(None),
+                service_port=resolve_essentia_semantic_service_port(None),
+                drive_letters=[],
+            )
+            if not semantic_ready:
+                raise SystemExit(
+                    "\n".join(semantic_notes) or "Essentia semantic service warmup failed."
+                )
+    print("Model services prewarmed.")
     return 0
 
 
@@ -2108,6 +2514,10 @@ def main(argv: list[str] | None = None) -> int:
             return handle_analyze_relative_playlist(args)
         if args.command == "refresh-relative-playlist":
             return handle_refresh_relative_playlist(args)
+        if args.command == "run-analysis-worker":
+            return handle_run_analysis_worker(args)
+        if args.command == "prewarm-model-services":
+            return handle_prewarm_model_services(args)
         if args.command == "analyze-energy-playlist":
             return handle_analyze_energy_playlist(args)
         if args.command == "download-essentia-semantic-models":

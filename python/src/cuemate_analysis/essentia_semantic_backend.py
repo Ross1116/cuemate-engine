@@ -25,7 +25,7 @@ DEFAULT_ESSENTIA_SEMANTIC_SERVICE_NAME = "cuemate-essentia-semantics-service"
 DEFAULT_ESSENTIA_SEMANTIC_SERVICE_PORT = 47833
 DEFAULT_ESSENTIA_SEMANTIC_MODEL_ROOT = REPO_ROOT / "python" / "models" / "essentia_semantics"
 ESSENTIA_SEMANTIC_BACKEND = "essentia_semantics"
-ESSENTIA_SEMANTIC_CACHE_VERSION = "essentia-semantics-cache-v2"
+ESSENTIA_SEMANTIC_CACHE_VERSION = "essentia-semantics-cache-v3"
 ESSENTIA_SEMANTIC_DEVICE_CHOICES = {"auto", "cpu", "cuda"}
 ESSENTIA_SEMANTIC_FAMILY_POLICIES = {"best_per_task", "musicnn_only"}
 ESSENTIA_SEMANTIC_URLS = {
@@ -54,6 +54,7 @@ class EssentiaSemanticEstimate:
     mood_aggressive_abs: float | None
     mood_party_abs: float | None
     mood_relaxed_abs: float | None
+    semantic_confidence: float | None
     energy_essentia_fused: float | None
     energy_essentia_bucket: str | None
     elapsed_ms: float | None
@@ -447,9 +448,28 @@ def request_essentia_semantic_service(
     model_root: str,
     device: str,
     family_policy: str,
+    auxiliary_features_by_track: dict[str, dict[str, float | None]] | None = None,
+    default_excerpt_seconds: float = 60.0,
+    multisample_excerpt_seconds: float = 30.0,
+    mismatch_threshold: float = 0.22,
+    confidence_threshold: float = 0.58,
+    structure_rms_cv_threshold: float = 0.45,
+    outlier_zscore_threshold: float = 1.35,
 ) -> tuple[dict[str, Any] | None, list[str]]:
     request_body = json.dumps(
-        {"tracks": track_paths, "model_root": model_root, "device": device, "family_policy": family_policy}
+        {
+            "tracks": track_paths,
+            "model_root": model_root,
+            "device": device,
+            "family_policy": family_policy,
+            "auxiliary_features_by_track": auxiliary_features_by_track or {},
+            "default_excerpt_seconds": default_excerpt_seconds,
+            "multisample_excerpt_seconds": multisample_excerpt_seconds,
+            "mismatch_threshold": mismatch_threshold,
+            "confidence_threshold": confidence_threshold,
+            "structure_rms_cv_threshold": structure_rms_cv_threshold,
+            "outlier_zscore_threshold": outlier_zscore_threshold,
+        }
     ).encode("utf-8")
     request = urllib_request.Request(
         f"http://127.0.0.1:{service_port}/analyze-semantics",
@@ -482,6 +502,7 @@ def build_essentia_semantic_unavailable_estimate(
         mood_aggressive_abs=None,
         mood_party_abs=None,
         mood_relaxed_abs=None,
+        semantic_confidence=None,
         energy_essentia_fused=None,
         energy_essentia_bucket=None,
         elapsed_ms=elapsed_ms,
@@ -522,14 +543,12 @@ def build_essentia_semantic_success_estimate(
     if all(semantics.get(key) is not None for key in semantics):
         fused = clamp(
             (0.34 * float(semantics["arousal_abs"]))
-            + (0.18 * float(semantics["danceability_abs"]))
-            + (0.16 * float(semantics["mood_party_abs"]))
+            + (0.24 * float(semantics["danceability_abs"]))
+            + (0.18 * float(semantics["mood_party_abs"]))
             + (0.14 * (1.0 - float(semantics["mood_relaxed_abs"])))
-            + (0.08 * float(semantics["mood_aggressive_abs"]))
-            + (0.04 * float(payload.get("loudness_norm") or 0.0))
-            + (0.03 * float(payload.get("drums_abs") or 0.0))
-            + (0.02 * float(payload.get("groove_abs") or 0.0))
-            + (0.01 * float(payload.get("bass_abs") or 0.0))
+            + (0.05 * float(semantics["mood_aggressive_abs"]))
+            + (0.03 * float(payload.get("loudness_norm") or 0.0))
+            + (0.02 * float(payload.get("bass_abs") or 0.0))
         )
         bucket = bucket_from_score(fused)
     return EssentiaSemanticEstimate(
@@ -540,6 +559,7 @@ def build_essentia_semantic_success_estimate(
         mood_aggressive_abs=float(semantics["mood_aggressive_abs"]) if semantics["mood_aggressive_abs"] is not None else None,
         mood_party_abs=float(semantics["mood_party_abs"]) if semantics["mood_party_abs"] is not None else None,
         mood_relaxed_abs=float(semantics["mood_relaxed_abs"]) if semantics["mood_relaxed_abs"] is not None else None,
+        semantic_confidence=float(payload.get("semantic_confidence")) if payload.get("semantic_confidence") is not None else None,
         energy_essentia_fused=fused,
         energy_essentia_bucket=bucket,
         elapsed_ms=elapsed_ms,
@@ -550,6 +570,8 @@ def build_essentia_semantic_success_estimate(
             "tf_physical_gpu_count": payload.get("tf_physical_gpu_count"),
             "tf_logical_gpu_count": payload.get("tf_logical_gpu_count"),
             "family_map": payload.get("family_map"),
+            "sampling_mode": payload.get("sampling_mode"),
+            "sampling_triggers": payload.get("sampling_triggers"),
         },
         notes=payload_notes,
         available=True,
@@ -611,6 +633,8 @@ def load_cached_essentia_semantic_estimates(
         payload = payloads.get(str(descriptor["cache_key"]))
         if payload is None:
             continue
+        if "semantic_confidence" not in payload:
+            payload["semantic_confidence"] = None
         notes = ["Persistent inference cache hit.", *payload.get("notes", [])]
         estimates[path] = EssentiaSemanticEstimate(**{**payload, "elapsed_ms": elapsed_ms, "notes": notes})
     return estimates, descriptors
@@ -647,7 +671,11 @@ def persist_essentia_semantic_estimates(
         logger.debug("Failed to persist Essentia semantic inference cache entries.", exc_info=exc)
 
 
-def purge_essentia_semantic_cache(file_paths: list[str] | None = None) -> int:
+def purge_essentia_semantic_cache(
+    file_paths: list[str] | None = None,
+    *,
+    clear_warm_service: bool = True,
+) -> int:
     deleted = 0
     try:
         with PersistentInferenceCache(resolve_inference_cache_path()) as cache:
@@ -658,7 +686,8 @@ def purge_essentia_semantic_cache(file_paths: list[str] | None = None) -> int:
             )
     except Exception:
         deleted = 0
-    remove_docker_container(resolve_essentia_semantic_service_name(None))
+    if clear_warm_service:
+        remove_docker_container(resolve_essentia_semantic_service_name(None))
     return deleted
 
 
@@ -670,6 +699,12 @@ def estimate_essentia_semantic_batch(
     device: str = "auto",
     family_policy: str = "best_per_task",
     auxiliary_features_by_path: dict[Path, dict[str, float | None]] | None = None,
+    default_excerpt_seconds: float = 60.0,
+    multisample_excerpt_seconds: float = 30.0,
+    mismatch_threshold: float = 0.22,
+    confidence_threshold: float = 0.58,
+    structure_rms_cv_threshold: float = 0.45,
+    outlier_zscore_threshold: float = 1.35,
 ) -> dict[Path, EssentiaSemanticEstimate]:
     resolved_paths = [Path(path).expanduser().resolve() for path in track_paths]
     if not resolved_paths:
@@ -741,6 +776,19 @@ def estimate_essentia_semantic_batch(
         model_root=container_model_root,
         device=normalized_device,
         family_policy=normalized_family_policy,
+        auxiliary_features_by_track={
+            container_track_paths[path]: {
+                key: value
+                for key, value in ((auxiliary_features_by_path or {}).get(path.resolve(), {}) or {}).items()
+            }
+            for path in service_candidate_paths
+        },
+        default_excerpt_seconds=default_excerpt_seconds,
+        multisample_excerpt_seconds=multisample_excerpt_seconds,
+        mismatch_threshold=mismatch_threshold,
+        confidence_threshold=confidence_threshold,
+        structure_rms_cv_threshold=structure_rms_cv_threshold,
+        outlier_zscore_threshold=outlier_zscore_threshold,
     )
     elapsed_ms = round((time.perf_counter() - started) * 1000.0 / max(len(service_candidate_paths), 1), 1)
     if service_payload is None:

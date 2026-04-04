@@ -60,26 +60,8 @@ CREATE TABLE track_features_abs (
   analyzed_at TEXT NOT NULL,
   analysis_signature TEXT NOT NULL,
   config_signature TEXT NOT NULL,
-  scoring_contract_id_at_analysis TEXT,
-  energy_hybrid REAL,
-  energy_learned REAL,
-  energy_learned_bucket TEXT,
-  energy_model_signature TEXT,
-  energy_model_source TEXT,
-  energy_model_inferred_at TEXT,
-  danceability_abs REAL,
-  arousal_abs REAL,
-  valence_abs REAL,
-  mood_aggressive_abs REAL,
-  mood_party_abs REAL,
-  mood_relaxed_abs REAL,
-  energy_essentia_fused REAL,
-  energy_essentia_bucket TEXT,
-  essentia_semantic_signature TEXT,
-  essentia_semantic_source TEXT,
-  essentia_semantic_inferred_at TEXT,
-  energy_heuristic_abs REAL
-);
+  scoring_contract_id_at_analysis TEXT
+, energy_hybrid REAL, energy_learned REAL, energy_learned_bucket TEXT, energy_model_signature TEXT, energy_model_source TEXT, energy_model_inferred_at TEXT, danceability_abs REAL, arousal_abs REAL, valence_abs REAL, mood_aggressive_abs REAL, mood_party_abs REAL, mood_relaxed_abs REAL, energy_essentia_fused REAL, energy_essentia_bucket TEXT, essentia_semantic_signature TEXT, essentia_semantic_source TEXT, essentia_semantic_inferred_at TEXT, energy_heuristic_abs REAL);
 CREATE TABLE analysis_jobs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   playlist_id TEXT REFERENCES playlists(id) ON DELETE SET NULL,
@@ -97,7 +79,7 @@ CREATE TABLE analysis_jobs (
   created_at TEXT NOT NULL,
   started_at TEXT,
   completed_at TEXT
-);
+, job_kind TEXT NOT NULL DEFAULT 'full');
 CREATE INDEX idx_analysis_jobs_status_priority
   ON analysis_jobs(status, priority DESC, created_at ASC);
 CREATE TABLE IF NOT EXISTS "playlist_tracks" (
@@ -168,6 +150,25 @@ CREATE TABLE playlist_stats (
   stale_reason     TEXT,    -- "absolute_track_changed","playlist_membership_changed","relative_signature_changed"
   stale_marked_at  TEXT
 );
+CREATE TABLE track_features_fast (
+  track_id TEXT PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL DEFAULT 'local',
+  source_file_hash TEXT NOT NULL,
+  bpm REAL NOT NULL,
+  bpm_confidence REAL NOT NULL,
+  bpm_source TEXT NOT NULL,
+  key TEXT NOT NULL,
+  key_number INTEGER NOT NULL,
+  key_letter TEXT NOT NULL,
+  key_confidence REAL NOT NULL,
+  key_source TEXT NOT NULL,
+  key_imported TEXT,
+  key_tagged TEXT,
+  key_agreement INTEGER,
+  analyzed_at TEXT NOT NULL,
+  analysis_signature TEXT NOT NULL,
+  config_signature TEXT NOT NULL
+);
 -- Dbmate schema migrations
 INSERT INTO "schema_migrations" (version) VALUES
   ('20260403112734'),
@@ -177,4 +178,5 @@ INSERT INTO "schema_migrations" (version) VALUES
   ('20260404193000'),
   ('20260404210000'),
   ('20260404220000'),
-  ('20260404230000');
+  ('20260404230000'),
+  ('20260405093000');

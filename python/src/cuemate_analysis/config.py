@@ -51,6 +51,12 @@ class AnalysisSettings:
     essentia_semantic_device: str
     essentia_semantic_model_family_policy: str
     essentia_semantic_model_root: str
+    essentia_semantic_default_excerpt_seconds: float
+    essentia_semantic_multisample_excerpt_seconds: float
+    essentia_semantic_trigger_mismatch_threshold: float
+    essentia_semantic_trigger_confidence_threshold: float
+    essentia_semantic_trigger_structure_rms_cv: float
+    essentia_semantic_trigger_outlier_zscore: float
     full_chunk_size: int
     tempo_chunk_size: int
     key_chunk_size: int
@@ -219,6 +225,12 @@ def _analysis_signature(
         "essentia_semantic_device": analysis_config.essentia_semantic_device,
         "essentia_semantic_model_family_policy": analysis_config.essentia_semantic_model_family_policy,
         "essentia_semantic_model_root": analysis_config.essentia_semantic_model_root,
+        "essentia_semantic_default_excerpt_seconds": analysis_config.essentia_semantic_default_excerpt_seconds,
+        "essentia_semantic_multisample_excerpt_seconds": analysis_config.essentia_semantic_multisample_excerpt_seconds,
+        "essentia_semantic_trigger_mismatch_threshold": analysis_config.essentia_semantic_trigger_mismatch_threshold,
+        "essentia_semantic_trigger_confidence_threshold": analysis_config.essentia_semantic_trigger_confidence_threshold,
+        "essentia_semantic_trigger_structure_rms_cv": analysis_config.essentia_semantic_trigger_structure_rms_cv,
+        "essentia_semantic_trigger_outlier_zscore": analysis_config.essentia_semantic_trigger_outlier_zscore,
         "semantic_calibration": _serialize_semantic_calibration(semantic_calibration),
     }
     digest = hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
@@ -295,6 +307,12 @@ def load_runtime_settings(repo_root: Path | None = None) -> RuntimeSettings:
         essentia_semantic_device=str(analysis_payload.get("essentia_semantic_device", "auto")),
         essentia_semantic_model_family_policy=str(analysis_payload.get("essentia_semantic_model_family_policy", "best_per_task")),
         essentia_semantic_model_root=str(analysis_payload.get("essentia_semantic_model_root", "python/models/essentia_semantics")),
+        essentia_semantic_default_excerpt_seconds=float(analysis_payload.get("essentia_semantic_default_excerpt_seconds", 60.0)),
+        essentia_semantic_multisample_excerpt_seconds=float(analysis_payload.get("essentia_semantic_multisample_excerpt_seconds", 30.0)),
+        essentia_semantic_trigger_mismatch_threshold=float(analysis_payload.get("essentia_semantic_trigger_mismatch_threshold", 0.22)),
+        essentia_semantic_trigger_confidence_threshold=float(analysis_payload.get("essentia_semantic_trigger_confidence_threshold", 0.58)),
+        essentia_semantic_trigger_structure_rms_cv=float(analysis_payload.get("essentia_semantic_trigger_structure_rms_cv", 0.45)),
+        essentia_semantic_trigger_outlier_zscore=float(analysis_payload.get("essentia_semantic_trigger_outlier_zscore", 1.35)),
         full_chunk_size=int(analysis_payload.get("full_chunk_size", 4)),
         tempo_chunk_size=int(analysis_payload.get("tempo_chunk_size", 8)),
         key_chunk_size=int(analysis_payload.get("key_chunk_size", 8)),

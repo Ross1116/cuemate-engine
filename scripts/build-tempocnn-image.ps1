@@ -1,13 +1,9 @@
 $ErrorActionPreference = "Stop"
 
-$repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
-$imageTag = if ($env:CUEMATE_TEMPOCNN_IMAGE) { $env:CUEMATE_TEMPOCNN_IMAGE } else { "cuemate-tempocnn:local" }
+$delegateScript = Join-Path $PSScriptRoot "build-essentia-semantics-image.ps1"
+if (-not (Test-Path $delegateScript)) {
+    throw "Shared TensorFlow/Essentia build script was not found at $delegateScript"
+}
 
-Push-Location $repoRoot
-try {
-    & docker build --tag $imageTag --file docker/tempocnn/Dockerfile docker/tempocnn
-    exit $LASTEXITCODE
-}
-finally {
-    Pop-Location
-}
+Write-Output "TempoCNN now uses the shared TensorFlow/Essentia image."
+& powershell -ExecutionPolicy Bypass -File $delegateScript

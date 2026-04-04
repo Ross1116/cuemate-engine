@@ -75,6 +75,11 @@ python -m cuemate_analysis analyze-bpm "D:\path\to\track.wav"
 python -m cuemate_analysis analyze-bpm-playlist --playlist "My Playlist"
 python -m cuemate_analysis analyze-bpm-key "D:\path\to\track.wav"
 python -m cuemate_analysis analyze-bpm-key-playlist --playlist "My Playlist"
+python -m cuemate_analysis analyze-relative-playlist --playlist "My Playlist"
+python -m cuemate_analysis analyze-energy-playlist --playlist "My Playlist"
+python -m cuemate_analysis export-energy-dataset --playlist "My Playlist" --output .\data\energy-dataset.csv
+python -m cuemate_analysis train-energy-model --dataset .\data\energy-dataset.csv --model-out .\python\models\energy\teacher_first_v1.joblib --meta-out .\python\models\energy\teacher_first_v1.meta.json
+python -m cuemate_analysis benchmark-energy-model --dataset .\data\energy-dataset.csv
 python -m cuemate_analysis purge-model-cache
 python -m cuemate_analysis list-playlist --name "My Playlist"
 python -m cuemate_analysis show-track --track-id trk_example123
@@ -88,6 +93,9 @@ Important notes:
 - Serato crate imports currently provide playlist membership and file-path discovery only; BPM/key metadata is not available from the current parser
 - `analyze-bpm` and `analyze-bpm-playlist` are the intended BPM-only commands
 - `analyze-bpm-key` and `analyze-bpm-key-playlist` are the intended fast paths when you only want BPM + key
+- `analyze-relative-playlist` is the experimental read-only Milestone 2 Phase 1 surface for playlist-relative context and playlist stats previews
+- `analyze-energy-playlist` is the experimental read-only workbench for comparing absolute-energy formulas before promoting one into the production analyzer
+- `export-energy-dataset`, `train-energy-model`, and `benchmark-energy-model` implement the offline teacher-first learned-energy workflow
 - if TempoCNN is unavailable for a track, analysis falls back to the current librosa baseline automatically and records `baseline_fallback` as the source
 - TempoCNN now runs through Docker and will try GPU before falling back to CPU
 - TempoCNN now handles BPM only; key extraction is no longer part of the TempoCNN container path
@@ -98,6 +106,7 @@ Important notes:
 - repeated requests for unchanged files are cached inside those warm services, so reruns are much faster than the first pass
 - those persistent model caches are also stored in `data/inference-cache.db`, and `purge-model-cache` clears both the persistent rows and the warm service state
 - playlist analysis batches TempoCNN tracks through the warm service so the model stays loaded
+- when `analysis.energy_parallel_enabled` is true and the configured energy model artifacts exist, `analyze-playlist --analysis-mode full` stores `energy_hybrid` and `energy_learned` alongside heuristic `energy_abs`
 - the default TempoCNN model shipped in the repo is `deepsquare-k16-3.pb`
 - the default MusicalKeyCNN checkpoint shipped in the local repo cache is `keynet.pt`
 - the default local Docker image name is `cuemate-tempocnn:local`, and you can override it with `CUEMATE_TEMPOCNN_IMAGE`

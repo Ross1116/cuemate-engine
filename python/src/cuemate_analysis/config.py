@@ -8,6 +8,29 @@ from pathlib import Path
 from typing import Any
 
 
+DEFAULT_STATIC_WEIGHTS = {
+    "target_energy": 0.22,
+    "transition_support": 0.18,
+    "bass_transition": 0.15,
+    "vocal_transition": 0.13,
+    "harmonic": 0.12,
+    "tempo": 0.10,
+    "history_fit": 0.06,
+    "rhythmic_continuity": 0.04,
+}
+
+DEFAULT_WEIGHT_FLOORS = {
+    "target_energy": 0.08,
+    "transition_support": 0.05,
+    "bass_transition": 0.04,
+    "vocal_transition": 0.03,
+    "harmonic": 0.04,
+    "tempo": 0.03,
+    "history_fit": 0.03,
+    "rhythmic_continuity": 0.02,
+}
+
+
 @dataclass(frozen=True)
 class AnalysisSettings:
     sample_rate: int
@@ -22,6 +45,28 @@ class AnalysisSettings:
     model_preload: bool
     fast_pass_enabled: bool
     analysis_signature_seed: str
+    energy_parallel_enabled: bool
+    energy_model_path: str | None
+    energy_model_meta_path: str | None
+    energy_source_default: str
+
+
+@dataclass(frozen=True)
+class ThresholdSettings:
+    small_playlist_limit: int
+    min_playlist_for_relative: int
+
+
+@dataclass(frozen=True)
+class ScoringSettings:
+    static_weights: dict[str, float]
+    weight_floors: dict[str, float]
+
+
+@dataclass(frozen=True)
+class WeightAdaptationSettings:
+    mode: str
+    adaptation_strength: float
 
 
 @dataclass(frozen=True)
@@ -34,6 +79,9 @@ class RuntimeSettings:
     config_signature: str
     analysis_signature: str
     analysis: AnalysisSettings
+    thresholds: ThresholdSettings
+    scoring: ScoringSettings
+    weight_adaptation: WeightAdaptationSettings
 
 
 def find_repo_root(start: Path | None = None) -> Path:
@@ -107,6 +155,25 @@ def _analysis_signature(config_signature: str, analysis_config: AnalysisSettings
     return f"m1-{digest[:12]}"
 
 
+def _relative_signature(
+    config_signature: str,
+    thresholds: ThresholdSettings,
+    scoring: ScoringSettings,
+    weight_adaptation: WeightAdaptationSettings,
+) -> str:
+    payload = {
+        "config_signature": config_signature,
+        "small_playlist_limit": thresholds.small_playlist_limit,
+        "min_playlist_for_relative": thresholds.min_playlist_for_relative,
+        "static_weights": scoring.static_weights,
+        "weight_floors": scoring.weight_floors,
+        "weight_adaptation_mode": weight_adaptation.mode,
+        "adaptation_strength": weight_adaptation.adaptation_strength,
+    }
+    digest = hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+    return f"m2exp-{digest[:12]}"
+
+
 def load_runtime_settings(repo_root: Path | None = None) -> RuntimeSettings:
     root = find_repo_root(repo_root)
     env_path = root / ".env"
@@ -126,6 +193,9 @@ def load_runtime_settings(repo_root: Path | None = None) -> RuntimeSettings:
     config_path = (root / config_path_value).resolve()
     config_payload = _load_json(config_path)
     analysis_payload = config_payload.get("analysis", {})
+    thresholds_payload = config_payload.get("thresholds", {})
+    scoring_payload = config_payload.get("scoring", {})
+    weight_adaptation_payload = config_payload.get("weight_adaptation", {})
 
     analysis_settings = AnalysisSettings(
         sample_rate=int(analysis_payload.get("sample_rate", 22050)),
@@ -140,6 +210,28 @@ def load_runtime_settings(repo_root: Path | None = None) -> RuntimeSettings:
         model_preload=bool(analysis_payload.get("model_preload", True)),
         fast_pass_enabled=bool(analysis_payload.get("fast_pass_enabled", True)),
         analysis_signature_seed=str(analysis_payload.get("analysis_signature_seed", "m1-absolute-v1")),
+        energy_parallel_enabled=bool(analysis_payload.get("energy_parallel_enabled", True)),
+        energy_model_path=analysis_payload.get("energy_model_path", "python/models/energy/teacher_first_v1.joblib"),
+        energy_model_meta_path=analysis_payload.get("energy_model_meta_path", "python/models/energy/teacher_first_v1.meta.json"),
+        energy_source_default=str(analysis_payload.get("energy_source_default", "heuristic")),
+    )
+    thresholds = ThresholdSettings(
+        small_playlist_limit=int(thresholds_payload.get("small_playlist_limit", 12)),
+        min_playlist_for_relative=int(thresholds_payload.get("min_playlist_for_relative", 5)),
+    )
+    scoring = ScoringSettings(
+        static_weights={
+            key: float(value)
+            for key, value in scoring_payload.get("static_weights", DEFAULT_STATIC_WEIGHTS).items()
+        },
+        weight_floors={
+            key: float(value)
+            for key, value in scoring_payload.get("weight_floors", DEFAULT_WEIGHT_FLOORS).items()
+        },
+    )
+    weight_adaptation = WeightAdaptationSettings(
+        mode=str(weight_adaptation_payload.get("mode", "auto")),
+        adaptation_strength=float(weight_adaptation_payload.get("adaptation_strength", 0.7)),
     )
 
     config_signature = str(config_payload.get("config_signature", "default"))
@@ -156,4 +248,16 @@ def load_runtime_settings(repo_root: Path | None = None) -> RuntimeSettings:
         config_signature=config_signature,
         analysis_signature=_analysis_signature(config_signature, analysis_settings),
         analysis=analysis_settings,
+        thresholds=thresholds,
+        scoring=scoring,
+        weight_adaptation=weight_adaptation,
+    )
+
+
+def build_relative_experiment_signature(settings: RuntimeSettings) -> str:
+    return _relative_signature(
+        settings.config_signature,
+        settings.thresholds,
+        settings.scoring,
+        settings.weight_adaptation,
     )

@@ -12,6 +12,40 @@
     "per_track_timeout_seconds": 120,
     "model_preload": true,
     "fast_pass_enabled": true,
-    "analysis_signature_seed": "m1-absolute-v1"
+    "analysis_signature_seed": "m1-absolute-v1",
+    "energy_parallel_enabled": true,
+    "energy_model_path": "python/models/energy/teacher_first_v1.joblib",
+    "energy_model_meta_path": "python/models/energy/teacher_first_v1.meta.json",
+    "energy_source_default": "heuristic"
+  },
+  "thresholds": {
+    "small_playlist_limit": 12,
+    "min_playlist_for_relative": 5
+  },
+  "scoring": {
+    "static_weights": {
+      "target_energy": 0.22,
+      "transition_support": 0.18,
+      "bass_transition": 0.15,
+      "vocal_transition": 0.13,
+      "harmonic": 0.12,
+      "tempo": 0.10,
+      "history_fit": 0.06,
+      "rhythmic_continuity": 0.04
+    },
+    "weight_floors": {
+      "target_energy": 0.08,
+      "transition_support": 0.05,
+      "bass_transition": 0.04,
+      "vocal_transition": 0.03,
+      "harmonic": 0.04,
+      "tempo": 0.03,
+      "history_fit": 0.03,
+      "rhythmic_continuity": 0.02
+    }
+  },
+  "weight_adaptation": {
+    "mode": "auto",
+    "adaptation_strength": 0.7
   }
 }

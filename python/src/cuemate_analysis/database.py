@@ -114,7 +114,51 @@ class Database:
               f.source_file_hash,
               f.bpm,
               f.key,
+              f.energy_abs,
+              f.energy_hybrid,
+              f.energy_learned,
+              f.energy_learned_bucket,
+              f.energy_model_signature,
+              f.energy_model_source,
+              f.energy_model_inferred_at,
               f.analyzed_at
+            FROM playlists p
+            JOIN playlist_tracks pt ON pt.playlist_id = p.id
+            JOIN tracks t ON t.id = pt.track_id
+            LEFT JOIN track_features_abs f ON f.track_id = t.id
+            WHERE p.name = ?
+            ORDER BY pt.position ASC
+            """,
+            (playlist_name,),
+        ).fetchall()
+
+    def get_playlist_relative_inputs(self, playlist_name: str) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            """
+            SELECT
+              p.id AS playlist_id,
+              p.name AS playlist_name,
+              pt.position,
+              t.id AS track_id,
+              t.file_path,
+              t.title,
+              t.artist,
+              f.track_id IS NOT NULL AS has_absolute_analysis,
+              f.bpm,
+              f.key,
+              f.energy_abs,
+              f.energy_hybrid,
+              f.energy_learned,
+              f.energy_learned_bucket,
+              f.bass_abs,
+              f.drums_abs,
+              f.harmonic_abs,
+              f.groove_abs,
+              f.vocals_abs,
+              f.vocals_confidence,
+              f.analyzed_at,
+              f.analysis_signature,
+              f.config_signature
             FROM playlists p
             JOIN playlist_tracks pt ON pt.playlist_id = p.id
             JOIN tracks t ON t.id = pt.track_id
@@ -222,7 +266,9 @@ class Database:
                   track_id, user_id, source_file_hash, bpm, bpm_confidence, bpm_source,
                   time_signature, time_signature_confidence, key, key_number, key_letter,
                   key_confidence, key_source, key_imported, key_tagged, key_agreement,
-                  energy_abs, energy_sustained, energy_peak, loudness_lufs, loudness_norm,
+                  energy_abs, energy_sustained, energy_peak, energy_hybrid, energy_learned,
+                  energy_learned_bucket, energy_model_signature, energy_model_source,
+                  energy_model_inferred_at, loudness_lufs, loudness_norm,
                   bass_abs, drums_abs, harmonic_abs, groove_abs, vocals_abs,
                   vocals_confidence, analysis_mode, analyzed_at, analysis_signature,
                   config_signature, scoring_contract_id_at_analysis
@@ -230,7 +276,9 @@ class Database:
                   :track_id, :user_id, :source_file_hash, :bpm, :bpm_confidence, :bpm_source,
                   :time_signature, :time_signature_confidence, :key, :key_number, :key_letter,
                   :key_confidence, :key_source, :key_imported, :key_tagged, :key_agreement,
-                  :energy_abs, :energy_sustained, :energy_peak, :loudness_lufs, :loudness_norm,
+                  :energy_abs, :energy_sustained, :energy_peak, :energy_hybrid, :energy_learned,
+                  :energy_learned_bucket, :energy_model_signature, :energy_model_source,
+                  :energy_model_inferred_at, :loudness_lufs, :loudness_norm,
                   :bass_abs, :drums_abs, :harmonic_abs, :groove_abs, :vocals_abs,
                   :vocals_confidence, :analysis_mode, :analyzed_at, :analysis_signature,
                   :config_signature, :scoring_contract_id_at_analysis
@@ -253,6 +301,12 @@ class Database:
                   energy_abs = excluded.energy_abs,
                   energy_sustained = excluded.energy_sustained,
                   energy_peak = excluded.energy_peak,
+                  energy_hybrid = excluded.energy_hybrid,
+                  energy_learned = excluded.energy_learned,
+                  energy_learned_bucket = excluded.energy_learned_bucket,
+                  energy_model_signature = excluded.energy_model_signature,
+                  energy_model_source = excluded.energy_model_source,
+                  energy_model_inferred_at = excluded.energy_model_inferred_at,
                   loudness_lufs = excluded.loudness_lufs,
                   loudness_norm = excluded.loudness_norm,
                   bass_abs = excluded.bass_abs,
@@ -303,6 +357,12 @@ class Database:
               f.energy_abs,
               f.energy_sustained,
               f.energy_peak,
+              f.energy_hybrid,
+              f.energy_learned,
+              f.energy_learned_bucket,
+              f.energy_model_signature,
+              f.energy_model_source,
+              f.energy_model_inferred_at,
               f.loudness_lufs,
               f.loudness_norm,
               f.bass_abs,

@@ -9,6 +9,7 @@ import numpy as np
 import pyloudnorm as pyln
 
 from cuemate_analysis.config import RuntimeSettings
+from cuemate_analysis.energy_model import build_energy_feature_vector, predict_energy_from_features, resolve_energy_model_meta_path, resolve_energy_model_path
 from cuemate_analysis.models import AnalysisResult, ImportedTrack
 
 
@@ -69,6 +70,12 @@ def clamp(value: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
 
 def normalize_loudness(lufs: float) -> float:
     return clamp((lufs + 24.0) / 18.0)
+
+
+def log_normalize(value: float, scale: float) -> float:
+    if scale <= 0.0:
+        return clamp(value)
+    return clamp(math.log1p(max(value, 0.0) * scale) / math.log1p(scale))
 
 
 def parse_key_label(raw_value: str | None) -> dict[str, str | int] | None:
@@ -475,12 +482,25 @@ def extract_energy(y: np.ndarray, sr: int) -> dict[str, float]:
     sustained = float(np.percentile(rms, 75))
     peak = float(np.percentile(rms, 95))
     centroid = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
-    brightness = float(np.mean(centroid)) / max(sr / 2.0, 1.0)
-    raw_energy = (sustained * 2.5 * 0.4) + (peak * 2.0 * 0.3) + (brightness * 0.3)
+    brightness = clamp(float(np.mean(centroid)) / max(sr / 2.0, 1.0))
+    onset_env = librosa.onset.onset_strength(y=y, sr=sr)
+    onset_peak = float(np.percentile(onset_env, 85)) if onset_env.size else 0.0
+
+    # Use log compression so modern mastered tracks still separate meaningfully
+    # instead of saturating at 1.0 across an entire crate.
+    sustained_norm = log_normalize(sustained, scale=30.0)
+    peak_norm = log_normalize(peak, scale=24.0)
+    onset_norm = log_normalize(onset_peak, scale=8.0)
+    raw_energy = (
+        (0.42 * sustained_norm)
+        + (0.18 * peak_norm)
+        + (0.22 * brightness)
+        + (0.18 * onset_norm)
+    )
     return {
         "energy_abs": clamp(raw_energy),
-        "energy_sustained": clamp(sustained * 2.5),
-        "energy_peak": clamp(peak * 2.0),
+        "energy_sustained": sustained_norm,
+        "energy_peak": peak_norm,
     }
 
 
@@ -620,6 +640,43 @@ def analyze_track(
             "groove_abs": None,
         }
 
+    energy_features = build_energy_feature_vector(
+        energy_abs=float(energy["energy_abs"]),
+        energy_sustained=energy["energy_sustained"],
+        energy_peak=energy["energy_peak"],
+        loudness_norm=float(loudness["loudness_norm"]),
+        loudness_lufs=float(loudness["loudness_lufs"]),
+        bass_abs=bass_abs,
+        drums_abs=full_features["drums_abs"],
+        harmonic_abs=full_features["harmonic_abs"],
+        groove_abs=full_features["groove_abs"],
+    )
+    energy_hybrid: float | None = None
+    energy_learned: float | None = None
+    energy_learned_bucket: str | None = None
+    energy_model_signature: str | None = None
+    energy_model_source: str | None = None
+    energy_model_inferred_at: str | None = None
+    if analysis_mode == "full" and settings.analysis.energy_parallel_enabled:
+        model_path = resolve_energy_model_path(settings.analysis.energy_model_path, settings.repo_root)
+        meta_path = resolve_energy_model_meta_path(settings.analysis.energy_model_meta_path, settings.repo_root)
+        if model_path.is_file() and meta_path.is_file():
+            try:
+                energy_inference = predict_energy_from_features(
+                    energy_features,
+                    model_path=model_path,
+                    meta_path=meta_path,
+                )
+            except Exception:
+                energy_inference = None
+            if energy_inference is not None:
+                energy_hybrid = float(energy_inference.hybrid)
+                energy_learned = float(energy_inference.learned)
+                energy_learned_bucket = str(energy_inference.bucket)
+                energy_model_signature = str(energy_inference.model_signature)
+                energy_model_source = str(energy_inference.model_source)
+                energy_model_inferred_at = utc_now()
+
     return AnalysisResult(
         track_id=track.id,
         source_file_hash=track.file_hash,
@@ -639,6 +696,12 @@ def analyze_track(
         energy_abs=float(energy["energy_abs"]),
         energy_sustained=energy["energy_sustained"],
         energy_peak=energy["energy_peak"],
+        energy_hybrid=energy_hybrid,
+        energy_learned=energy_learned,
+        energy_learned_bucket=energy_learned_bucket,
+        energy_model_signature=energy_model_signature,
+        energy_model_source=energy_model_source,
+        energy_model_inferred_at=energy_model_inferred_at,
         loudness_lufs=loudness["loudness_lufs"],
         loudness_norm=loudness["loudness_norm"],
         bass_abs=bass_abs,

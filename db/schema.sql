@@ -50,6 +50,12 @@ CREATE TABLE track_features_abs (
   energy_abs REAL NOT NULL,
   energy_sustained REAL,
   energy_peak REAL,
+  energy_hybrid REAL,
+  energy_learned REAL,
+  energy_learned_bucket TEXT,
+  energy_model_signature TEXT,
+  energy_model_source TEXT,
+  energy_model_inferred_at TEXT,
   loudness_lufs REAL NOT NULL,
   loudness_norm REAL NOT NULL,
   bass_abs REAL NOT NULL,
@@ -97,4 +103,5 @@ INSERT INTO "schema_migrations" (version) VALUES
   ('20260403112734'),
   ('20260403154500'),
   ('20260404143000'),
-  ('20260404173000');
+  ('20260404173000'),
+  ('20260404193000');

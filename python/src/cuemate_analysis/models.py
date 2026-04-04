@@ -57,6 +57,12 @@ class AnalysisResult:
     energy_abs: float
     energy_sustained: float | None
     energy_peak: float | None
+    energy_hybrid: float | None
+    energy_learned: float | None
+    energy_learned_bucket: str | None
+    energy_model_signature: str | None
+    energy_model_source: str | None
+    energy_model_inferred_at: str | None
     loudness_lufs: float
     loudness_norm: float
     bass_abs: float

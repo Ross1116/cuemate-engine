@@ -161,6 +161,29 @@ python -m cuemate_analysis analyze-bpm-key-playlist --playlist "Fred again"
 python -m cuemate_analysis analyze-bpm-key-playlist --playlist "Fred again" --limit 5 --output .\data\benchmarks\fred-again-bpm-key.csv
 ```
 
+Compute the experimental Phase 1 relative-context preview from persisted absolute features:
+
+```powershell
+python -m cuemate_analysis analyze-relative-playlist --playlist "Fred again"
+python -m cuemate_analysis analyze-relative-playlist --playlist "Fred again" --limit 12 --json
+python -m cuemate_analysis analyze-relative-playlist --playlist "Fred again" --output .\data\benchmarks\fred-again-relative.csv
+```
+
+Experiment with multiple absolute-energy candidates on a real playlist without changing persisted analysis rows:
+
+```powershell
+python -m cuemate_analysis analyze-energy-playlist --playlist "Fred again" --limit 12
+python -m cuemate_analysis analyze-energy-playlist --playlist "Fred again" --output .\data\benchmarks\fred-again-energy.csv
+```
+
+Export a labeled energy dataset, train the teacher-first learned scorer, and benchmark it:
+
+```powershell
+python -m cuemate_analysis export-energy-dataset --playlist "Fred again" --output .\data\benchmarks\fred-again-energy-dataset.csv
+python -m cuemate_analysis train-energy-model --dataset .\data\benchmarks\fred-again-energy-dataset.csv --model-out .\python\models\energy\teacher_first_v1.joblib --meta-out .\python\models\energy\teacher_first_v1.meta.json
+python -m cuemate_analysis benchmark-energy-model --dataset .\data\benchmarks\fred-again-energy-dataset.csv
+```
+
 Purge persisted TempoCNN and MusicalKeyCNN caches, and clear the warm service state so the next run is fully fresh:
 
 ```powershell
@@ -177,6 +200,10 @@ Speed notes:
 - Serato crate import currently contributes playlist membership and local file paths only; it does not provide BPM/key metadata yet
 - `analyze-bpm` and `analyze-bpm-playlist` are the intended BPM-only commands
 - `analyze-bpm-key` and `analyze-bpm-key-playlist` are the intended fast paths when you only want BPM + key
+- `analyze-relative-playlist` is a read-only experimental Milestone 2 Phase 1 preview; it computes relative context from `track_features_abs` and does not persist new tables yet
+- `analyze-energy-playlist` is a read-only experimental workbench for comparing absolute-energy formulas on real playlists before promoting one into the production analyzer
+- `export-energy-dataset`, `train-energy-model`, and `benchmark-energy-model` are the teacher-first offline workflow for learned energy scoring
+- full playlist analysis now keeps heuristic `energy_abs` as the production default and, when a trained model artifact exists, persists parallel learned-energy fields beside it
 - TempoCNN and MusicalKeyCNN both use warm Docker workers so repeated analysis avoids model cold starts
 - both warm workers now cache results for unchanged files, so rerunning the same BPM/key playlist pass is dramatically faster
 - those persistent caches live in `data/inference-cache.db` and can be purged on demand with `purge-model-cache`

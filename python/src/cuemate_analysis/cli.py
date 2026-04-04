@@ -745,7 +745,7 @@ def handle_analyze_bpm_playlist(args: argparse.Namespace) -> int:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         rows_for_csv: list[dict[str, object]] = []
         for item in payload_rows:
-            estimate = TempoEstimate(**item["estimate"])
+            estimate = TempoEstimate.from_payload(item["estimate"])
             rows_for_csv.append(
                 {
                     "position": item["position"],

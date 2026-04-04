@@ -114,10 +114,15 @@ def normalize_musicalkeycnn_policy_choice(value: str | None) -> str:
 
 def windows_path_to_container_path(path: Path | PurePath) -> str:
     resolved = path.resolve() if isinstance(path, Path) else path
+    posix_path = resolved.as_posix()
     drive = resolved.drive.rstrip(":").lower()
     if not drive:
-        raise ValueError(f"Expected a Windows drive path, got: {resolved}")
-    posix_path = resolved.as_posix()
+        if resolved.is_absolute():
+            return f"/host{posix_path}"
+        raise ValueError(
+            f"Expected a Windows drive path or POSIX absolute path, got: {resolved}. "
+            "Use a platform-specific path converter for relative paths."
+        )
     tail = posix_path[2:] if len(posix_path) >= 2 and posix_path[1] == ":" else posix_path
     return f"/host/{drive}{tail}"
 

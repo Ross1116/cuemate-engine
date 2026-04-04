@@ -53,6 +53,24 @@ class TempoEstimate:
     def to_payload(self) -> dict[str, Any]:
         return asdict(self)
 
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "TempoEstimate":
+        details = payload.get("details")
+        notes = payload.get("notes")
+        return cls(
+            backend=str(payload.get("backend") or TEMPO_BACKEND_TEMPOCNN),
+            bpm=(float(payload["bpm"]) if payload.get("bpm") is not None else None),
+            confidence=(
+                float(payload["confidence"]) if payload.get("confidence") is not None else None
+            ),
+            elapsed_ms=(
+                float(payload["elapsed_ms"]) if payload.get("elapsed_ms") is not None else None
+            ),
+            details=dict(details) if isinstance(details, dict) else {},
+            notes=[str(item) for item in notes] if isinstance(notes, list) else [],
+            available=bool(payload.get("available", True)),
+        )
+
 
 def normalize_tempo_backend(backend: str) -> str:
     clean = backend.strip().lower()

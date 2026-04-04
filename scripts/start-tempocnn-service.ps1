@@ -115,6 +115,7 @@ try {
 
     $deadline = (Get-Date).AddSeconds(20)
     $healthUrl = "http://127.0.0.1:$servicePort/health"
+    $lastHealthError = $null
     while ((Get-Date) -lt $deadline) {
         try {
             $response = Invoke-RestMethod -Uri $healthUrl -Method Get -TimeoutSec 3
@@ -123,6 +124,8 @@ try {
                 exit 0
             }
         } catch {
+            $lastHealthError = $_
+            Write-Verbose "TempoCNN health probe failed: $_"
         }
         Start-Sleep -Milliseconds 500
     }
@@ -135,7 +138,12 @@ try {
             Write-Warning "Failed to clean up timed-out TempoCNN container ${containerId}: $_"
         }
     }
-    Write-Error "TempoCNN service did not become healthy on $healthUrl within 20 seconds."
+    if ($lastHealthError) {
+        Write-Error "TempoCNN service did not become healthy on $healthUrl within 20 seconds. Last health error: $lastHealthError"
+    }
+    else {
+        Write-Error "TempoCNN service did not become healthy on $healthUrl within 20 seconds."
+    }
     exit 1
 }
 finally {

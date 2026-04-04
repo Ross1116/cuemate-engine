@@ -121,7 +121,13 @@ class PersistentInferenceCache:
                 ],
             )
 
-    def purge(self, *, backend: str | None = None, file_paths: Iterable[str] | None = None) -> int:
+    def purge(
+        self,
+        *,
+        backend: str | None = None,
+        file_paths: Iterable[str] | None = None,
+        purge_all: bool = False,
+    ) -> int:
         clauses: list[str] = []
         parameters: list[Any] = []
         if backend:
@@ -133,6 +139,9 @@ class PersistentInferenceCache:
             placeholders = ", ".join("?" for _ in resolved_paths)
             clauses.append(f"file_path IN ({placeholders})")
             parameters.extend(resolved_paths)
+
+        if not clauses and not purge_all:
+            raise ValueError("Refusing to purge the entire inference cache without purge_all=True.")
 
         sql = "DELETE FROM model_inference_cache"
         if clauses:

@@ -103,7 +103,7 @@ def test_serato_playlist_import_extracts_track_paths(tmp_path: Path) -> None:
     crates_dir = tmp_path / "serato"
     crates_dir.mkdir()
     crate_path = crates_dir / "My Crate.crate"
-    crate_path.write_bytes(b"header\x00" + str(track_path.resolve()).encode("utf-8") + b"\x00footer")
+    crate_path.write_bytes(b"header\x00" + track_path.resolve().as_posix().encode("utf-8") + b"\x00footer")
 
     playlists = list_dj_playlists("serato", crates_dir)
     imported_tracks = load_dj_playlist("serato", crates_dir, "My Crate")

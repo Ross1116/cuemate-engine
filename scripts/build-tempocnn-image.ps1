@@ -6,7 +6,7 @@ $imageTag = if ($env:CUEMATE_TEMPOCNN_IMAGE) { $env:CUEMATE_TEMPOCNN_IMAGE } els
 Push-Location $repoRoot
 try {
     & docker build --tag $imageTag --file docker/tempocnn/Dockerfile docker/tempocnn
-    return $LASTEXITCODE
+    exit $LASTEXITCODE
 }
 finally {
     Pop-Location

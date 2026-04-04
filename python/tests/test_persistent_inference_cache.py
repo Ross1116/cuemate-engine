@@ -42,6 +42,6 @@ def test_persistent_inference_cache_round_trip_and_purge(tmp_path: Path) -> None
         assert deleted_scoped == 1
         assert cache.fetch_payloads("tempocnn", ["tempo-key"]) == {}
 
-        deleted_remaining = cache.purge()
+        deleted_remaining = cache.purge(purge_all=True)
         assert deleted_remaining == 1
         assert cache.fetch_payloads("musicalkeycnn", ["key-key"]) == {}

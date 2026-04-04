@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 from typing import Iterable
 
@@ -21,6 +22,10 @@ SUPPORTED_AUDIO_EXTENSIONS = {
 }
 
 
+def _normalized_path_identity(path: Path) -> str:
+    return os.path.normcase(str(path.resolve()))
+
+
 def discover_audio_files(paths: Iterable[str | Path]) -> list[Path]:
     discovered: dict[str, Path] = {}
     for raw_path in paths:
@@ -37,13 +42,13 @@ def discover_audio_files(paths: Iterable[str | Path]) -> list[Path]:
             if candidate.suffix.lower() not in SUPPORTED_AUDIO_EXTENSIONS:
                 continue
             resolved = candidate.resolve()
-            discovered[str(resolved).lower()] = resolved
+            discovered[_normalized_path_identity(resolved)] = resolved
 
     return sorted(discovered.values(), key=lambda candidate: str(candidate).lower())
 
 
 def make_track_id(path: Path) -> str:
-    normalized = str(path.resolve()).lower().encode("utf-8")
+    normalized = _normalized_path_identity(path).encode("utf-8")
     return f"trk_{hashlib.sha1(normalized).hexdigest()[:16]}"
 
 
@@ -124,7 +129,7 @@ def read_track_metadata_with_overrides(
 ) -> ImportedTrack:
     resolved = path.resolve()
     audio_easy = MutagenFile(resolved, easy=True)
-    audio_full = audio_easy if audio_easy is not None else MutagenFile(resolved)
+    audio_full = MutagenFile(resolved)
 
     duration_seconds: float | None = None
     if audio_full is not None and getattr(audio_full, "info", None) is not None:
@@ -132,15 +137,14 @@ def read_track_metadata_with_overrides(
         if duration is not None:
             duration_seconds = float(duration)
 
-    tags = getattr(audio_easy, "tags", None) if audio_easy is not None else None
-    if tags is None and audio_full is not None:
-        tags = getattr(audio_full, "tags", None)
+    easy_tags = getattr(audio_easy, "tags", None) if audio_easy is not None else None
+    full_tags = getattr(audio_full, "tags", None) if audio_full is not None else None
 
-    title = title_override or _first_tag(tags, ["title"]) or resolved.stem
-    artist = artist_override or _first_tag(tags, ["artist", "albumartist"])
-    genre = genre_override or _first_tag(tags, ["genre"])
-    bpm_tag = _parse_float(_first_tag(tags, ["bpm", "tbpm"]))
-    key_tag = _first_tag(tags, ["initialkey", "key", "tkey"])
+    title = title_override or _first_tag(easy_tags, ["title"]) or _first_tag(full_tags, ["title"]) or resolved.stem
+    artist = artist_override or _first_tag(easy_tags, ["artist", "albumartist"]) or _first_tag(full_tags, ["artist", "albumartist"])
+    genre = genre_override or _first_tag(easy_tags, ["genre"]) or _first_tag(full_tags, ["genre"])
+    bpm_tag = _parse_float(_first_tag(easy_tags, ["bpm", "tbpm"]) or _first_tag(full_tags, ["bpm", "tbpm"]))
+    key_tag = _first_tag(easy_tags, ["initialkey", "key", "tkey"]) or _first_tag(full_tags, ["initialkey", "key", "tkey"])
 
     return ImportedTrack(
         id=make_track_id(resolved),

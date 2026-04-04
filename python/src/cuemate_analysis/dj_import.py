@@ -3,13 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import re
-from typing import Iterable
+from typing import Iterable, TypeVar
 from urllib.parse import unquote, urlparse
 import xml.etree.ElementTree as ET
 
 
 SUPPORTED_DJ_LIBRARY_SOURCES = {"rekordbox", "traktor", "serato"}
 SUPPORTED_AUDIO_EXTENSIONS = {".aac", ".aif", ".aiff", ".flac", ".m4a", ".mp3", ".ogg", ".wav"}
+T = TypeVar("T")
 
 
 @dataclass(frozen=True)
@@ -44,7 +45,7 @@ def _normalize_playlist_name(value: str) -> str:
     return value.strip().casefold()
 
 
-def _resolve_playlist_choice(available: dict[str, object], requested: str) -> object:
+def _resolve_playlist_choice(available: dict[str, T], requested: str) -> T:
     normalized = _normalize_playlist_name(requested)
     exact = {name: value for name, value in available.items() if _normalize_playlist_name(name) == normalized}
     if exact:
@@ -278,7 +279,7 @@ def load_traktor_playlist(library_path: Path, playlist_name: str) -> list[DJPlay
 
 
 SERATO_CRATE_PATH_RE = re.compile(
-    r"([A-Za-z]:[\\/][^\x00\r\n]+?\.(?:aac|aif|aiff|flac|m4a|mp3|ogg|wav))",
+    r"((?:[A-Za-z]:[\\/]|/)[^\x00\r\n]+?\.(?:aac|aif|aiff|flac|m4a|mp3|ogg|wav))",
     re.IGNORECASE,
 )
 

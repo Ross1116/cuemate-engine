@@ -1,5 +1,5 @@
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from cuemate_analysis.tempo_backend import (
     DEFAULT_TEMPOCNN_MODEL,
@@ -117,7 +117,7 @@ def test_build_tempocnn_batch_docker_command_mounts_multiple_track_directories(t
 
 
 def test_windows_path_to_container_path_maps_drive_root() -> None:
-    path = Path("D:/Personal Projects/Music/example.wav")
+    path = PureWindowsPath("D:/Personal Projects/Music/example.wav")
 
     assert windows_path_to_container_path(path) == "/host/d/Personal Projects/Music/example.wav"
 

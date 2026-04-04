@@ -43,7 +43,7 @@ Push-Location $repoRoot
 try {
     & docker @command | Out-Null
     if ($LASTEXITCODE -ne 0) {
-        return $LASTEXITCODE
+        exit $LASTEXITCODE
     }
 
     $deadline = (Get-Date).AddSeconds(20)
@@ -53,7 +53,7 @@ try {
             $response = Invoke-RestMethod -Uri $healthUrl -Method Get -TimeoutSec 3
             if ($response.status -eq "ok") {
                 Write-Output "TempoCNN service is healthy on $healthUrl"
-                return 0
+                exit 0
             }
         } catch {
         }
@@ -61,7 +61,7 @@ try {
     }
 
     Write-Error "TempoCNN service did not become healthy on $healthUrl within 20 seconds."
-    return 1
+    exit 1
 }
 finally {
     Pop-Location

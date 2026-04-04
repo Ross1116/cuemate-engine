@@ -31,6 +31,7 @@ CueMate Engine is a monorepo with a hard split between the Python analysis plane
 For a clean Windows bootstrap from a fresh clone, follow:
 
 - [Bootstrap on Windows](d:/Personal%20Projects/CueMate/cuemate-engine/docs/bootstrap-windows.md)
+- [Bootstrap on Windows](./docs/bootstrap-windows.md)
 
 ## Environment setup
 
@@ -40,7 +41,7 @@ Before running migrations or services, copy `.env.example` to `.env` and adjust 
 Copy-Item .env.example .env
 ```
 
-This is required because [compose.yaml](d:/Personal%20Projects/CueMate/cuemate-engine/compose.yaml) uses `env_file: - .env`. Make sure `.env` exists before running commands like:
+This is required because [compose.yaml](./compose.yaml) uses `env_file: - .env`. Make sure `.env` exists before running commands like:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\docker-compose.ps1 --profile ops run --rm migrate

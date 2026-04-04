@@ -75,7 +75,10 @@ def analyze_tracks(model, track_paths: list[str]) -> list[dict[str, object]]:
     worker_count = max(1, min(TEMPOCNN_AUDIO_WORKERS, len(track_paths)))
 
     def load_one(track_path: str):
-        return track_path, load_tempo_audio(track_path)
+        try:
+            return track_path, load_tempo_audio(track_path), None
+        except Exception as exc:
+            return track_path, None, str(exc)
 
     if worker_count == 1:
         loaded = [load_one(track_path) for track_path in track_paths]
@@ -84,7 +87,10 @@ def analyze_tracks(model, track_paths: list[str]) -> list[dict[str, object]]:
             loaded = list(executor.map(load_one, track_paths))
 
     results: list[dict[str, object]] = []
-    for track_path, tempo_audio in loaded:
+    for track_path, tempo_audio, load_error in loaded:
+        if load_error is not None or tempo_audio is None:
+            results.append({"track_path": str(track_path), "error": load_error or "audio_load_failed"})
+            continue
         try:
             results.append(analyze_audio(model, track_path, tempo_audio))
         except Exception as exc:
@@ -169,9 +175,14 @@ class TempoCNNHandler(BaseHTTPRequestHandler):
 
         resolved_track_paths = [str(track_path) for track_path in track_paths]
         cached_results: dict[str, dict[str, object]] = {}
+        immediate_results: dict[str, dict[str, object]] = {}
         missing_track_paths: list[str] = []
         for track_path in resolved_track_paths:
-            cache_key = build_cache_key(model_path, track_path)
+            try:
+                cache_key = build_cache_key(model_path, track_path)
+            except Exception as exc:
+                immediate_results[track_path] = {"track_path": track_path, "error": str(exc)}
+                continue
             cached = RESULT_CACHE.get(cache_key)
             if cached is None:
                 missing_track_paths.append(track_path)
@@ -187,7 +198,12 @@ class TempoCNNHandler(BaseHTTPRequestHandler):
                     RESULT_CACHE[build_cache_key(model_path, track_path)] = dict(item)
 
         results = [
-            dict(cached_results.get(track_path) or computed_results.get(track_path) or {"track_path": track_path, "error": "missing_result"})
+            dict(
+                immediate_results.get(track_path)
+                or cached_results.get(track_path)
+                or computed_results.get(track_path)
+                or {"track_path": track_path, "error": "missing_result"}
+            )
             for track_path in resolved_track_paths
         ]
 

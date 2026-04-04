@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from http import HTTPStatus
@@ -93,7 +94,7 @@ class MusicalKeyHandler(BaseHTTPRequestHandler):
             cached_results: dict[str, dict[str, object]] = {}
             missing_track_paths: list[str] = []
             for track_path in resolved_track_paths:
-                cache_key = build_cache_key(model_path, normalized_policy, track_path)
+                cache_key = build_cache_key(model_path, normalized_policy, str(runner_device), track_path)
                 cached = RESULT_CACHE.get(cache_key)
                 if cached is None:
                     missing_track_paths.append(track_path)
@@ -106,7 +107,9 @@ class MusicalKeyHandler(BaseHTTPRequestHandler):
                     track_path = str(item.get("track_path") or "")
                     computed_results[track_path] = item
                     if "error" not in item and track_path:
-                        RESULT_CACHE[build_cache_key(model_path, normalized_policy, track_path)] = dict(item)
+                        RESULT_CACHE[
+                            build_cache_key(model_path, normalized_policy, str(runner_device), track_path)
+                        ] = dict(item)
 
             results = [
                 dict(cached_results.get(track_path) or computed_results.get(track_path) or {"track_path": track_path, "error": "missing_result"})
@@ -131,14 +134,27 @@ class MusicalKeyHandler(BaseHTTPRequestHandler):
         )
 
 
-RESULT_CACHE: dict[tuple[str, str, str, int, int], dict[str, object]] = {}
+RESULT_CACHE: dict[tuple[str, str, str, str, int, int], dict[str, object]] = {}
 
 
-def build_cache_key(model_path: str, policy: str, track_path: str) -> tuple[str, str, str, int, int]:
+def build_model_artifact_identity(model_path: str) -> str:
+    stat_result = Path(model_path).stat()
+    payload = f"{Path(model_path).resolve().as_posix()}:{int(stat_result.st_mtime_ns)}:{int(stat_result.st_size)}"
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
+
+
+def build_cache_key(
+    model_path: str,
+    policy: str,
+    runner_device: str,
+    track_path: str,
+) -> tuple[str, str, str, str, int, int]:
     stat_result = Path(track_path).stat()
     return (
         model_path,
+        build_model_artifact_identity(model_path),
         policy,
+        runner_device,
         str(Path(track_path).resolve()),
         int(stat_result.st_mtime_ns),
         int(stat_result.st_size),
@@ -155,7 +171,7 @@ def main() -> int:
             warm_pipeline(model, runner_device)
         except Exception:
             pass
-    server = ThreadingHTTPServer(("0.0.0.0", port), MusicalKeyHandler)
+    server = ThreadingHTTPServer(("127.0.0.1", port), MusicalKeyHandler)
     server.serve_forever()
     return 0
 

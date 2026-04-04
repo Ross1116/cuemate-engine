@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePath
 import subprocess
 import time
 from typing import Any
@@ -109,8 +109,8 @@ def normalize_musicalkeycnn_policy_choice(value: str | None) -> str:
     return choice
 
 
-def windows_path_to_container_path(path: Path) -> str:
-    resolved = path.resolve()
+def windows_path_to_container_path(path: Path | PurePath) -> str:
+    resolved = path.resolve() if isinstance(path, Path) else path
     drive = resolved.drive.rstrip(":").lower()
     if not drive:
         raise ValueError(f"Expected a Windows drive path, got: {resolved}")
@@ -133,6 +133,11 @@ def container_path_for_model(model_path: Path) -> tuple[list[str], str]:
         mount = docker_volume_spec(model_path.parent, "/model", read_only=True)
         return (["--volume", mount], f"/model/{model_path.name}")
     return ([], f"/workspace/{relative.as_posix()}")
+
+
+def build_musicalkeycnn_model_identity(model_path: Path) -> str:
+    stat_result = model_path.stat()
+    return f"{model_path.resolve().as_posix()}:{int(stat_result.st_mtime_ns)}:{int(stat_result.st_size)}"
 
 
 def build_musicalkeycnn_service_run_command(
@@ -171,9 +176,9 @@ def build_musicalkeycnn_service_run_command(
         "--volume",
         f"{os.fspath(REPO_ROOT.resolve())}:/workspace:ro",
     ]
-    if resolved_device in {"auto", "cuda"}:
+    if resolved_device == "cuda":
         command.extend(["--gpus", "all"])
-    else:
+    elif resolved_device == "cpu":
         command.extend(["--env", "CUDA_VISIBLE_DEVICES=-1"])
     for drive in sorted({letter.lower() for letter in drive_letters}):
         source = f"{drive.upper()}:\\"
@@ -228,6 +233,7 @@ def service_container_matches(
     drive_letters: list[str],
     image_name: str,
     requires_external_model_mount: bool,
+    expected_model_source: str | None = None,
 ) -> bool:
     if not details.get("State", {}).get("Running"):
         return False
@@ -239,6 +245,11 @@ def service_container_matches(
     required_targets = {"/workspace", *{f"/host/{drive.lower()}" for drive in drive_letters}}
     if requires_external_model_mount:
         required_targets.add("/model")
+        model_mount = next((item for item in mounts if str(item.get("Destination") or "") == "/model"), None)
+        if model_mount is None:
+            return False
+        if expected_model_source and str(model_mount.get("Source") or "") != expected_model_source:
+            return False
     return required_targets.issubset(targets)
 
 
@@ -269,12 +280,14 @@ def ensure_musicalkeycnn_service(
     drive_letters: list[str],
 ) -> tuple[bool, list[str]]:
     extra_model_mounts, _ = container_path_for_model(model_path)
+    expected_model_source = os.fspath(model_path.parent.resolve()) if extra_model_mounts else None
     details = inspect_docker_container(service_name)
     if details is not None and service_container_matches(
         details,
         drive_letters=drive_letters,
         image_name=image_name,
         requires_external_model_mount=bool(extra_model_mounts),
+        expected_model_source=expected_model_source,
     ):
         healthy, health_error = wait_for_musicalkeycnn_service_health(service_port)
         if healthy:
@@ -406,12 +419,16 @@ def build_musicalkeycnn_cache_descriptor(
     policy: str,
 ) -> dict[str, object]:
     stat_result = track_path.stat()
+    model_stat = model_path.stat()
     descriptor_payload = {
         "version": MUSICALKEYCNN_PERSISTED_CACHE_VERSION,
         "track_path": track_path.resolve().as_posix(),
         "file_mtime_ns": int(stat_result.st_mtime_ns),
         "file_size": int(stat_result.st_size),
         "model_path": model_path.resolve().as_posix(),
+        "model_identity": build_musicalkeycnn_model_identity(model_path),
+        "model_mtime_ns": int(model_stat.st_mtime_ns),
+        "model_size": int(model_stat.st_size),
         "device": device,
         "policy": policy,
     }
@@ -421,7 +438,10 @@ def build_musicalkeycnn_cache_descriptor(
         "file_path": descriptor_payload["track_path"],
         "file_mtime_ns": descriptor_payload["file_mtime_ns"],
         "file_size": descriptor_payload["file_size"],
-        "model_signature": f"{MUSICALKEYCNN_PERSISTED_CACHE_VERSION}:{model_path.name}:{device}:{policy}",
+        "model_signature": (
+            f"{MUSICALKEYCNN_PERSISTED_CACHE_VERSION}:{model_path.name}:"
+            f"{descriptor_payload['model_mtime_ns']}:{descriptor_payload['model_size']}:{device}:{policy}"
+        ),
     }
 
 
@@ -505,7 +525,11 @@ def purge_musicalkeycnn_cache(file_paths: list[str] | None = None) -> int:
     deleted = 0
     try:
         with PersistentInferenceCache(resolve_inference_cache_path()) as cache:
-            deleted = cache.purge(backend=KEY_BACKEND_MUSICALKEYCNN, file_paths=file_paths)
+            deleted = cache.purge(
+                backend=KEY_BACKEND_MUSICALKEYCNN,
+                file_paths=file_paths,
+                purge_all=file_paths is None,
+            )
     except Exception:
         deleted = 0
     remove_docker_container(resolve_musicalkeycnn_service_name(None))
@@ -547,8 +571,11 @@ def estimate_musicalkeycnn_keys(
             "Download or copy keynet.pt into python/models/musicalkeycnn/keynet.pt.",
         ]
         return {
-            path: build_musicalkeycnn_unavailable_estimate(elapsed_ms=None, notes=notes)
-            for path in pending_paths
+            **cached_estimates,
+            **{
+                path: build_musicalkeycnn_unavailable_estimate(elapsed_ms=None, notes=notes)
+                for path in pending_paths
+            },
         }
 
     started = time.perf_counter()

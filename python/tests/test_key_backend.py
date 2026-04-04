@@ -1,4 +1,4 @@
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from cuemate_analysis.key_backend import (
     DEFAULT_MUSICALKEYCNN_MODEL,
@@ -47,7 +47,7 @@ def test_resolve_musicalkeycnn_service_defaults(monkeypatch) -> None:
 
 
 def test_windows_path_to_container_path_maps_drive_root() -> None:
-    path = Path("D:/Personal Projects/Music/example.wav")
+    path = PureWindowsPath("D:/Personal Projects/Music/example.wav")
 
     assert windows_path_to_container_path(path) == "/host/d/Personal Projects/Music/example.wav"
 
@@ -64,7 +64,7 @@ def test_build_musicalkeycnn_service_run_command_includes_drive_mounts() -> None
 
     command_text = " ".join(command)
     assert "cuemate-musicalkeycnn:test" in command
-    assert "--gpus" in command
+    assert "--gpus" not in command
     assert "127.0.0.1:49001:49001" in command_text
     assert "target=/host/d" in command_text
     assert "target=/host/e" in command_text

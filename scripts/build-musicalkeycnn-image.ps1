@@ -6,7 +6,7 @@ $imageTag = if ($env:CUEMATE_MUSICALKEYCNN_IMAGE) { $env:CUEMATE_MUSICALKEYCNN_I
 Push-Location $repoRoot
 try {
     & docker build --tag $imageTag --file docker/musicalkeycnn/Dockerfile docker/musicalkeycnn
-    return $LASTEXITCODE
+    exit $LASTEXITCODE
 }
 finally {
     Pop-Location

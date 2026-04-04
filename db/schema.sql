@@ -30,15 +30,6 @@ CREATE TABLE playlists (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
-CREATE TABLE playlist_tracks (
-  playlist_id TEXT NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
-  track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
-  position INTEGER NOT NULL,
-  added_at TEXT NOT NULL,
-  PRIMARY KEY (playlist_id, track_id)
-);
-CREATE INDEX idx_playlist_tracks_playlist_position
-  ON playlist_tracks(playlist_id, position);
 CREATE TABLE track_features_abs (
   track_id TEXT PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE,
   user_id TEXT NOT NULL DEFAULT 'local',
@@ -93,8 +84,17 @@ CREATE TABLE analysis_jobs (
 );
 CREATE INDEX idx_analysis_jobs_status_priority
   ON analysis_jobs(status, priority DESC, created_at ASC);
+CREATE TABLE IF NOT EXISTS "playlist_tracks" (
+  playlist_id TEXT NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+  track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+  position INTEGER NOT NULL,
+  added_at TEXT NOT NULL,
+  PRIMARY KEY (playlist_id, track_id),
+  UNIQUE (playlist_id, position)
+);
 -- Dbmate schema migrations
 INSERT INTO "schema_migrations" (version) VALUES
   ('20260403112734'),
   ('20260403154500'),
-  ('20260404143000');
+  ('20260404143000'),
+  ('20260404173000');

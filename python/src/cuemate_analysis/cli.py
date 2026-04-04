@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import csv
+import hashlib
 import json
 from pathlib import Path
 import sqlite3
@@ -37,6 +38,16 @@ from cuemate_analysis.tempo_backend import (
 TEMPOCNN_PROGRESS_BATCH_SIZE = 8
 
 
+def hash_file_identity(path: Path) -> str:
+    if not path.is_file():
+        return f"missing-{path.name}"
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()[:12]
+
+
 def build_effective_analysis_signature(
     base_signature: str,
     *,
@@ -46,12 +57,12 @@ def build_effective_analysis_signature(
     musicalkeycnn_device: str = "auto",
     musicalkeycnn_policy: str = MUSICALKEYCNN_POLICY_FULL_TRACK,
 ) -> str:
-    tempo_model_name = resolve_tempocnn_model_path(tempocnn_model).stem
-    key_model_name = resolve_musicalkeycnn_model_path(musicalkeycnn_model).stem
+    tempo_model_hash = hash_file_identity(resolve_tempocnn_model_path(tempocnn_model))
+    key_model_hash = hash_file_identity(resolve_musicalkeycnn_model_path(musicalkeycnn_model))
     return (
         f"{base_signature}"
-        f"-tempo-tempocnn-{tempo_model_name}-{tempocnn_accelerator}"
-        f"-key-musicalkeycnn-{key_model_name}-{musicalkeycnn_device}-{musicalkeycnn_policy}"
+        f"-tempo-tempocnn-{tempo_model_hash}-{tempocnn_accelerator}"
+        f"-key-musicalkeycnn-{key_model_hash}-{musicalkeycnn_device}-{musicalkeycnn_policy}"
     )
 
 
@@ -448,23 +459,27 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
         if not rows:
             raise SystemExit(f"Playlist '{playlist_name}' was not found. Import it first.")
 
-        prepared_tracks = [
-            {
-                "row": row,
-                "track": track_from_playlist_row(row),
-            }
-            for row in rows
-        ]
         total = len(rows)
         processed = 0
-        for chunk in chunk_items(prepared_tracks):
+        for chunk in chunk_items(rows):
+            prepared_tracks = []
+            for row in chunk:
+                index = int(row["position"])
+                try:
+                    track = track_from_playlist_row(row)
+                except Exception as exc:
+                    print(f"[{index}/{total}] failed {row['track_id']}: {exc}", file=sys.stderr)
+                    continue
+                prepared_tracks.append({"row": row, "track": track})
+
             pending_paths = [
                 item["track"].file_path
-                for item in chunk
+                for item in prepared_tracks
                 if args.force
                 or item["row"]["source_file_hash"] != item["track"].file_hash
                 or item["row"]["analysis_signature"] != effective_analysis_signature
                 or item["row"]["analysis_mode"] != args.analysis_mode
+                or item["row"]["config_signature"] != settings.config_signature
             ]
             prefetched_tempocnn_estimates: dict[Path, TempoEstimate] = {}
             prefetched_musicalkeycnn_estimates: dict[Path, KeyEstimate] = {}
@@ -474,31 +489,33 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
                     settings,
                 )
 
-            for item in chunk:
+            for item in prepared_tracks:
                 index = int(item["row"]["position"])
                 row = item["row"]
                 track = item["track"]
-                created_at = utc_now()
-                job_id = database.create_analysis_job(
-                    playlist_id=row["playlist_id"],
-                    track_id=row["track_id"],
-                    track_path=row["file_path"],
-                    analysis_mode=args.analysis_mode,
-                    analysis_signature=effective_analysis_signature,
-                    config_signature=settings.config_signature,
-                    source_file_hash=row["file_hash"],
-                    priority=total - index,
-                    created_at=created_at,
-                )
                 start_time = time.perf_counter()
-                database.mark_analysis_job_started(job_id, created_at)
+                job_id: int | None = None
                 try:
+                    created_at = utc_now()
+                    job_id = database.create_analysis_job(
+                        playlist_id=row["playlist_id"],
+                        track_id=row["track_id"],
+                        track_path=row["file_path"],
+                        analysis_mode=args.analysis_mode,
+                        analysis_signature=effective_analysis_signature,
+                        config_signature=settings.config_signature,
+                        source_file_hash=track.file_hash,
+                        priority=total - index,
+                        created_at=created_at,
+                    )
+                    database.mark_analysis_job_started(job_id, created_at)
                     database.upsert_track(track, utc_now())
                     if (
                         not args.force
                         and row["source_file_hash"] == track.file_hash
                         and row["analysis_signature"] == effective_analysis_signature
                         and row["analysis_mode"] == args.analysis_mode
+                        and row["config_signature"] == settings.config_signature
                     ):
                         duration_seconds = round(time.perf_counter() - start_time, 3)
                         database.mark_analysis_job_completed(
@@ -562,7 +579,8 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
                     )
                 except Exception as exc:
                     duration_seconds = round(time.perf_counter() - start_time, 3)
-                    database.mark_analysis_job_failed(job_id, str(exc), duration_seconds, utc_now())
+                    if job_id is not None:
+                        database.mark_analysis_job_failed(job_id, str(exc), duration_seconds, utc_now())
                     print(f"[{index}/{total}] failed {track.id}: {exc}", file=sys.stderr)
 
     print(f"Completed playlist analysis for '{playlist_name}'. Updated {processed} track(s).")

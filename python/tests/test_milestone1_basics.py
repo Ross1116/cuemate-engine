@@ -42,16 +42,23 @@ def test_resolve_bpm_uses_backend_name_in_source() -> None:
     assert resolved["bpm_source"] == "tag+tempocnn"
 
 
-def test_effective_analysis_signature_includes_production_models() -> None:
+def test_effective_analysis_signature_includes_production_models(tmp_path: Path) -> None:
+    tempo_model = tmp_path / "deepsquare-k16-3.pb"
+    key_model = tmp_path / "keynet.pt"
+    tempo_model.write_bytes(b"tempo")
+    key_model.write_bytes(b"key")
+
     signature = build_effective_analysis_signature(
         "m1-stable",
-        tempocnn_model="D:/models/deepsquare-k16-3.pb",
+        tempocnn_model=str(tempo_model),
         tempocnn_accelerator="auto",
-        musicalkeycnn_model="D:/models/keynet.pt",
+        musicalkeycnn_model=str(key_model),
         musicalkeycnn_device="auto",
     )
 
-    assert signature == "m1-stable-tempo-tempocnn-deepsquare-k16-3-auto-key-musicalkeycnn-keynet-auto-full_track"
+    assert signature.startswith("m1-stable-tempo-tempocnn-")
+    assert "-auto-key-musicalkeycnn-" in signature
+    assert signature.endswith("-auto-full_track")
 
 
 def test_resolve_bpm_with_backend_falls_back_to_baseline_when_tempocnn_is_unavailable(

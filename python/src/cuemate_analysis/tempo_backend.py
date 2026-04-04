@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePath
 import subprocess
 import time
 from typing import Any
@@ -131,8 +131,8 @@ def summarize_stderr(stderr: str, *, max_lines: int = 8) -> str:
     return "\n".join(trimmed)
 
 
-def windows_path_to_container_path(path: Path) -> str:
-    resolved = path.resolve()
+def windows_path_to_container_path(path: Path | PurePath) -> str:
+    resolved = path.resolve() if isinstance(path, Path) else path
     drive = resolved.drive.rstrip(":").lower()
     if not drive:
         raise ValueError(f"Expected a Windows drive path, got: {resolved}")
@@ -521,12 +521,15 @@ def build_tempocnn_cache_descriptor(
     accelerator: str,
 ) -> dict[str, object]:
     stat_result = track_path.stat()
+    model_stat = model_path.stat()
     descriptor_payload = {
         "version": TEMPOCNN_PERSISTED_CACHE_VERSION,
         "track_path": track_path.resolve().as_posix(),
         "file_mtime_ns": int(stat_result.st_mtime_ns),
         "file_size": int(stat_result.st_size),
         "model_path": model_path.resolve().as_posix(),
+        "model_mtime_ns": int(model_stat.st_mtime_ns),
+        "model_size": int(model_stat.st_size),
         "accelerator": accelerator,
     }
     cache_key = hashlib.sha1(json.dumps(descriptor_payload, sort_keys=True).encode("utf-8")).hexdigest()
@@ -535,7 +538,10 @@ def build_tempocnn_cache_descriptor(
         "file_path": descriptor_payload["track_path"],
         "file_mtime_ns": descriptor_payload["file_mtime_ns"],
         "file_size": descriptor_payload["file_size"],
-        "model_signature": f"{TEMPOCNN_PERSISTED_CACHE_VERSION}:{model_path.name}:{accelerator}",
+        "model_signature": (
+            f"{TEMPOCNN_PERSISTED_CACHE_VERSION}:{model_path.name}:"
+            f"{descriptor_payload['model_mtime_ns']}:{descriptor_payload['model_size']}:{accelerator}"
+        ),
     }
 
 
@@ -613,7 +619,11 @@ def purge_tempocnn_cache(file_paths: list[str] | None = None) -> int:
     deleted = 0
     try:
         with PersistentInferenceCache(resolve_inference_cache_path()) as cache:
-            deleted = cache.purge(backend=TEMPO_BACKEND_TEMPOCNN, file_paths=file_paths)
+            deleted = cache.purge(
+                backend=TEMPO_BACKEND_TEMPOCNN,
+                file_paths=file_paths,
+                purge_all=file_paths is None,
+            )
     except Exception:
         deleted = 0
     remove_docker_container(resolve_tempocnn_service_name(None))
@@ -763,26 +773,28 @@ def estimate_tempocnn_bpms(
             fallback_note = "Docker GPU runtime was unavailable, so TempoCNN retried in CPU mode."
     except Exception as exc:
         elapsed_ms = round((time.perf_counter() - started) * 1000.0, 1)
-        return {
+        new_estimates = {
             path: build_tempocnn_unavailable_estimate(
                 elapsed_ms=elapsed_ms,
                 notes=[f"TempoCNN Docker invocation failed: {exc}"],
             )
             for path in pending_paths
         }
+        return {**cached_estimates, **new_estimates}
 
     elapsed_ms = round((time.perf_counter() - started) * 1000.0, 1)
     payload, notes = parse_docker_json_payload(completed)
     if payload is None:
         if fallback_note:
             notes.insert(0, fallback_note)
-        return {
+        new_estimates = {
             path: build_tempocnn_unavailable_estimate(
                 elapsed_ms=elapsed_ms,
                 notes=notes,
             )
             for path in pending_paths
         }
+        return {**cached_estimates, **new_estimates}
 
     tf_physical_gpu_count = payload.get("tf_physical_gpu_count")
     tf_logical_gpu_count = payload.get("tf_logical_gpu_count")

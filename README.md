@@ -110,6 +110,22 @@ Import a local playlist or crate:
 python -m cuemate_analysis import-playlist --name "My Playlist" .\path\to\audio
 ```
 
+List playlists available from an exported DJ library:
+
+```powershell
+python -m cuemate_analysis list-dj-playlists --source rekordbox --library "D:\Exports\rekordbox.xml"
+python -m cuemate_analysis list-dj-playlists --source traktor --library "D:\Exports\collection.nml"
+python -m cuemate_analysis list-dj-playlists --source serato --library "D:\Music\_Serato_\Subcrates"
+```
+
+Import one playlist from Rekordbox, Traktor, or Serato:
+
+```powershell
+python -m cuemate_analysis import-dj-playlist --source rekordbox --library "D:\Exports\rekordbox.xml" --playlist "Main Room"
+python -m cuemate_analysis import-dj-playlist --source traktor --library "D:\Exports\collection.nml" --playlist "Warmup" --name "Warmup"
+python -m cuemate_analysis import-dj-playlist --source serato --library "D:\Music\_Serato_\Subcrates" --playlist "Club Set"
+```
+
 Analyze imported tracks with absolute features only:
 
 ```powershell
@@ -157,6 +173,8 @@ Speed notes:
 
 - TempoCNN is now used for BPM only
 - MusicalKeyCNN is the primary key backend for playlist analysis
+- exported Rekordbox/Traktor BPM and key metadata are now imported into the local track catalog and used during analysis resolution
+- Serato crate import currently contributes playlist membership and local file paths only; it does not provide BPM/key metadata yet
 - `analyze-bpm` and `analyze-bpm-playlist` are the intended BPM-only commands
 - `analyze-bpm-key` and `analyze-bpm-key-playlist` are the intended fast paths when you only want BPM + key
 - TempoCNN and MusicalKeyCNN both use warm Docker workers so repeated analysis avoids model cold starts

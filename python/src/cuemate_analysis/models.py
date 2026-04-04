@@ -14,7 +14,9 @@ class ImportedTrack:
     artist: str | None
     genre: str | None
     duration_seconds: float | None
+    bpm_imported: float | None
     bpm_tag: float | None
+    key_imported: str | None
     key_tag: str | None
     import_source: str = "local_files"
 
@@ -27,6 +29,8 @@ class ImportedTrack:
             "artist": self.artist,
             "genre": self.genre,
             "duration_seconds": self.duration_seconds,
+            "imported_bpm": self.bpm_imported,
+            "imported_key": self.key_imported,
             "import_source": self.import_source,
             "imported_at": timestamp,
             "updated_at": timestamp,

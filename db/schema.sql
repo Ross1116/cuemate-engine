@@ -17,7 +17,9 @@ CREATE TABLE tracks (
   duration_seconds REAL,
   import_source TEXT,
   imported_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  imported_bpm REAL,
+  imported_key TEXT
 );
 CREATE INDEX idx_tracks_file_hash ON tracks(file_hash);
 CREATE TABLE playlists (
@@ -94,4 +96,5 @@ CREATE INDEX idx_analysis_jobs_status_priority
 -- Dbmate schema migrations
 INSERT INTO "schema_migrations" (version) VALUES
   ('20260403112734'),
-  ('20260403154500');
+  ('20260403154500'),
+  ('20260404143000');

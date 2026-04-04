@@ -12,7 +12,13 @@ import time
 from cuemate_analysis.analysis import analyze_track, utc_now
 from cuemate_analysis.config import load_runtime_settings
 from cuemate_analysis.database import Database
-from cuemate_analysis.ingest import discover_audio_files, make_playlist_id, read_track_metadata
+from cuemate_analysis.dj_import import list_dj_playlists, load_dj_playlist
+from cuemate_analysis.ingest import (
+    discover_audio_files,
+    make_playlist_id,
+    read_track_metadata,
+    read_track_metadata_with_overrides,
+)
 from cuemate_analysis.key_backend import (
     KeyEstimate,
     MUSICALKEYCNN_POLICY_FULL_TRACK,
@@ -140,6 +146,18 @@ def chunk_items(items: list[object], chunk_size: int = TEMPOCNN_PROGRESS_BATCH_S
     return [items[index:index + chunk_size] for index in range(0, len(items), chunk_size)]
 
 
+def track_from_playlist_row(row) -> object:
+    return read_track_metadata_with_overrides(
+        Path(row["file_path"]),
+        bpm_imported=row["imported_bpm"],
+        key_imported=row["imported_key"],
+        title_override=row["title"],
+        artist_override=row["artist"],
+        genre_override=row["genre"],
+        import_source=row["import_source"] or "local_files",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cuemate-analysis",
@@ -156,6 +174,47 @@ def build_parser() -> argparse.ArgumentParser:
         "paths",
         nargs="+",
         help="One or more audio files or directories to import.",
+    )
+
+    list_dj_playlists_parser = subparsers.add_parser(
+        "list-dj-playlists",
+        help="List playlists available from a Rekordbox, Traktor, or Serato library export.",
+    )
+    list_dj_playlists_parser.add_argument(
+        "--source",
+        required=True,
+        choices=["rekordbox", "traktor", "serato"],
+        help="DJ library source type.",
+    )
+    list_dj_playlists_parser.add_argument(
+        "--library",
+        required=True,
+        help="Path to the exported Rekordbox XML, Traktor NML, or Serato crate folder/file.",
+    )
+
+    import_dj_playlist_parser = subparsers.add_parser(
+        "import-dj-playlist",
+        help="Import one playlist from a Rekordbox, Traktor, or Serato library export.",
+    )
+    import_dj_playlist_parser.add_argument(
+        "--source",
+        required=True,
+        choices=["rekordbox", "traktor", "serato"],
+        help="DJ library source type.",
+    )
+    import_dj_playlist_parser.add_argument(
+        "--library",
+        required=True,
+        help="Path to the exported Rekordbox XML, Traktor NML, or Serato crate folder/file.",
+    )
+    import_dj_playlist_parser.add_argument(
+        "--playlist",
+        required=True,
+        help="Playlist/crate name inside the source library export.",
+    )
+    import_dj_playlist_parser.add_argument(
+        "--name",
+        help="Optional local CueMate playlist name. Defaults to the source playlist name.",
     )
 
     analyze_parser = subparsers.add_parser(
@@ -296,6 +355,83 @@ def handle_import_playlist(args: argparse.Namespace) -> int:
     return 0
 
 
+def handle_list_dj_playlists(args: argparse.Namespace) -> int:
+    library_path = Path(args.library).expanduser().resolve()
+    if not library_path.exists():
+        raise FileNotFoundError(f"DJ library path was not found: {library_path}")
+
+    playlist_names = list_dj_playlists(args.source, library_path)
+    if not playlist_names:
+        print(f"No playlists were found in {library_path}")
+        return 0
+
+    print(f"Found {len(playlist_names)} playlist(s) in {library_path}")
+    for name in playlist_names:
+        print(f"- {name}")
+    return 0
+
+
+def handle_import_dj_playlist(args: argparse.Namespace) -> int:
+    settings = load_runtime_settings()
+    library_path = Path(args.library).expanduser().resolve()
+    if not library_path.exists():
+        raise FileNotFoundError(f"DJ library path was not found: {library_path}")
+
+    source_playlist_name = args.playlist
+    local_playlist_name = args.name or source_playlist_name
+    playlist_id = make_playlist_id(local_playlist_name)
+    timestamp = utc_now()
+    imported_entries = load_dj_playlist(args.source, library_path, source_playlist_name)
+    if not imported_entries:
+        raise SystemExit(
+            f"Playlist '{source_playlist_name}' from {args.source} did not yield any usable track entries."
+        )
+
+    tracks = []
+    skipped: list[str] = []
+    for entry in imported_entries:
+        if not entry.file_path.is_file():
+            skipped.append(f"{entry.file_path} (file not found)")
+            continue
+        try:
+            tracks.append(
+                read_track_metadata_with_overrides(
+                    entry.file_path,
+                    bpm_imported=entry.bpm_imported,
+                    key_imported=entry.key_imported,
+                    title_override=entry.title,
+                    artist_override=entry.artist,
+                    genre_override=entry.genre,
+                    import_source=entry.import_source,
+                )
+            )
+        except Exception as exc:
+            skipped.append(f"{entry.file_path} ({exc})")
+
+    if not tracks:
+        raise SystemExit(
+            f"Playlist '{source_playlist_name}' from {args.source} did not contain any importable local audio files."
+        )
+
+    with Database(settings.database_path) as database:
+        database.upsert_playlist(playlist_id, local_playlist_name, len(tracks), timestamp)
+        for track in tracks:
+            database.upsert_track(track, timestamp)
+        database.replace_playlist_tracks(playlist_id, [track.id for track in tracks], timestamp)
+
+    print(
+        f"Imported DJ playlist '{source_playlist_name}' from {args.source} as "
+        f"'{local_playlist_name}' ({playlist_id}) with {len(tracks)} track(s)."
+    )
+    if skipped:
+        print(f"Skipped {len(skipped)} track(s) that could not be resolved locally.")
+        for detail in skipped[:10]:
+            print(f"- {detail}")
+        if len(skipped) > 10:
+            print(f"- ... and {len(skipped) - 10} more")
+    return 0
+
+
 def handle_analyze_playlist(args: argparse.Namespace) -> int:
     settings = load_runtime_settings()
     playlist_name = args.playlist
@@ -315,7 +451,7 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
         prepared_tracks = [
             {
                 "row": row,
-                "track": read_track_metadata(Path(row["file_path"])),
+                "track": track_from_playlist_row(row),
             }
             for row in rows
         ]
@@ -722,6 +858,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "import-playlist":
             return handle_import_playlist(args)
+        if args.command == "list-dj-playlists":
+            return handle_list_dj_playlists(args)
+        if args.command == "import-dj-playlist":
+            return handle_import_dj_playlist(args)
         if args.command == "analyze-playlist":
             return handle_analyze_playlist(args)
         if args.command == "list-playlist":

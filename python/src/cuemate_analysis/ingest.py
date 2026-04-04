@@ -109,6 +109,19 @@ def _parse_float(value: str | None) -> float | None:
 
 
 def read_track_metadata(path: Path) -> ImportedTrack:
+    return read_track_metadata_with_overrides(path)
+
+
+def read_track_metadata_with_overrides(
+    path: Path,
+    *,
+    bpm_imported: float | None = None,
+    key_imported: str | None = None,
+    title_override: str | None = None,
+    artist_override: str | None = None,
+    genre_override: str | None = None,
+    import_source: str = "local_files",
+) -> ImportedTrack:
     resolved = path.resolve()
     audio_easy = MutagenFile(resolved, easy=True)
     audio_full = audio_easy if audio_easy is not None else MutagenFile(resolved)
@@ -123,9 +136,9 @@ def read_track_metadata(path: Path) -> ImportedTrack:
     if tags is None and audio_full is not None:
         tags = getattr(audio_full, "tags", None)
 
-    title = _first_tag(tags, ["title"]) or resolved.stem
-    artist = _first_tag(tags, ["artist", "albumartist"])
-    genre = _first_tag(tags, ["genre"])
+    title = title_override or _first_tag(tags, ["title"]) or resolved.stem
+    artist = artist_override or _first_tag(tags, ["artist", "albumartist"])
+    genre = genre_override or _first_tag(tags, ["genre"])
     bpm_tag = _parse_float(_first_tag(tags, ["bpm", "tbpm"]))
     key_tag = _first_tag(tags, ["initialkey", "key", "tkey"])
 
@@ -137,6 +150,9 @@ def read_track_metadata(path: Path) -> ImportedTrack:
         artist=artist,
         genre=genre,
         duration_seconds=duration_seconds,
+        bpm_imported=bpm_imported,
         bpm_tag=bpm_tag,
+        key_imported=key_imported,
         key_tag=key_tag,
+        import_source=import_source,
     )

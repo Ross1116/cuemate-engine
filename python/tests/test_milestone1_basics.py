@@ -36,7 +36,7 @@ def test_discover_audio_files_filters_supported_extensions(tmp_path: Path) -> No
 
 
 def test_resolve_bpm_uses_backend_name_in_source() -> None:
-    resolved = resolve_bpm(124.0, {"bpm": 124.1, "bpm_confidence": 0.88}, detected_source="tempocnn")
+    resolved = resolve_bpm(None, 124.0, {"bpm": 124.1, "bpm_confidence": 0.88}, detected_source="tempocnn")
 
     assert resolved["bpm"] == 124.0
     assert resolved["bpm_source"] == "tag+tempocnn"
@@ -68,7 +68,9 @@ def test_resolve_bpm_with_backend_falls_back_to_baseline_when_tempocnn_is_unavai
         artist="Artist",
         genre=None,
         duration_seconds=10.0,
+        bpm_imported=None,
         bpm_tag=None,
+        key_imported=None,
         key_tag=None,
     )
 
@@ -114,7 +116,9 @@ def test_resolve_key_with_backend_falls_back_to_tag_when_musicalkeycnn_is_unavai
         artist="Artist",
         genre=None,
         duration_seconds=10.0,
+        bpm_imported=None,
         bpm_tag=None,
+        key_imported=None,
         key_tag="8A",
     )
 
@@ -153,7 +157,9 @@ def test_resolve_key_prefers_high_confidence_musicalkeycnn_over_conflicting_tag(
             artist="Artist",
             genre=None,
             duration_seconds=10.0,
+            bpm_imported=None,
             bpm_tag=None,
+            key_imported=None,
             key_tag="2A",
         ),
         np.zeros(22050, dtype=float),
@@ -176,3 +182,10 @@ def test_resolve_key_prefers_high_confidence_musicalkeycnn_over_conflicting_tag(
     assert resolved["key_source"] == "musicalkeycnn_override_tag"
     assert resolved["key_tagged"] == "2A"
     assert resolved["key_agreement"] == 0
+
+
+def test_resolve_bpm_prefers_imported_bpm_when_present() -> None:
+    resolved = resolve_bpm(128.0, 124.0, {"bpm": 128.1, "bpm_confidence": 0.90}, detected_source="tempocnn")
+
+    assert resolved["bpm"] == 128.0
+    assert resolved["bpm_source"] == "imported+tempocnn"

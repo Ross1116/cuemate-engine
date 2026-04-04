@@ -15,6 +15,8 @@ from cuemate_analysis.models import AnalysisResult, ImportedTrack
 PITCH_CLASSES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 MAJOR_PROFILE = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
 MINOR_PROFILE = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
+FILE_TAG_BPM_CONFIDENCE = 0.90
+FILE_TAG_KEY_CONFIDENCE = 0.85
 
 CAMELOT_BY_PITCH_MODE = {
     ("A", "minor"): ("8A", 8, "A"),
@@ -119,19 +121,49 @@ def parse_key_label(raw_value: str | None) -> dict[str, str | int] | None:
     return {"key": key, "key_number": key_number, "key_letter": key_letter}
 
 
+def bayesian_key_confidence(
+    conf_a: float,
+    conf_b: float,
+    *,
+    provenance_independent: bool = False,
+) -> float:
+    conf_a = clamp(conf_a)
+    conf_b = clamp(conf_b)
+    if provenance_independent:
+        p_both_right = conf_a * conf_b
+        p_both_wrong_and_agree = (1.0 - conf_a) * (1.0 - conf_b) * (1.0 / 24.0)
+        combined = p_both_right / max(p_both_right + p_both_wrong_and_agree, 1e-9)
+        return clamp(combined, maximum=0.98)
+    stronger = max(conf_a, conf_b)
+    weaker = min(conf_a, conf_b)
+    correlation_lift = 0.15 * weaker
+    return clamp(stronger + correlation_lift, maximum=0.95)
+
+
 def detect_bpm(y: np.ndarray, sr: int) -> dict[str, float]:
     onset_env = librosa.onset.onset_strength(y=y, sr=sr)
-    tempo_value, beats = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr)
+    tempo_value, beat_frames = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr)
     tempo = float(np.atleast_1d(tempo_value)[0])
-    duration_seconds = max(len(y) / float(sr), 1e-6)
-    observed_bpm = (len(beats) / duration_seconds) * 60.0 if len(beats) else 0.0
-    stability = 1.0 - min(abs(tempo - observed_bpm) / max(tempo, 1.0), 1.0)
-    onset_strength = float(np.mean(onset_env)) if onset_env.size else 0.0
-    confidence = clamp(0.45 + (0.35 * stability) + (0.20 * clamp(onset_strength / 2.0)))
-    return {"bpm": max(tempo, 0.0), "bpm_confidence": confidence}
+    beat_times = librosa.frames_to_time(beat_frames, sr=sr)
+
+    if len(beat_times) >= 2:
+        ibis = np.diff(beat_times)
+        ibi_mean = float(np.mean(ibis)) if ibis.size else 0.0
+        ibi_std = float(np.std(ibis)) if ibis.size else 0.0
+        bpm_confidence = clamp(1.0 - ((ibi_std / max(ibi_mean, 1e-6)) * 5.0))
+    else:
+        bpm_confidence = 0.3
+
+    tempogram = librosa.feature.tempogram(onset_envelope=onset_env, sr=sr)
+    peak_sharpness = float(np.max(tempogram) / (np.mean(tempogram) + 1e-10)) if tempogram.size else 0.0
+    tempogram_confidence = clamp(peak_sharpness / 20.0)
+    combined_confidence = clamp((0.5 * bpm_confidence) + (0.5 * tempogram_confidence))
+
+    return {"bpm": max(tempo, 0.0), "bpm_confidence": combined_confidence}
 
 
 def resolve_bpm(
+    imported_bpm: float | None,
     tagged_bpm: float | None,
     detected: dict[str, float],
     *,
@@ -140,9 +172,22 @@ def resolve_bpm(
     detected_bpm = float(detected.get("bpm", 0.0))
     detected_confidence = float(detected.get("bpm_confidence", 0.0))
 
+    if imported_bpm and imported_bpm > 0:
+        source = "imported"
+        confidence = 0.95
+        if detected_bpm > 0:
+            ratios = [1.0, 2.0, 0.5]
+            best_ratio = min(ratios, key=lambda ratio: abs(imported_bpm - (detected_bpm * ratio)))
+            matched = detected_bpm * best_ratio
+            tolerance = 1.0 if math.isclose(best_ratio, 1.0) else 2.0
+            if abs(imported_bpm - matched) <= tolerance:
+                source = f"imported+{detected_source}"
+                confidence = 0.98
+        return {"bpm": float(imported_bpm), "bpm_confidence": confidence, "bpm_source": source}
+
     if tagged_bpm and tagged_bpm > 0:
         source = "tag"
-        confidence = 0.90
+        confidence = FILE_TAG_BPM_CONFIDENCE
         if detected_bpm > 0:
             ratios = [1.0, 2.0, 0.5]
             best_ratio = min(ratios, key=lambda ratio: abs(tagged_bpm - (detected_bpm * ratio)))
@@ -174,7 +219,7 @@ def resolve_bpm_with_backend(
     prefetched_tempocnn_estimate=None,
 ) -> dict[str, float | str]:
     if tempo_backend == "baseline":
-        return resolve_bpm(track.bpm_tag, detect_bpm(y, sr), detected_source="detected")
+        return resolve_bpm(track.bpm_imported, track.bpm_tag, detect_bpm(y, sr), detected_source="detected")
 
     from cuemate_analysis.tempo_backend import (
         TEMPO_BACKEND_TEMPOCNN,
@@ -193,6 +238,7 @@ def resolve_bpm_with_backend(
     )
     if estimate.available and estimate.bpm is not None:
         return resolve_bpm(
+            track.bpm_imported,
             track.bpm_tag,
             {"bpm": float(estimate.bpm), "bpm_confidence": float(estimate.confidence or 0.0)},
             detected_source="tempocnn",
@@ -200,6 +246,7 @@ def resolve_bpm_with_backend(
 
     baseline = detect_bpm(y, sr)
     return resolve_bpm(
+        track.bpm_imported,
         track.bpm_tag,
         baseline,
         detected_source="baseline_fallback",
@@ -240,8 +287,13 @@ def detect_key(y: np.ndarray, sr: int) -> dict[str, str | int | float]:
     }
 
 
-def resolve_key(tagged_key: str | None, detected: dict[str, str | int | float]) -> dict[str, str | int | float | None]:
+def resolve_key(
+    tagged_key: str | None,
+    imported_key: str | None,
+    detected: dict[str, str | int | float],
+) -> dict[str, str | int | float | None]:
     parsed_tag = parse_key_label(tagged_key)
+    parsed_imported = parse_key_label(imported_key)
     detected_source = str(detected.get("key_source", "chroma"))
     detected_confidence = float(detected.get("key_confidence", 0.0) or 0.0)
 
@@ -249,9 +301,13 @@ def resolve_key(tagged_key: str | None, detected: dict[str, str | int | float]) 
         if parsed_tag["key"] == detected["key"]:
             return {
                 **parsed_tag,
-                "key_confidence": 0.92,
+                "key_confidence": bayesian_key_confidence(
+                    detected_confidence,
+                    FILE_TAG_KEY_CONFIDENCE,
+                    provenance_independent=False,
+                ),
                 "key_source": f"tag+{detected_source}",
-                "key_imported": None,
+                "key_imported": imported_key,
                 "key_tagged": tagged_key,
                 "key_agreement": 1,
             }
@@ -264,18 +320,57 @@ def resolve_key(tagged_key: str | None, detected: dict[str, str | int | float]) 
                 "key": detected["key"],
                 "key_number": detected["key_number"],
                 "key_letter": detected["key_letter"],
-                "key_confidence": detected_confidence,
+                "key_confidence": clamp(min(detected_confidence, FILE_TAG_KEY_CONFIDENCE) * 0.6),
                 "key_source": "musicalkeycnn_override_tag",
-                "key_imported": None,
+                "key_imported": imported_key,
                 "key_tagged": tagged_key,
                 "key_agreement": 0,
             }
 
         return {
             **parsed_tag,
-            "key_confidence": 0.65,
+            "key_confidence": clamp(min(detected_confidence, FILE_TAG_KEY_CONFIDENCE) * 0.6),
             "key_source": "tag_conflicted",
-            "key_imported": None,
+            "key_imported": imported_key,
+            "key_tagged": tagged_key,
+            "key_agreement": 0,
+        }
+
+    if parsed_imported is not None:
+        if parsed_imported["key"] == detected["key"]:
+            return {
+                **parsed_imported,
+                "key_confidence": bayesian_key_confidence(
+                    detected_confidence,
+                    0.80,
+                    provenance_independent=False,
+                ),
+                "key_source": f"imported+{detected_source}",
+                "key_imported": imported_key,
+                "key_tagged": tagged_key,
+                "key_agreement": 1,
+            }
+
+        if (
+            detected_source == "musicalkeycnn"
+            and detected_confidence >= MUSICALKEYCNN_OVERRIDE_CONFIDENCE
+        ):
+            return {
+                "key": detected["key"],
+                "key_number": detected["key_number"],
+                "key_letter": detected["key_letter"],
+                "key_confidence": clamp(min(detected_confidence, 0.80) * 0.6),
+                "key_source": "musicalkeycnn_override_imported",
+                "key_imported": imported_key,
+                "key_tagged": tagged_key,
+                "key_agreement": 0,
+            }
+
+        return {
+            **parsed_imported,
+            "key_confidence": clamp(min(detected_confidence, 0.80) * 0.6),
+            "key_source": "imported_conflicted",
+            "key_imported": imported_key,
             "key_tagged": tagged_key,
             "key_agreement": 0,
         }
@@ -286,24 +381,36 @@ def resolve_key(tagged_key: str | None, detected: dict[str, str | int | float]) 
         "key_letter": detected["key_letter"],
         "key_confidence": detected["key_confidence"],
         "key_source": detected_source,
-        "key_imported": None,
+        "key_imported": imported_key,
         "key_tagged": tagged_key,
         "key_agreement": None,
     }
 
 
-def resolve_tag_only_key(tagged_key: str | None) -> dict[str, str | int | float | None]:
+def resolve_tag_only_key(tagged_key: str | None, imported_key: str | None) -> dict[str, str | int | float | None]:
     parsed_tag = parse_key_label(tagged_key)
-    if parsed_tag is None:
-        raise RuntimeError("MusicalKeyCNN was unavailable and no usable tagged key was found; chroma fallback is disabled.")
-    return {
-        **parsed_tag,
-        "key_confidence": 0.55,
-        "key_source": "tag_only_fallback",
-        "key_imported": None,
-        "key_tagged": tagged_key,
-        "key_agreement": None,
-    }
+    if parsed_tag is not None:
+        return {
+            **parsed_tag,
+            "key_confidence": FILE_TAG_KEY_CONFIDENCE,
+            "key_source": "tag_only_fallback",
+            "key_imported": imported_key,
+            "key_tagged": tagged_key,
+            "key_agreement": None,
+        }
+
+    parsed_imported = parse_key_label(imported_key)
+    if parsed_imported is not None:
+        return {
+            **parsed_imported,
+            "key_confidence": 0.80,
+            "key_source": "import_only_fallback",
+            "key_imported": imported_key,
+            "key_tagged": tagged_key,
+            "key_agreement": None,
+        }
+
+    raise RuntimeError("MusicalKeyCNN was unavailable and no usable tagged or imported key was found; chroma fallback is disabled.")
 
 
 def resolve_key_with_backend(
@@ -321,6 +428,7 @@ def resolve_key_with_backend(
     if key_backend == "chroma":
         return resolve_key(
             track.key_tag,
+            track.key_imported,
             {
                 **detect_key(y, sr),
                 "key_source": "chroma",
@@ -347,6 +455,7 @@ def resolve_key_with_backend(
     if estimate.available and estimate.key and estimate.key_number is not None and estimate.key_letter is not None:
         return resolve_key(
             track.key_tag,
+            track.key_imported,
             {
                 "key": estimate.key,
                 "key_number": estimate.key_number,
@@ -358,19 +467,52 @@ def resolve_key_with_backend(
             },
         )
 
-    return resolve_tag_only_key(track.key_tag)
+    return resolve_tag_only_key(track.key_tag, track.key_imported)
 
 
-def extract_energy(y: np.ndarray) -> dict[str, float]:
-    rms = librosa.feature.rms(y=y)[0]
-    q75 = float(np.percentile(rms, 75))
-    q95 = float(np.percentile(rms, 95))
-    energy_abs = clamp(((0.6 * q75) + (0.4 * q95)) / 0.28)
+def extract_energy(y: np.ndarray, sr: int) -> dict[str, float]:
+    rms = librosa.feature.rms(y=y, hop_length=512)[0]
+    sustained = float(np.percentile(rms, 75))
+    peak = float(np.percentile(rms, 95))
+    centroid = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
+    brightness = float(np.mean(centroid)) / max(sr / 2.0, 1.0)
+    raw_energy = (sustained * 2.5 * 0.4) + (peak * 2.0 * 0.3) + (brightness * 0.3)
     return {
-        "energy_abs": energy_abs,
-        "energy_sustained": clamp(q75 / 0.24),
-        "energy_peak": clamp(q95 / 0.35),
+        "energy_abs": clamp(raw_energy),
+        "energy_sustained": clamp(sustained * 2.5),
+        "energy_peak": clamp(peak * 2.0),
     }
+
+
+def detect_time_signature(y: np.ndarray, sr: int) -> dict[str, str | float]:
+    onset_env = librosa.onset.onset_strength(y=y, sr=sr)
+    _, beat_frames = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr)
+    if len(beat_frames) < 8:
+        return {"time_signature": "4/4", "time_signature_confidence": 0.35}
+
+    beat_strengths = onset_env[beat_frames]
+    if beat_strengths.size < 8 or float(np.mean(beat_strengths)) <= 1e-6:
+        return {"time_signature": "4/4", "time_signature_confidence": 0.4}
+
+    candidates = ["3/4", "4/4", "5/4"]
+    scores: dict[str, float] = {}
+    normalized_strengths = beat_strengths / max(float(np.mean(beat_strengths)), 1e-6)
+
+    for signature in candidates:
+        meter = int(signature.split("/")[0])
+        grouped = [normalized_strengths[index::meter] for index in range(meter)]
+        means = np.array([float(np.mean(group)) if group.size else 0.0 for group in grouped], dtype=float)
+        accent_contrast = float(np.max(means) - np.min(means))
+        downbeat_strength = float(np.max(means))
+        regularity = clamp(len(beat_frames) / float(meter * 8))
+        scores[signature] = (accent_contrast * 0.5) + (downbeat_strength * 0.25) + (regularity * 0.25)
+
+    best_signature = max(scores, key=scores.get)
+    ordered_scores = sorted(scores.values(), reverse=True)
+    best_score = ordered_scores[0]
+    second_score = ordered_scores[1] if len(ordered_scores) > 1 else 0.0
+    confidence = clamp(0.35 + ((best_score - second_score) * 0.45) + (0.20 if best_signature == "4/4" else 0.0))
+    return {"time_signature": best_signature, "time_signature_confidence": confidence}
 
 
 def extract_loudness(y: np.ndarray, sr: int) -> dict[str, float]:
@@ -464,9 +606,10 @@ def analyze_track(
         musicalkeycnn_policy=musicalkeycnn_policy or settings.analysis.key_policy,
         prefetched_musicalkeycnn_estimate=prefetched_musicalkeycnn_estimate,
     )
-    energy = extract_energy(y)
+    energy = extract_energy(y, sr)
     loudness = extract_loudness(y, sr)
     bass_abs = extract_bass_ratio(y, sr)
+    time_signature = detect_time_signature(y, sr)
 
     if analysis_mode == "full":
         full_features = extract_full_features(y, sr)
@@ -483,8 +626,8 @@ def analyze_track(
         bpm=float(bpm["bpm"]),
         bpm_confidence=float(bpm["bpm_confidence"]),
         bpm_source=str(bpm["bpm_source"]),
-        time_signature="4/4",
-        time_signature_confidence=0.6,
+        time_signature=str(time_signature["time_signature"]),
+        time_signature_confidence=float(time_signature["time_signature_confidence"]),
         key=str(key["key"]),
         key_number=int(key["key_number"]),
         key_letter=str(key["key_letter"]),

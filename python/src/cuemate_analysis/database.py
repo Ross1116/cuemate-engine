@@ -31,10 +31,10 @@ class Database:
                 """
                 INSERT INTO tracks (
                   id, user_id, file_path, file_hash, title, artist, genre,
-                  duration_seconds, import_source, imported_at, updated_at
+                  duration_seconds, imported_bpm, imported_key, import_source, imported_at, updated_at
                 ) VALUES (
                   :id, 'local', :file_path, :file_hash, :title, :artist, :genre,
-                  :duration_seconds, :import_source, :imported_at, :updated_at
+                  :duration_seconds, :imported_bpm, :imported_key, :import_source, :imported_at, :updated_at
                 )
                 ON CONFLICT(id) DO UPDATE SET
                   file_path = excluded.file_path,
@@ -43,6 +43,8 @@ class Database:
                   artist = excluded.artist,
                   genre = excluded.genre,
                   duration_seconds = excluded.duration_seconds,
+                  imported_bpm = excluded.imported_bpm,
+                  imported_key = excluded.imported_key,
                   import_source = excluded.import_source,
                   updated_at = excluded.updated_at
                 """,
@@ -103,6 +105,9 @@ class Database:
               t.artist,
               t.genre,
               t.duration_seconds,
+              t.imported_bpm,
+              t.imported_key,
+              t.import_source,
               f.analysis_mode,
               f.analysis_signature,
               f.config_signature,
@@ -276,6 +281,8 @@ class Database:
               t.artist,
               t.genre,
               t.duration_seconds,
+              t.imported_bpm,
+              t.imported_key,
               t.import_source,
               t.imported_at,
               t.updated_at,

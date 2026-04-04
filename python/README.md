@@ -18,6 +18,7 @@ python/
 The current implementation covers the first milestone from the decision engine plan:
 
 - import local files and directories as playlists/crates
+- import playlists from exported Rekordbox XML, Traktor NML, and Serato crate files
 - read embedded tags with `mutagen`
 - decode audio and extract absolute features on PC
 - persist imported tracks, playlists, analysis jobs, and `track_features_abs` into SQLite
@@ -66,6 +67,8 @@ Use the module form so the commands work even when the user-site Scripts directo
 
 ```powershell
 python -m cuemate_analysis import-playlist --name "My Playlist" .\path\to\audio
+python -m cuemate_analysis list-dj-playlists --source rekordbox --library "D:\Exports\rekordbox.xml"
+python -m cuemate_analysis import-dj-playlist --source rekordbox --library "D:\Exports\rekordbox.xml" --playlist "Main Room"
 python -m cuemate_analysis analyze-playlist --playlist "My Playlist" --analysis-mode full
 python -m cuemate_analysis analyze-playlist --playlist "My Playlist" --analysis-mode full --force
 python -m cuemate_analysis analyze-bpm "D:\path\to\track.wav"
@@ -81,6 +84,8 @@ Important notes:
 
 - `tempocnn` is now the primary BPM backend used by `analyze-playlist`
 - `musicalkeycnn` is now the primary key backend used by `analyze-playlist`
+- Rekordbox and Traktor imports can contribute BPM/key metadata that is stored on `tracks` and folded into the final analysis resolution
+- Serato crate imports currently provide playlist membership and file-path discovery only; BPM/key metadata is not available from the current parser
 - `analyze-bpm` and `analyze-bpm-playlist` are the intended BPM-only commands
 - `analyze-bpm-key` and `analyze-bpm-key-playlist` are the intended fast paths when you only want BPM + key
 - if TempoCNN is unavailable for a track, analysis falls back to the current librosa baseline automatically and records `baseline_fallback` as the source

@@ -266,12 +266,12 @@ def test_relative_preview_is_deterministic(tmp_path: Path) -> None:
     assert json.dumps(first, sort_keys=True) == json.dumps(second, sort_keys=True)
 
 
-def test_relative_preview_falls_back_to_heuristic_when_learned_energy_is_missing() -> None:
+def test_relative_preview_can_use_essentia_fused_with_heuristic_fallback() -> None:
     settings = load_runtime_settings()
     rows = [
         RelativeTrackInput(
             playlist_id="plt_test",
-            playlist_name="Fallback",
+            playlist_name="Essentia",
             track_id=f"trk_{index}",
             position=index,
             file_path=f"D:/Music/trk_{index}.wav",
@@ -280,9 +280,9 @@ def test_relative_preview_falls_back_to_heuristic_when_learned_energy_is_missing
             has_absolute_analysis=True,
             bpm=120.0 + index,
             key="8A",
-            energy_abs=0.30 + (index * 0.05),
-            energy_learned=None if index == 1 else 0.20 + (index * 0.06),
-            energy_learned_bucket=None,
+            energy_abs=0.20 + (index * 0.05),
+            energy_essentia_fused=None if index == 1 else 0.15 + (index * 0.07),
+            energy_essentia_bucket=None,
             bass_abs=0.20 + (index * 0.05),
             drums_abs=0.25 + (index * 0.05),
             harmonic_abs=0.30 + (index * 0.04),
@@ -298,12 +298,12 @@ def test_relative_preview_falls_back_to_heuristic_when_learned_energy_is_missing
     preview = compute_relative_playlist_preview(
         rows,
         settings,
-        playlist_name="Fallback",
+        playlist_name="Essentia",
         is_limited=False,
-        energy_source="learned",
+        energy_source="essentia_fused",
     )
     assert preview.tracks[0].energy_source_used == "heuristic"
-    assert any(track.energy_source_used == "learned" for track in preview.tracks[1:])
+    assert any(track.energy_source_used == "essentia_fused" for track in preview.tracks[1:])
 
 
 def test_cli_analyze_relative_playlist_json_and_csv(tmp_path: Path, monkeypatch, capsys) -> None:

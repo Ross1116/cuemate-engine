@@ -14,7 +14,7 @@ from cuemate_analysis.analysis import (
     extract_full_features,
     extract_loudness,
 )
-from cuemate_analysis.energy_model import EnergyFeatureVector, build_energy_feature_vector, energy_consensus
+from cuemate_analysis.energy_features import EnergyFeatureVector, build_energy_feature_vector, energy_consensus
 
 
 @dataclass(frozen=True)
@@ -23,8 +23,6 @@ class EnergyCandidateSet:
     loudness_fusion: float
     club_fusion: float
     pressure_fusion: float
-    hybrid_blended: float | None
-    learned: float | None
     consensus: float
     energy_sustained: float | None
     energy_peak: float | None
@@ -41,17 +39,12 @@ class EnergyCandidateSet:
 
 def build_energy_candidate_set_from_vector(
     features: EnergyFeatureVector,
-    *,
-    hybrid_blended: float | None = None,
-    learned: float | None = None,
 ) -> EnergyCandidateSet:
     return EnergyCandidateSet(
         baseline=features.baseline,
         loudness_fusion=features.loudness_fusion,
         club_fusion=features.club_fusion,
         pressure_fusion=features.pressure_fusion,
-        hybrid_blended=hybrid_blended,
-        learned=learned,
         consensus=energy_consensus(features),
         energy_sustained=features.energy_sustained,
         energy_peak=features.energy_peak,

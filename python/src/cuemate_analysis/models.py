@@ -57,12 +57,17 @@ class AnalysisResult:
     energy_abs: float
     energy_sustained: float | None
     energy_peak: float | None
-    energy_hybrid: float | None
-    energy_learned: float | None
-    energy_learned_bucket: str | None
-    energy_model_signature: str | None
-    energy_model_source: str | None
-    energy_model_inferred_at: str | None
+    danceability_abs: float | None
+    arousal_abs: float | None
+    valence_abs: float | None
+    mood_aggressive_abs: float | None
+    mood_party_abs: float | None
+    mood_relaxed_abs: float | None
+    energy_essentia_fused: float | None
+    energy_essentia_bucket: str | None
+    essentia_semantic_signature: str | None
+    essentia_semantic_source: str | None
+    essentia_semantic_inferred_at: str | None
     loudness_lufs: float
     loudness_norm: float
     bass_abs: float

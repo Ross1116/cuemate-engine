@@ -45,10 +45,12 @@ class AnalysisSettings:
     model_preload: bool
     fast_pass_enabled: bool
     analysis_signature_seed: str
-    energy_parallel_enabled: bool
-    energy_model_path: str | None
-    energy_model_meta_path: str | None
     energy_source_default: str
+    essentia_semantics_enabled: bool
+    essentia_semantic_image: str
+    essentia_semantic_device: str
+    essentia_semantic_model_family_policy: str
+    essentia_semantic_model_root: str
 
 
 @dataclass(frozen=True)
@@ -150,6 +152,11 @@ def _analysis_signature(config_signature: str, analysis_config: AnalysisSettings
         "key_device": analysis_config.key_device,
         "key_policy": analysis_config.key_policy,
         "fast_pass_enabled": analysis_config.fast_pass_enabled,
+        "essentia_semantics_enabled": analysis_config.essentia_semantics_enabled,
+        "essentia_semantic_image": analysis_config.essentia_semantic_image,
+        "essentia_semantic_device": analysis_config.essentia_semantic_device,
+        "essentia_semantic_model_family_policy": analysis_config.essentia_semantic_model_family_policy,
+        "essentia_semantic_model_root": analysis_config.essentia_semantic_model_root,
     }
     digest = hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
     return f"m1-{digest[:12]}"
@@ -210,10 +217,12 @@ def load_runtime_settings(repo_root: Path | None = None) -> RuntimeSettings:
         model_preload=bool(analysis_payload.get("model_preload", True)),
         fast_pass_enabled=bool(analysis_payload.get("fast_pass_enabled", True)),
         analysis_signature_seed=str(analysis_payload.get("analysis_signature_seed", "m1-absolute-v1")),
-        energy_parallel_enabled=bool(analysis_payload.get("energy_parallel_enabled", True)),
-        energy_model_path=analysis_payload.get("energy_model_path", "python/models/energy/teacher_first_v1.joblib"),
-        energy_model_meta_path=analysis_payload.get("energy_model_meta_path", "python/models/energy/teacher_first_v1.meta.json"),
         energy_source_default=str(analysis_payload.get("energy_source_default", "heuristic")),
+        essentia_semantics_enabled=bool(analysis_payload.get("essentia_semantics_enabled", True)),
+        essentia_semantic_image=str(analysis_payload.get("essentia_semantic_image", "cuemate-essentia-semantics:local")),
+        essentia_semantic_device=str(analysis_payload.get("essentia_semantic_device", "auto")),
+        essentia_semantic_model_family_policy=str(analysis_payload.get("essentia_semantic_model_family_policy", "best_per_task")),
+        essentia_semantic_model_root=str(analysis_payload.get("essentia_semantic_model_root", "python/models/essentia_semantics")),
     )
     thresholds = ThresholdSettings(
         small_playlist_limit=int(thresholds_payload.get("small_playlist_limit", 12)),

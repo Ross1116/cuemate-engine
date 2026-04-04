@@ -14,19 +14,17 @@ from cuemate_analysis.analysis import analyze_track, utc_now
 from cuemate_analysis.config import load_runtime_settings
 from cuemate_analysis.database import Database
 from cuemate_analysis.dj_import import list_dj_playlists, load_dj_playlist
-from cuemate_analysis.energy_experiments import analyze_energy_path
-from cuemate_analysis.energy_model import (
-    EnergyFeatureVector,
-    FEATURE_NAMES,
-    energy_consensus,
-    evaluate_energy_model,
-    load_energy_dataset_rows,
-    predict_energy_from_features,
-    resolve_energy_model_meta_path,
-    resolve_energy_model_path,
-    save_energy_bundle,
-    train_energy_bundle,
+from cuemate_analysis.essentia_semantic_backend import (
+    EssentiaSemanticEstimate,
+    build_essentia_semantic_manifest_signature,
+    build_essentia_semantic_model_manifest,
+    download_essentia_semantic_models,
+    estimate_essentia_semantic_batch,
+    purge_essentia_semantic_cache,
+    resolve_essentia_semantic_model_root,
 )
+from cuemate_analysis.energy_experiments import analyze_energy_path
+from cuemate_analysis.energy_features import EnergyFeatureVector, energy_consensus
 from cuemate_analysis.ingest import (
     discover_audio_files,
     make_playlist_id,
@@ -66,14 +64,20 @@ def hash_file_identity(path: Path) -> str:
     return digest.hexdigest()[:12]
 
 
-def resolve_expected_energy_model_signature(settings) -> str:
-    if not settings.analysis.energy_parallel_enabled:
+def resolve_expected_essentia_semantic_signature(settings) -> str:
+    if not settings.analysis.essentia_semantics_enabled:
         return "disabled"
-    model_path = resolve_energy_model_path(settings.analysis.energy_model_path, settings.repo_root)
-    meta_path = resolve_energy_model_meta_path(settings.analysis.energy_model_meta_path, settings.repo_root)
-    if not model_path.is_file() or not meta_path.is_file():
+    try:
+        manifest = build_essentia_semantic_model_manifest(
+            settings.analysis.essentia_semantic_model_root,
+            family_policy=settings.analysis.essentia_semantic_model_family_policy,
+        )
+        return build_essentia_semantic_manifest_signature(
+            manifest,
+            device=settings.analysis.essentia_semantic_device,
+        )
+    except Exception:
         return "missing"
-    return f"{hash_file_identity(model_path)}-{hash_file_identity(meta_path)}"
 
 
 def build_effective_analysis_signature(
@@ -84,7 +88,7 @@ def build_effective_analysis_signature(
     musicalkeycnn_model: str | None = None,
     musicalkeycnn_device: str = "auto",
     musicalkeycnn_policy: str = MUSICALKEYCNN_POLICY_FULL_TRACK,
-    energy_model_signature: str = "missing",
+    essentia_semantic_signature: str = "missing",
 ) -> str:
     tempo_model_hash = hash_file_identity(resolve_tempocnn_model_path(tempocnn_model))
     key_model_hash = hash_file_identity(resolve_musicalkeycnn_model_path(musicalkeycnn_model))
@@ -92,7 +96,7 @@ def build_effective_analysis_signature(
         f"{base_signature}"
         f"-tempo-tempocnn-{tempo_model_hash}-{tempocnn_accelerator}"
         f"-key-musicalkeycnn-{key_model_hash}-{musicalkeycnn_device}-{musicalkeycnn_policy}"
-        f"-energy-{energy_model_signature}"
+        f"-essentia-{essentia_semantic_signature}"
     )
 
 
@@ -109,6 +113,70 @@ def summarize_key_estimate(estimate: KeyEstimate) -> str:
     if not estimate.available or estimate.key is None:
         return f"unavailable ({estimate.elapsed_ms:.1f} ms)" if estimate.elapsed_ms is not None else "unavailable"
     return f"{estimate.details.get('display_key', estimate.key)} in {estimate.elapsed_ms:.1f} ms"
+
+
+def estimate_has_persistent_cache_hit(estimate) -> bool:
+    return any(str(note).startswith("Persistent inference cache hit.") for note in getattr(estimate, "notes", []))
+
+
+def estimate_runner_device(estimate) -> str | None:
+    details = getattr(estimate, "details", {}) or {}
+    explicit = details.get("runner_device")
+    if explicit:
+        return str(explicit)
+    tf_logical = details.get("tf_logical_gpu_count")
+    if tf_logical is not None:
+        try:
+            return "cuda" if int(tf_logical) > 0 else "cpu"
+        except (TypeError, ValueError):
+            return None
+    torch_logical = details.get("torch_logical_gpu_count")
+    if torch_logical is not None:
+        try:
+            return "cuda" if int(torch_logical) > 0 else "cpu"
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def estimate_gpu_summary(estimate) -> str | None:
+    details = getattr(estimate, "details", {}) or {}
+    tf_physical = details.get("tf_physical_gpu_count")
+    tf_logical = details.get("tf_logical_gpu_count")
+    if tf_physical is not None or tf_logical is not None:
+        return f"tensorflow_gpus={tf_physical if tf_physical is not None else '?'} physical / {tf_logical if tf_logical is not None else '?'} logical"
+    torch_physical = details.get("torch_physical_gpu_count")
+    torch_logical = details.get("torch_logical_gpu_count")
+    if torch_physical is not None or torch_logical is not None:
+        return f"torch_gpus={torch_physical if torch_physical is not None else '?'} physical / {torch_logical if torch_logical is not None else '?'} logical"
+    return None
+
+
+def print_backend_diagnostics(label: str, estimates: list[object], *, requested_device: str | None = None) -> None:
+    if not estimates:
+        return
+    total = len(estimates)
+    available = sum(1 for estimate in estimates if getattr(estimate, "available", False))
+    cache_hits = sum(1 for estimate in estimates if estimate_has_persistent_cache_hit(estimate))
+    elapsed_values = [
+        float(estimate.elapsed_ms)
+        for estimate in estimates
+        if getattr(estimate, "elapsed_ms", None) is not None
+    ]
+    runner_devices = sorted({device for estimate in estimates if (device := estimate_runner_device(estimate))})
+    gpu_summaries = sorted({summary for estimate in estimates if (summary := estimate_gpu_summary(estimate))})
+
+    print(f"{label} diagnostics:")
+    if requested_device:
+        print(f"- requested_device: {requested_device}")
+    print(f"- results: {available}/{total} available")
+    print(f"- persistent_cache_hits: {cache_hits}/{total}")
+    if elapsed_values:
+        print(f"- avg_elapsed_ms: {sum(elapsed_values) / len(elapsed_values):.1f}")
+    if runner_devices:
+        print(f"- runner_device(s): {', '.join(runner_devices)}")
+    for summary in gpu_summaries:
+        print(f"- {summary}")
 
 
 def build_bpm_payload(path: Path, metadata, estimate: TempoEstimate) -> dict[str, object]:
@@ -135,6 +203,37 @@ def prefetch_bpm_and_key_estimates(paths: list[Path], settings) -> tuple[dict[Pa
             policy=settings.analysis.key_policy,
         )
         return tempo_future.result(), key_future.result()
+
+
+def prefetch_essentia_semantic_estimates(rows, settings) -> dict[Path, EssentiaSemanticEstimate]:
+    if not rows or not settings.analysis.essentia_semantics_enabled:
+        return {}
+    auxiliary_features_by_path = {}
+    paths: list[Path] = []
+    for row in rows:
+        path = Path(row["file_path"]).resolve()
+        paths.append(path)
+        row_keys = set(row.keys()) if hasattr(row, "keys") else set()
+
+        def optional_value(key: str):
+            if row_keys and key not in row_keys:
+                return None
+            return row[key]
+
+        auxiliary_features_by_path[path] = {
+            "loudness_norm": optional_value("loudness_norm"),
+            "drums_abs": optional_value("drums_abs"),
+            "groove_abs": optional_value("groove_abs"),
+            "bass_abs": optional_value("bass_abs"),
+        }
+    return estimate_essentia_semantic_batch(
+        paths,
+        model_root=settings.analysis.essentia_semantic_model_root,
+        image_name=settings.analysis.essentia_semantic_image,
+        device=settings.analysis.essentia_semantic_device,
+        family_policy=settings.analysis.essentia_semantic_model_family_policy,
+        auxiliary_features_by_path=auxiliary_features_by_path,
+    )
 
 
 def build_bpm_key_payload(
@@ -187,44 +286,6 @@ def chunk_items(items: list[object], chunk_size: int = TEMPOCNN_PROGRESS_BATCH_S
     return [items[index:index + chunk_size] for index in range(0, len(items), chunk_size)]
 
 
-def build_energy_dataset_row(
-    *,
-    row,
-    features: EnergyFeatureVector,
-    playlist_name: str,
-) -> dict[str, object]:
-    return {
-        "track_id": row["track_id"],
-        "file_hash": row["file_hash"],
-        "file_path": str(Path(row["file_path"]).resolve().as_posix()),
-        "title": row["title"] or "",
-        "artist": row["artist"] or "",
-        "playlist_name": playlist_name,
-        "position": int(row["position"]),
-        "stored_energy_abs": row["energy_abs"],
-        **features.to_payload(),
-        "teacher_energy": "",
-        "teacher_source": "",
-        "teacher_confidence": "",
-        "manual_bucket": "",
-        "manual_score": "",
-        "manual_notes": "",
-    }
-
-
-def load_energy_label_lookup(dataset_path: Path | None) -> dict[str, dict[str, str]]:
-    if dataset_path is None:
-        return {}
-    resolved = dataset_path.expanduser().resolve()
-    with resolved.open("r", encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle)
-        return {
-            (row.get("track_id") or "").strip(): row
-            for row in reader
-            if (row.get("track_id") or "").strip()
-        }
-
-
 def track_from_playlist_row(row) -> object:
     return read_track_metadata_with_overrides(
         Path(row["file_path"]),
@@ -245,19 +306,22 @@ def should_skip_analysis(
     config_signature: str,
     analysis_mode: str,
     force: bool,
-    expected_energy_model_signature: str,
+    expected_essentia_semantic_signature: str,
 ) -> bool:
     if force:
         return False
-    energy_current = True
-    if analysis_mode == "full" and expected_energy_model_signature not in {"disabled", "missing"}:
-        energy_current = row["energy_model_signature"] == expected_energy_model_signature and row["energy_learned"] is not None
+    essentia_current = True
+    if analysis_mode == "full" and expected_essentia_semantic_signature not in {"disabled", "missing"}:
+        essentia_current = (
+            row["essentia_semantic_signature"] == expected_essentia_semantic_signature
+            and row["energy_essentia_fused"] is not None
+        )
     return (
         row["source_file_hash"] == track.file_hash
         and row["analysis_signature"] == effective_analysis_signature
         and row["analysis_mode"] == analysis_mode
         and row["config_signature"] == config_signature
-        and energy_current
+        and essentia_current
     )
 
 
@@ -435,7 +499,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     analyze_relative_playlist_parser.add_argument(
         "--energy-source",
-        choices=["heuristic", "learned"],
+        choices=["heuristic", "essentia_fused"],
         default=None,
         help="Choose which absolute-energy source to use for relative scaling.",
     )
@@ -460,36 +524,29 @@ def build_parser() -> argparse.ArgumentParser:
         "--output",
         help="Optional output path for a CSV report.",
     )
-    analyze_energy_playlist_parser.add_argument(
-        "--dataset",
-        help="Optional labeled dataset CSV to merge teacher/manual labels into the report.",
+
+    download_essentia_models_parser = subparsers.add_parser(
+        "download-essentia-semantic-models",
+        help="Download the Essentia semantic model bundle into the local model root.",
+    )
+    download_essentia_models_parser.add_argument(
+        "--model-root",
+        help="Optional model root override.",
+    )
+    download_essentia_models_parser.add_argument(
+        "--family-policy",
+        choices=["best_per_task", "musicnn_only"],
+        help="Optional family policy override for the manifest download.",
     )
 
-    export_energy_dataset_parser = subparsers.add_parser(
-        "export-energy-dataset",
-        help="Export an energy training dataset for an imported playlist.",
+    analyze_essentia_playlist_parser = subparsers.add_parser(
+        "analyze-essentia-playlist",
+        help="Inspect Essentia semantic predictions for a playlist without persisting results.",
     )
-    export_energy_dataset_parser.add_argument("--playlist", required=True, help="Playlist name to export.")
-    export_energy_dataset_parser.add_argument("--output", required=True, help="CSV path to write.")
-    export_energy_dataset_parser.add_argument("--limit", type=int, default=0, help="Optional track limit.")
-
-    train_energy_model_parser = subparsers.add_parser(
-        "train-energy-model",
-        help="Train the teacher-first energy model from a labeled CSV dataset.",
-    )
-    train_energy_model_parser.add_argument("--dataset", required=True, help="Labeled dataset CSV path.")
-    train_energy_model_parser.add_argument("--model-out", required=True, help="Joblib artifact output path.")
-    train_energy_model_parser.add_argument("--meta-out", required=True, help="JSON metadata output path.")
-
-    benchmark_energy_model_parser = subparsers.add_parser(
-        "benchmark-energy-model",
-        help="Benchmark baseline, hybrid, and learned energy scorers from a labeled dataset.",
-    )
-    benchmark_energy_model_parser.add_argument("--dataset", required=True, help="Labeled dataset CSV path.")
-    benchmark_energy_model_parser.add_argument("--json", action="store_true", help="Emit benchmark JSON.")
-    benchmark_energy_model_parser.add_argument("--output", help="Optional CSV output path.")
-    benchmark_energy_model_parser.add_argument("--model-path", help="Optional learned model override path.")
-    benchmark_energy_model_parser.add_argument("--meta-path", help="Optional learned model metadata override path.")
+    analyze_essentia_playlist_parser.add_argument("--playlist", required=True, help="Playlist name to analyze.")
+    analyze_essentia_playlist_parser.add_argument("--limit", type=int, default=0, help="Optional track limit.")
+    analyze_essentia_playlist_parser.add_argument("--json", action="store_true", help="Emit JSON output.")
+    analyze_essentia_playlist_parser.add_argument("--output", help="Optional output CSV path.")
 
     purge_cache_parser = subparsers.add_parser(
         "purge-model-cache",
@@ -497,7 +554,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     purge_cache_parser.add_argument(
         "--backend",
-        choices=["all", "tempocnn", "musicalkeycnn"],
+        choices=["all", "tempocnn", "musicalkeycnn", "essentia_semantics"],
         default="all",
         help="Limit the purge to one backend.",
     )
@@ -616,14 +673,14 @@ def handle_import_dj_playlist(args: argparse.Namespace) -> int:
 def handle_analyze_playlist(args: argparse.Namespace) -> int:
     settings = load_runtime_settings()
     playlist_name = args.playlist
-    expected_energy_model_signature = resolve_expected_energy_model_signature(settings)
+    expected_essentia_semantic_signature = resolve_expected_essentia_semantic_signature(settings)
     effective_analysis_signature = build_effective_analysis_signature(
         settings.analysis_signature,
         tempocnn_accelerator="auto",
         musicalkeycnn_model=settings.analysis.key_model_path,
         musicalkeycnn_device=settings.analysis.key_device,
         musicalkeycnn_policy=settings.analysis.key_policy,
-        energy_model_signature=expected_energy_model_signature,
+        essentia_semantic_signature=expected_essentia_semantic_signature,
     )
 
     with Database(settings.database_path) as database:
@@ -633,6 +690,9 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
 
         total = len(rows)
         processed = 0
+        tempo_diagnostics: list[TempoEstimate] = []
+        key_diagnostics: list[KeyEstimate] = []
+        essentia_diagnostics: list[EssentiaSemanticEstimate] = []
         for chunk in chunk_items(rows):
             prepared_tracks = []
             for row in chunk:
@@ -654,16 +714,19 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
                     config_signature=settings.config_signature,
                     analysis_mode=args.analysis_mode,
                     force=args.force,
-                    expected_energy_model_signature=expected_energy_model_signature,
+                    expected_essentia_semantic_signature=expected_essentia_semantic_signature,
                 )
             ]
             prefetched_tempocnn_estimates: dict[Path, TempoEstimate] = {}
             prefetched_musicalkeycnn_estimates: dict[Path, KeyEstimate] = {}
+            prefetched_essentia_semantic_estimates: dict[Path, EssentiaSemanticEstimate] = {}
             if pending_paths:
                 prefetched_tempocnn_estimates, prefetched_musicalkeycnn_estimates = prefetch_bpm_and_key_estimates(
                     pending_paths,
                     settings,
                 )
+                if args.analysis_mode == "full":
+                    prefetched_essentia_semantic_estimates = prefetch_essentia_semantic_estimates(chunk, settings)
 
             for item in prepared_tracks:
                 index = int(item["row"]["position"])
@@ -693,7 +756,7 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
                         config_signature=settings.config_signature,
                         analysis_mode=args.analysis_mode,
                         force=args.force,
-                        expected_energy_model_signature=expected_energy_model_signature,
+                        expected_essentia_semantic_signature=expected_essentia_semantic_signature,
                     ):
                         duration_seconds = round(time.perf_counter() - start_time, 3)
                         database.mark_analysis_job_completed(
@@ -709,8 +772,8 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
                                 "musicalkeycnn_model": settings.analysis.key_model_path,
                                 "musicalkeycnn_device": settings.analysis.key_device,
                                 "musicalkeycnn_policy": settings.analysis.key_policy,
-                                "energy_parallel_enabled": settings.analysis.energy_parallel_enabled,
-                                "energy_model_signature": expected_energy_model_signature,
+                                "essentia_semantics_enabled": settings.analysis.essentia_semantics_enabled,
+                                "essentia_semantic_signature": expected_essentia_semantic_signature,
                                 "skipped": True,
                             },
                             utc_now(),
@@ -732,8 +795,18 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
                         musicalkeycnn_device=settings.analysis.key_device,
                         musicalkeycnn_policy=settings.analysis.key_policy,
                         prefetched_musicalkeycnn_estimate=prefetched_musicalkeycnn_estimates.get(track.file_path.resolve()),
+                        prefetched_essentia_semantic_estimate=prefetched_essentia_semantic_estimates.get(track.file_path.resolve()),
                         analysis_signature=effective_analysis_signature,
                     )
+                    tempo_estimate = prefetched_tempocnn_estimates.get(track.file_path.resolve())
+                    if tempo_estimate is not None:
+                        tempo_diagnostics.append(tempo_estimate)
+                    key_estimate = prefetched_musicalkeycnn_estimates.get(track.file_path.resolve())
+                    if key_estimate is not None:
+                        key_diagnostics.append(key_estimate)
+                    essentia_estimate = prefetched_essentia_semantic_estimates.get(track.file_path.resolve())
+                    if essentia_estimate is not None:
+                        essentia_diagnostics.append(essentia_estimate)
                     database.upsert_track_features(result)
                     duration_seconds = round(time.perf_counter() - start_time, 3)
                     database.mark_analysis_job_completed(
@@ -749,8 +822,8 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
                             "musicalkeycnn_model": settings.analysis.key_model_path,
                             "musicalkeycnn_device": settings.analysis.key_device,
                             "musicalkeycnn_policy": settings.analysis.key_policy,
-                            "energy_parallel_enabled": settings.analysis.energy_parallel_enabled,
-                            "energy_model_signature": expected_energy_model_signature,
+                            "essentia_semantics_enabled": settings.analysis.essentia_semantics_enabled,
+                            "essentia_semantic_signature": expected_essentia_semantic_signature,
                         },
                         utc_now(),
                     )
@@ -766,6 +839,14 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
                     print(f"[{index}/{total}] failed {track.id}: {exc}", file=sys.stderr)
 
     print(f"Completed playlist analysis for '{playlist_name}'. Updated {processed} track(s).")
+    print_backend_diagnostics("TempoCNN", tempo_diagnostics, requested_device="auto")
+    print_backend_diagnostics("MusicalKeyCNN", key_diagnostics, requested_device=settings.analysis.key_device)
+    if args.analysis_mode == "full":
+        print_backend_diagnostics(
+            "Essentia semantics",
+            essentia_diagnostics,
+            requested_device=settings.analysis.essentia_semantic_device,
+        )
     return 0
 
 
@@ -796,12 +877,21 @@ def handle_show_track(args: argparse.Namespace) -> int:
             raise SystemExit(f"Track '{args.track_id}' was not found.")
     details["energy_summary"] = {
         "heuristic": details.get("energy_abs"),
-        "hybrid": details.get("energy_hybrid"),
-        "learned": details.get("energy_learned"),
-        "learned_bucket": details.get("energy_learned_bucket"),
-        "model_signature": details.get("energy_model_signature"),
-        "model_source": details.get("energy_model_source"),
-        "model_inferred_at": details.get("energy_model_inferred_at"),
+        "essentia_fused": details.get("energy_essentia_fused"),
+        "essentia_bucket": details.get("energy_essentia_bucket"),
+    }
+    details["essentia_semantics"] = {
+        "danceability_abs": details.get("danceability_abs"),
+        "arousal_abs": details.get("arousal_abs"),
+        "valence_abs": details.get("valence_abs"),
+        "mood_aggressive_abs": details.get("mood_aggressive_abs"),
+        "mood_party_abs": details.get("mood_party_abs"),
+        "mood_relaxed_abs": details.get("mood_relaxed_abs"),
+        "energy_essentia_fused": details.get("energy_essentia_fused"),
+        "energy_essentia_bucket": details.get("energy_essentia_bucket"),
+        "essentia_semantic_signature": details.get("essentia_semantic_signature"),
+        "essentia_semantic_source": details.get("essentia_semantic_source"),
+        "essentia_semantic_inferred_at": details.get("essentia_semantic_inferred_at"),
     }
     print(json.dumps(details, indent=2, sort_keys=True))
     return 0
@@ -827,6 +917,7 @@ def handle_analyze_bpm(args: argparse.Namespace) -> int:
     print(f"BPM: {summarize_estimate(estimate)}")
     if estimate.confidence is not None:
         print(f"Confidence: {estimate.confidence:.2f}")
+    print_backend_diagnostics("TempoCNN", [estimate], requested_device="auto")
     for note in estimate.notes:
         print(f"- {note}")
     return 0
@@ -860,6 +951,8 @@ def handle_analyze_bpm_key(args: argparse.Namespace) -> int:
     print(f"Key: {summarize_key_estimate(key_estimate)}")
     if key_estimate.confidence is not None:
         print(f"Key Confidence: {key_estimate.confidence:.2f}")
+    print_backend_diagnostics("TempoCNN", [bpm_estimate], requested_device="auto")
+    print_backend_diagnostics("MusicalKeyCNN", [key_estimate], requested_device=settings.analysis.key_device)
     return 0
 
 
@@ -874,6 +967,7 @@ def handle_analyze_bpm_playlist(args: argparse.Namespace) -> int:
         rows = rows[: args.limit]
 
     payload_rows: list[dict[str, object]] = []
+    diagnostics_estimates: list[TempoEstimate] = []
     total = len(rows)
     if not args.json:
         print(f"Playlist '{args.playlist}' BPM pass with backend tempocnn")
@@ -885,6 +979,7 @@ def handle_analyze_bpm_playlist(args: argparse.Namespace) -> int:
             index = int(row["position"])
             path = Path(row["file_path"]).resolve()
             estimate = prefetched_tempocnn_estimates[path]
+            diagnostics_estimates.append(estimate)
             payload = build_fast_playlist_bpm_payload(row, path, estimate)
             payload["track_id"] = row["track_id"]
             payload["position"] = index
@@ -908,6 +1003,8 @@ def handle_analyze_bpm_playlist(args: argparse.Namespace) -> int:
                 sort_keys=True,
             )
         )
+    else:
+        print_backend_diagnostics("TempoCNN", diagnostics_estimates, requested_device="auto")
     if args.output:
         output_path = Path(args.output).expanduser().resolve()
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -954,6 +1051,8 @@ def handle_analyze_bpm_key_playlist(args: argparse.Namespace) -> int:
         rows = rows[: args.limit]
 
     payload_rows: list[dict[str, object]] = []
+    bpm_diagnostics: list[TempoEstimate] = []
+    key_diagnostics: list[KeyEstimate] = []
     total = len(rows)
     if not args.json:
         print(f"Playlist '{args.playlist}' BPM+key pass with TempoCNN + MusicalKeyCNN")
@@ -970,6 +1069,8 @@ def handle_analyze_bpm_key_playlist(args: argparse.Namespace) -> int:
             path = Path(row["file_path"]).resolve()
             bpm_estimate = prefetched_tempocnn_estimates[path]
             key_estimate = prefetched_musicalkeycnn_estimates[path]
+            bpm_diagnostics.append(bpm_estimate)
+            key_diagnostics.append(key_estimate)
             payload = build_fast_playlist_bpm_key_payload(row, path, bpm_estimate, key_estimate)
             payload["track_id"] = row["track_id"]
             payload["position"] = index
@@ -992,6 +1093,9 @@ def handle_analyze_bpm_key_playlist(args: argparse.Namespace) -> int:
                 sort_keys=True,
             )
         )
+    else:
+        print_backend_diagnostics("TempoCNN", bpm_diagnostics, requested_device="auto")
+        print_backend_diagnostics("MusicalKeyCNN", key_diagnostics, requested_device=settings.analysis.key_device)
     if args.output:
         output_path = Path(args.output).expanduser().resolve()
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1065,10 +1169,20 @@ def handle_analyze_relative_playlist(args: argparse.Namespace) -> int:
             print("Adapted weights skipped")
         for note in stats.weight_adaptation_notes:
             print(f"- {note}")
-        if energy_source == "learned":
-            fallback_count = sum(1 for track in preview.tracks if track.energy_source_used != "learned")
+        if energy_source == "essentia_fused":
+            fallback_count = sum(1 for track in preview.tracks if track.energy_source_used != energy_source)
             if fallback_count:
-                print(f"- learned energy unavailable for {fallback_count} track(s); heuristic fallback was used per-track")
+                print(f"- {energy_source} unavailable for {fallback_count} track(s); heuristic fallback was used per-track")
+            essentia_rows = [row for row in rows if row["energy_essentia_fused"] is not None]
+            if essentia_rows:
+                signatures = sorted({str(row["essentia_semantic_signature"]) for row in essentia_rows if row["essentia_semantic_signature"]})
+                sources = sorted({str(row["essentia_semantic_source"]) for row in essentia_rows if row["essentia_semantic_source"]})
+                print("Essentia fused diagnostics:")
+                print(f"- persisted_rows: {len(essentia_rows)}/{len(rows)}")
+                if signatures:
+                    print(f"- semantic_signature(s): {', '.join(signatures)}")
+                if sources:
+                    print(f"- semantic_source(s): {', '.join(sources)}")
         for track in preview.tracks:
             title = track.title or Path(track.file_path).stem
             print(
@@ -1137,10 +1251,6 @@ def handle_analyze_energy_playlist(args: argparse.Namespace) -> int:
 
     payload_rows: list[dict[str, object]] = []
     total = len(rows)
-    label_lookup = load_energy_label_lookup(Path(args.dataset)) if args.dataset else {}
-    model_path = resolve_energy_model_path(settings.analysis.energy_model_path, settings.repo_root)
-    meta_path = resolve_energy_model_meta_path(settings.analysis.energy_model_meta_path, settings.repo_root)
-    model_available = model_path.is_file() and meta_path.is_file()
 
     if not args.json:
         print(f"Playlist '{args.playlist}' energy workbench :: experimental absolute-energy candidates")
@@ -1167,18 +1277,6 @@ def handle_analyze_energy_playlist(args: argparse.Namespace) -> int:
             harmonic_abs=float(candidates.harmonic_abs if candidates.harmonic_abs is not None else 0.5),
             groove_abs=float(candidates.groove_abs if candidates.groove_abs is not None else 0.5),
         )
-        hybrid_blended: float | None = None
-        learned: float | None = None
-        learned_bucket: str | None = None
-        if model_available:
-            inference = predict_energy_from_features(
-                features,
-                model_path=model_path,
-                meta_path=meta_path,
-            )
-            hybrid_blended = inference.hybrid
-            learned = inference.learned
-            learned_bucket = inference.bucket
         payload = {
             "position": index,
             "track_id": row["track_id"],
@@ -1190,9 +1288,6 @@ def handle_analyze_energy_playlist(args: argparse.Namespace) -> int:
             "loudness_fusion": candidates.loudness_fusion,
             "club_fusion": candidates.club_fusion,
             "pressure_fusion": candidates.pressure_fusion,
-            "hybrid_blended": hybrid_blended,
-            "learned": learned,
-            "learned_bucket": learned_bucket,
             "consensus": energy_consensus(features),
             "energy_sustained": candidates.energy_sustained,
             "energy_peak": candidates.energy_peak,
@@ -1203,16 +1298,15 @@ def handle_analyze_energy_playlist(args: argparse.Namespace) -> int:
             "harmonic_abs": candidates.harmonic_abs,
             "groove_abs": candidates.groove_abs,
         }
-        if row["energy_learned"] is not None:
-            payload["stored_energy_learned"] = row["energy_learned"]
-            payload["stored_energy_learned_bucket"] = row["energy_learned_bucket"]
-        labels = label_lookup.get(str(row["track_id"]))
-        if labels:
-            payload["teacher_energy"] = labels.get("teacher_energy") or None
-            payload["teacher_source"] = labels.get("teacher_source") or None
-            payload["teacher_confidence"] = labels.get("teacher_confidence") or None
-            payload["manual_bucket"] = labels.get("manual_bucket") or None
-            payload["manual_score"] = labels.get("manual_score") or None
+        if row["energy_essentia_fused"] is not None:
+            payload["stored_energy_essentia_fused"] = row["energy_essentia_fused"]
+            payload["stored_energy_essentia_bucket"] = row["energy_essentia_bucket"]
+            payload["danceability_abs"] = row["danceability_abs"]
+            payload["arousal_abs"] = row["arousal_abs"]
+            payload["valence_abs"] = row["valence_abs"]
+            payload["mood_aggressive_abs"] = row["mood_aggressive_abs"]
+            payload["mood_party_abs"] = row["mood_party_abs"]
+            payload["mood_relaxed_abs"] = row["mood_relaxed_abs"]
         payload_rows.append(payload)
         if not args.json:
             title = row["title"] or path.stem
@@ -1221,20 +1315,20 @@ def handle_analyze_energy_playlist(args: argparse.Namespace) -> int:
                 if payload["stored_energy_abs"] is not None
                 else "none"
             )
-            learned_label = f"{float(learned):.3f}" if learned is not None else "none"
-            hybrid_label = f"{float(hybrid_blended):.3f}" if hybrid_blended is not None else "none"
-            teacher_label = payload.get("teacher_energy")
-            print(
+            message = (
                 f"[{index}/{total}] {title} :: "
                 f"stored={stored_label} :: "
                 f"baseline={payload['baseline']:.3f} :: "
-                f"hybrid={hybrid_label} :: "
-                f"learned={learned_label} :: "
+                f"loudness={payload['loudness_fusion']:.3f} :: "
+            )
+            if payload.get("stored_energy_essentia_fused") is not None:
+                message += f"essentia={float(payload['stored_energy_essentia_fused']):.3f} :: "
+            message += (
                 f"club={payload['club_fusion']:.3f} :: "
                 f"pressure={payload['pressure_fusion']:.3f} :: "
                 f"consensus={payload['consensus']:.3f}"
-                + (f" :: teacher={teacher_label}" if teacher_label not in (None, "") else "")
             )
+            print(message)
 
     if args.json:
         print(
@@ -1252,7 +1346,7 @@ def handle_analyze_energy_playlist(args: argparse.Namespace) -> int:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         fieldnames = list(payload_rows[0].keys()) if payload_rows else [
             "position", "track_id", "title", "artist", "file_path", "stored_energy_abs",
-            "baseline", "loudness_fusion", "club_fusion", "pressure_fusion", "hybrid_blended", "learned", "learned_bucket", "consensus",
+            "baseline", "loudness_fusion", "club_fusion", "pressure_fusion", "consensus",
             "energy_sustained", "energy_peak", "loudness_norm", "loudness_lufs",
             "bass_abs", "drums_abs", "harmonic_abs", "groove_abs",
         ]
@@ -1265,7 +1359,19 @@ def handle_analyze_energy_playlist(args: argparse.Namespace) -> int:
     return 0
 
 
-def handle_export_energy_dataset(args: argparse.Namespace) -> int:
+def handle_download_essentia_semantic_models(args: argparse.Namespace) -> int:
+    settings = load_runtime_settings()
+    model_root = args.model_root or settings.analysis.essentia_semantic_model_root
+    family_policy = args.family_policy or settings.analysis.essentia_semantic_model_family_policy
+    downloaded = download_essentia_semantic_models(model_root=model_root, family_policy=family_policy)
+    resolved_root = resolve_essentia_semantic_model_root(model_root)
+    print(f"Downloaded Essentia semantic model bundle to {resolved_root}")
+    for path in downloaded:
+        print(f"- {path}")
+    return 0
+
+
+def handle_analyze_essentia_playlist(args: argparse.Namespace) -> int:
     settings = load_runtime_settings()
     with Database(settings.database_path) as database:
         rows = database.get_playlist_tracks(args.playlist)
@@ -1275,121 +1381,69 @@ def handle_export_energy_dataset(args: argparse.Namespace) -> int:
     if args.limit and args.limit > 0:
         rows = rows[: args.limit]
 
-    output_path = Path(args.output).expanduser().resolve()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    dataset_rows: list[dict[str, object]] = []
+    estimates = prefetch_essentia_semantic_estimates(rows, settings)
+    payload_rows: list[dict[str, object]] = []
+    diagnostics_estimates: list[EssentiaSemanticEstimate] = []
     total = len(rows)
-    print(f"Exporting energy dataset for '{args.playlist}'")
+    if not args.json:
+        print(f"Playlist '{args.playlist}' Essentia semantic preview")
+
     for row in rows:
         index = int(row["position"])
         path = Path(row["file_path"]).resolve()
-        candidates = analyze_energy_path(
-            path,
-            sample_rate=settings.analysis.sample_rate,
-            mono=settings.analysis.mono,
-        )
-        features = EnergyFeatureVector(
-            baseline=candidates.baseline,
-            loudness_fusion=candidates.loudness_fusion,
-            club_fusion=candidates.club_fusion,
-            pressure_fusion=candidates.pressure_fusion,
-            energy_sustained=float(candidates.energy_sustained if candidates.energy_sustained is not None else 0.5),
-            energy_peak=float(candidates.energy_peak if candidates.energy_peak is not None else 0.5),
-            loudness_norm=candidates.loudness_norm,
-            loudness_lufs=candidates.loudness_lufs,
-            bass_abs=candidates.bass_abs,
-            drums_abs=float(candidates.drums_abs if candidates.drums_abs is not None else 0.5),
-            harmonic_abs=float(candidates.harmonic_abs if candidates.harmonic_abs is not None else 0.5),
-            groove_abs=float(candidates.groove_abs if candidates.groove_abs is not None else 0.5),
-        )
-        dataset_rows.append(build_energy_dataset_row(row=row, features=features, playlist_name=args.playlist))
-        print(f"[{index}/{total}] {row['title'] or path.stem}")
-
-    fieldnames = [
-        "track_id", "file_hash", "file_path", "title", "artist", "playlist_name", "position", "stored_energy_abs",
-        *FEATURE_NAMES,
-        "teacher_energy", "teacher_source", "teacher_confidence", "manual_bucket", "manual_score", "manual_notes",
-    ]
-    with output_path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(dataset_rows)
-    print(f"Wrote energy dataset to {output_path}")
-    return 0
-
-
-def handle_train_energy_model(args: argparse.Namespace) -> int:
-    dataset_path = Path(args.dataset).expanduser().resolve()
-    model_out = Path(args.model_out).expanduser().resolve()
-    meta_out = Path(args.meta_out).expanduser().resolve()
-
-    rows = load_energy_dataset_rows(dataset_path)
-    bundle, metrics = train_energy_bundle(rows)
-    metadata = save_energy_bundle(bundle, metrics, model_out=model_out, meta_out=meta_out)
-
-    print(f"Trained energy model from {dataset_path}")
-    print(f"- model artifact: {model_out}")
-    print(f"- metadata: {meta_out}")
-    print(f"- model signature: {metadata['artifact_signature']}")
-    print(f"- teacher rows: {metadata['dataset_counts']['teacher_total']}")
-    print(f"- manual rows: {metadata['dataset_counts']['manual_total']}")
-    return 0
-
-
-def handle_benchmark_energy_model(args: argparse.Namespace) -> int:
-    settings = load_runtime_settings()
-    dataset_path = Path(args.dataset).expanduser().resolve()
-    model_path = resolve_energy_model_path(args.model_path or settings.analysis.energy_model_path, settings.repo_root)
-    meta_path = resolve_energy_model_meta_path(args.meta_path or settings.analysis.energy_model_meta_path, settings.repo_root)
-    if not model_path.is_file() or not meta_path.is_file():
-        raise SystemExit(f"Energy model artifacts were not found: {model_path} / {meta_path}")
-
-    rows = load_energy_dataset_rows(dataset_path)
-    benchmark = evaluate_energy_model(rows, model_path=model_path, meta_path=meta_path)
-
-    if args.json:
-        print(json.dumps(benchmark, indent=2, sort_keys=True))
-    else:
-        print(f"Energy benchmark :: model_signature={benchmark['model_signature']}")
-        print(
-            f"Validation rows :: teacher={benchmark['dataset_counts']['validation_teacher']} :: "
-            f"manual={benchmark['dataset_counts']['validation_manual']}"
-        )
-        for comparator_name, comparator in benchmark["comparators"].items():
-            teacher_metrics = comparator["teacher_metrics"] or {}
-            manual_metrics = comparator["manual_metrics"] or {}
+        estimate = estimates.get(path)
+        if estimate is not None:
+            diagnostics_estimates.append(estimate)
+        payload = {
+            "position": index,
+            "track_id": row["track_id"],
+            "title": row["title"],
+            "artist": row["artist"],
+            "file_path": path.as_posix(),
+            "available": estimate.available if estimate is not None else False,
+            "danceability_abs": estimate.danceability_abs if estimate is not None else None,
+            "arousal_abs": estimate.arousal_abs if estimate is not None else None,
+            "valence_abs": estimate.valence_abs if estimate is not None else None,
+            "mood_aggressive_abs": estimate.mood_aggressive_abs if estimate is not None else None,
+            "mood_party_abs": estimate.mood_party_abs if estimate is not None else None,
+            "mood_relaxed_abs": estimate.mood_relaxed_abs if estimate is not None else None,
+            "energy_essentia_fused": estimate.energy_essentia_fused if estimate is not None else None,
+            "energy_essentia_bucket": estimate.energy_essentia_bucket if estimate is not None else None,
+            "notes": [] if estimate is None else estimate.notes,
+        }
+        payload_rows.append(payload)
+        if not args.json:
+            title = row["title"] or path.stem
+            fused_label = "none" if payload["energy_essentia_fused"] is None else f"{float(payload['energy_essentia_fused']):.3f}"
             print(
-                f"- {comparator_name}: "
-                f"teacher_mae={teacher_metrics.get('mae', 0.0):.4f}, "
-                f"teacher_rmse={teacher_metrics.get('rmse', 0.0):.4f}, "
-                f"teacher_spearman={teacher_metrics.get('spearman', 0.0):.4f}, "
-                f"manual_macro_f1={manual_metrics.get('macro_f1', 0.0):.4f}, "
-                f"manual_bucket_accuracy={manual_metrics.get('bucket_accuracy', 0.0):.4f}"
+                f"[{index}/{total}] {title} :: "
+                f"danceability={payload['danceability_abs'] if payload['danceability_abs'] is not None else 'none'} :: "
+                f"arousal={payload['arousal_abs'] if payload['arousal_abs'] is not None else 'none'} :: "
+                f"party={payload['mood_party_abs'] if payload['mood_party_abs'] is not None else 'none'} :: "
+                f"relaxed={payload['mood_relaxed_abs'] if payload['mood_relaxed_abs'] is not None else 'none'} :: "
+                f"fused={fused_label} :: "
+                f"bucket={payload['energy_essentia_bucket'] or 'none'}"
             )
 
+    if args.json:
+        print(json.dumps({"playlist": args.playlist, "tracks": payload_rows}, indent=2, sort_keys=True))
+    else:
+        print_backend_diagnostics(
+            "Essentia semantics",
+            diagnostics_estimates,
+            requested_device=settings.analysis.essentia_semantic_device,
+        )
     if args.output:
         output_path = Path(args.output).expanduser().resolve()
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        rows_for_csv: list[dict[str, object]] = []
-        for comparator_name, comparator in benchmark["comparators"].items():
-            rows_for_csv.append(
-                {
-                    "comparator": comparator_name,
-                    "teacher_mae": comparator["teacher_metrics"]["mae"] if comparator["teacher_metrics"] else None,
-                    "teacher_rmse": comparator["teacher_metrics"]["rmse"] if comparator["teacher_metrics"] else None,
-                    "teacher_spearman": comparator["teacher_metrics"]["spearman"] if comparator["teacher_metrics"] else None,
-                    "manual_bucket_accuracy": comparator["manual_metrics"]["bucket_accuracy"] if comparator["manual_metrics"] else None,
-                    "manual_macro_f1": comparator["manual_metrics"]["macro_f1"] if comparator["manual_metrics"] else None,
-                    "manual_weighted_kappa": comparator["manual_metrics"]["weighted_kappa"] if comparator["manual_metrics"] else None,
-                    "manual_score_mae": comparator["manual_metrics"]["score_mae"] if comparator["manual_metrics"] else None,
-                }
-            )
+        fieldnames = list(payload_rows[0].keys()) if payload_rows else [
+            "position", "track_id", "title", "artist", "file_path", "available",
+            "danceability_abs", "arousal_abs", "valence_abs", "mood_aggressive_abs",
+            "mood_party_abs", "mood_relaxed_abs", "energy_essentia_fused", "energy_essentia_bucket", "notes",
+        ]
+        rows_for_csv = [{**item, "notes": " | ".join(item["notes"])} for item in payload_rows]
         with output_path.open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=list(rows_for_csv[0].keys()) if rows_for_csv else [
-                "comparator", "teacher_mae", "teacher_rmse", "teacher_spearman",
-                "manual_bucket_accuracy", "manual_macro_f1", "manual_weighted_kappa", "manual_score_mae",
-            ])
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(rows_for_csv)
         if not args.json:
@@ -1414,11 +1468,14 @@ def handle_purge_model_cache(args: argparse.Namespace) -> int:
     deduped_paths = sorted({str(Path(path).resolve()) for path in scoped_paths})
     deleted_tempocnn = 0
     deleted_musicalkeycnn = 0
+    deleted_essentia_semantics = 0
 
     if args.backend in {"all", "tempocnn"}:
         deleted_tempocnn = purge_tempocnn_cache(file_paths=deduped_paths or None)
     if args.backend in {"all", "musicalkeycnn"}:
         deleted_musicalkeycnn = purge_musicalkeycnn_cache(file_paths=deduped_paths or None)
+    if args.backend in {"all", "essentia_semantics"}:
+        deleted_essentia_semantics = purge_essentia_semantic_cache(file_paths=deduped_paths or None)
 
     scope_label = "all cached tracks"
     if deduped_paths:
@@ -1431,6 +1488,9 @@ def handle_purge_model_cache(args: argparse.Namespace) -> int:
     if args.backend in {"all", "musicalkeycnn"}:
         print(f"- MusicalKeyCNN rows removed: {deleted_musicalkeycnn}")
         print("- MusicalKeyCNN warm service state cleared")
+    if args.backend in {"all", "essentia_semantics"}:
+        print(f"- Essentia semantics rows removed: {deleted_essentia_semantics}")
+        print("- Essentia semantics warm service state cleared")
     print(f"- Persistent cache DB: {resolve_inference_cache_path()}")
     print("- Re-run analysis with --force if you want stored playlist analysis rows refreshed too.")
     return 0
@@ -1465,12 +1525,10 @@ def main(argv: list[str] | None = None) -> int:
             return handle_analyze_relative_playlist(args)
         if args.command == "analyze-energy-playlist":
             return handle_analyze_energy_playlist(args)
-        if args.command == "export-energy-dataset":
-            return handle_export_energy_dataset(args)
-        if args.command == "train-energy-model":
-            return handle_train_energy_model(args)
-        if args.command == "benchmark-energy-model":
-            return handle_benchmark_energy_model(args)
+        if args.command == "download-essentia-semantic-models":
+            return handle_download_essentia_semantic_models(args)
+        if args.command == "analyze-essentia-playlist":
+            return handle_analyze_essentia_playlist(args)
         if args.command == "purge-model-cache":
             return handle_purge_model_cache(args)
     except sqlite3.OperationalError as exc:

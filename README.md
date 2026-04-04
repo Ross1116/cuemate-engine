@@ -90,6 +90,12 @@ Build the local MusicalKeyCNN Docker image used by the primary key backend:
 powershell -ExecutionPolicy Bypass -File .\scripts\build-musicalkeycnn-image.ps1
 ```
 
+Build the local Essentia semantics Docker image used by the semantic absolute-feature lane:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build-essentia-semantics-image.ps1
+```
+
 Optional: warm-start the persistent TempoCNN service container yourself. The CLI will auto-start it on demand too.
 
 ```powershell
@@ -100,6 +106,12 @@ Optional: warm-start the persistent MusicalKeyCNN service container yourself. Th
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\start-musicalkeycnn-service.ps1
+```
+
+Optional: warm-start the persistent Essentia semantics service container yourself. The CLI will auto-start it on demand too.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\start-essentia-semantics-service.ps1
 ```
 
 ## Milestone 1 CLI
@@ -176,12 +188,12 @@ python -m cuemate_analysis analyze-energy-playlist --playlist "Fred again" --lim
 python -m cuemate_analysis analyze-energy-playlist --playlist "Fred again" --output .\data\benchmarks\fred-again-energy.csv
 ```
 
-Export a labeled energy dataset, train the teacher-first learned scorer, and benchmark it:
+Download the Essentia semantic model bundle and inspect Essentia semantic outputs for a playlist:
 
 ```powershell
-python -m cuemate_analysis export-energy-dataset --playlist "Fred again" --output .\data\benchmarks\fred-again-energy-dataset.csv
-python -m cuemate_analysis train-energy-model --dataset .\data\benchmarks\fred-again-energy-dataset.csv --model-out .\python\models\energy\teacher_first_v1.joblib --meta-out .\python\models\energy\teacher_first_v1.meta.json
-python -m cuemate_analysis benchmark-energy-model --dataset .\data\benchmarks\fred-again-energy-dataset.csv
+python -m cuemate_analysis download-essentia-semantic-models
+python -m cuemate_analysis analyze-essentia-playlist --playlist "Fred again" --limit 12
+python -m cuemate_analysis analyze-relative-playlist --playlist "Fred again" --energy-source essentia_fused
 ```
 
 Purge persisted TempoCNN and MusicalKeyCNN caches, and clear the warm service state so the next run is fully fresh:
@@ -202,9 +214,9 @@ Speed notes:
 - `analyze-bpm-key` and `analyze-bpm-key-playlist` are the intended fast paths when you only want BPM + key
 - `analyze-relative-playlist` is a read-only experimental Milestone 2 Phase 1 preview; it computes relative context from `track_features_abs` and does not persist new tables yet
 - `analyze-energy-playlist` is a read-only experimental workbench for comparing absolute-energy formulas on real playlists before promoting one into the production analyzer
-- `export-energy-dataset`, `train-energy-model`, and `benchmark-energy-model` are the teacher-first offline workflow for learned energy scoring
-- full playlist analysis now keeps heuristic `energy_abs` as the production default and, when a trained model artifact exists, persists parallel learned-energy fields beside it
-- TempoCNN and MusicalKeyCNN both use warm Docker workers so repeated analysis avoids model cold starts
+- `download-essentia-semantic-models` and `analyze-essentia-playlist` are the new model-acquisition and read-only inspection surfaces for Essentia semantic absolute features
+- full playlist analysis can now also persist Essentia semantic outputs and `energy_essentia_fused` in parallel when the Essentia model bundle is available
+- TempoCNN, MusicalKeyCNN, and Essentia semantics all use warm Docker workers so repeated analysis avoids model cold starts
 - both warm workers now cache results for unchanged files, so rerunning the same BPM/key playlist pass is dramatically faster
 - those persistent caches live in `data/inference-cache.db` and can be purged on demand with `purge-model-cache`
 - playlist analysis batches TempoCNN and MusicalKeyCNN work so the models stay loaded

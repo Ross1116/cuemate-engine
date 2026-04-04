@@ -58,7 +58,7 @@ def test_effective_analysis_signature_includes_production_models(tmp_path: Path)
 
     assert signature.startswith("m1-stable-tempo-tempocnn-")
     assert "-auto-key-musicalkeycnn-" in signature
-    assert "-auto-full_track-energy-" in signature
+    assert "-auto-full_track-essentia-" in signature
 
 
 def test_resolve_bpm_with_backend_falls_back_to_baseline_when_tempocnn_is_unavailable(

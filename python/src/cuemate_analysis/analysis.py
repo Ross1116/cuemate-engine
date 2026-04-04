@@ -10,7 +10,7 @@ import numpy as np
 import pyloudnorm as pyln
 
 from cuemate_analysis.config import RuntimeSettings
-from cuemate_analysis.energy_model import build_energy_feature_vector, predict_energy_from_features, resolve_energy_model_meta_path, resolve_energy_model_path
+from cuemate_analysis.essentia_semantic_backend import EssentiaSemanticEstimate
 from cuemate_analysis.models import AnalysisResult, ImportedTrack
 
 
@@ -777,6 +777,7 @@ def analyze_track(
     musicalkeycnn_device: str | None = None,
     musicalkeycnn_policy: str | None = None,
     prefetched_musicalkeycnn_estimate=None,
+    prefetched_essentia_semantic_estimate: EssentiaSemanticEstimate | None = None,
     analysis_signature: str | None = None,
 ) -> AnalysisResult:
     y, sr = librosa.load(
@@ -824,42 +825,33 @@ def analyze_track(
             "groove_abs": None,
         }
 
-    energy_features = build_energy_feature_vector(
-        energy_abs=float(energy["energy_abs"]),
-        energy_sustained=energy["energy_sustained"],
-        energy_peak=energy["energy_peak"],
-        loudness_norm=float(loudness["loudness_norm"]),
-        loudness_lufs=float(loudness["loudness_lufs"]),
-        bass_abs=bass_abs,
-        drums_abs=full_features["drums_abs"],
-        harmonic_abs=full_features["harmonic_abs"],
-        groove_abs=full_features["groove_abs"],
-    )
-    energy_hybrid: float | None = None
-    energy_learned: float | None = None
-    energy_learned_bucket: str | None = None
-    energy_model_signature: str | None = None
-    energy_model_source: str | None = None
-    energy_model_inferred_at: str | None = None
-    if analysis_mode == "full" and settings.analysis.energy_parallel_enabled:
-        model_path = resolve_energy_model_path(settings.analysis.energy_model_path, settings.repo_root)
-        meta_path = resolve_energy_model_meta_path(settings.analysis.energy_model_meta_path, settings.repo_root)
-        if model_path.is_file() and meta_path.is_file():
-            try:
-                energy_inference = predict_energy_from_features(
-                    energy_features,
-                    model_path=model_path,
-                    meta_path=meta_path,
-                )
-            except Exception:
-                energy_inference = None
-            if energy_inference is not None:
-                energy_hybrid = float(energy_inference.hybrid)
-                energy_learned = float(energy_inference.learned)
-                energy_learned_bucket = str(energy_inference.bucket)
-                energy_model_signature = str(energy_inference.model_signature)
-                energy_model_source = str(energy_inference.model_source)
-                energy_model_inferred_at = utc_now()
+    danceability_abs: float | None = None
+    arousal_abs: float | None = None
+    valence_abs: float | None = None
+    mood_aggressive_abs: float | None = None
+    mood_party_abs: float | None = None
+    mood_relaxed_abs: float | None = None
+    energy_essentia_fused: float | None = None
+    energy_essentia_bucket: str | None = None
+    essentia_semantic_signature: str | None = None
+    essentia_semantic_source: str | None = None
+    essentia_semantic_inferred_at: str | None = None
+    if analysis_mode == "full" and prefetched_essentia_semantic_estimate is not None and prefetched_essentia_semantic_estimate.available:
+        danceability_abs = prefetched_essentia_semantic_estimate.danceability_abs
+        arousal_abs = prefetched_essentia_semantic_estimate.arousal_abs
+        valence_abs = prefetched_essentia_semantic_estimate.valence_abs
+        mood_aggressive_abs = prefetched_essentia_semantic_estimate.mood_aggressive_abs
+        mood_party_abs = prefetched_essentia_semantic_estimate.mood_party_abs
+        mood_relaxed_abs = prefetched_essentia_semantic_estimate.mood_relaxed_abs
+        energy_essentia_fused = prefetched_essentia_semantic_estimate.energy_essentia_fused
+        energy_essentia_bucket = prefetched_essentia_semantic_estimate.energy_essentia_bucket
+        essentia_semantic_signature = str(
+            prefetched_essentia_semantic_estimate.details.get("model_signature") or ""
+        ) or None
+        essentia_semantic_source = str(
+            prefetched_essentia_semantic_estimate.details.get("semantic_source") or ""
+        ) or None
+        essentia_semantic_inferred_at = utc_now()
 
     return AnalysisResult(
         track_id=track.id,
@@ -880,12 +872,17 @@ def analyze_track(
         energy_abs=float(energy["energy_abs"]),
         energy_sustained=energy["energy_sustained"],
         energy_peak=energy["energy_peak"],
-        energy_hybrid=energy_hybrid,
-        energy_learned=energy_learned,
-        energy_learned_bucket=energy_learned_bucket,
-        energy_model_signature=energy_model_signature,
-        energy_model_source=energy_model_source,
-        energy_model_inferred_at=energy_model_inferred_at,
+        danceability_abs=danceability_abs,
+        arousal_abs=arousal_abs,
+        valence_abs=valence_abs,
+        mood_aggressive_abs=mood_aggressive_abs,
+        mood_party_abs=mood_party_abs,
+        mood_relaxed_abs=mood_relaxed_abs,
+        energy_essentia_fused=energy_essentia_fused,
+        energy_essentia_bucket=energy_essentia_bucket,
+        essentia_semantic_signature=essentia_semantic_signature,
+        essentia_semantic_source=essentia_semantic_source,
+        essentia_semantic_inferred_at=essentia_semantic_inferred_at,
         loudness_lufs=loudness["loudness_lufs"],
         loudness_norm=loudness["loudness_norm"],
         bass_abs=bass_abs,

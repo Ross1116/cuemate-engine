@@ -44,8 +44,8 @@ class RelativeTrackInput:
     bpm: float | None
     key: str | None
     energy_abs: float | None
-    energy_learned: float | None
-    energy_learned_bucket: str | None
+    energy_essentia_fused: float | None
+    energy_essentia_bucket: str | None
     bass_abs: float | None
     drums_abs: float | None
     harmonic_abs: float | None
@@ -153,8 +153,8 @@ def row_to_relative_track_input(row) -> RelativeTrackInput:
         bpm=float(read_optional("bpm")) if read_optional("bpm") is not None else None,
         key=str(read_optional("key")) if read_optional("key") is not None else None,
         energy_abs=float(read_optional("energy_abs")) if read_optional("energy_abs") is not None else None,
-        energy_learned=float(read_optional("energy_learned")) if read_optional("energy_learned") is not None else None,
-        energy_learned_bucket=str(read_optional("energy_learned_bucket")) if read_optional("energy_learned_bucket") is not None else None,
+        energy_essentia_fused=float(read_optional("energy_essentia_fused")) if read_optional("energy_essentia_fused") is not None else None,
+        energy_essentia_bucket=str(read_optional("energy_essentia_bucket")) if read_optional("energy_essentia_bucket") is not None else None,
         bass_abs=float(read_optional("bass_abs")) if read_optional("bass_abs") is not None else None,
         drums_abs=float(read_optional("drums_abs")) if read_optional("drums_abs") is not None else None,
         harmonic_abs=float(read_optional("harmonic_abs")) if read_optional("harmonic_abs") is not None else None,
@@ -377,10 +377,17 @@ def compute_relative_playlist_preview(
     playlist_id = rows[0].playlist_id if rows else None
     track_count_total = len(rows)
     analyzed_tracks = [row for row in rows if row.has_absolute_analysis]
+    def resolve_effective_energy(track: RelativeTrackInput) -> tuple[float | None, str]:
+        if energy_source == "essentia_fused" and track.energy_essentia_fused is not None:
+            return float(track.energy_essentia_fused), "essentia_fused"
+        if track.energy_abs is not None:
+            return float(track.energy_abs), "heuristic"
+        return None, "missing"
+
     eligible_tracks = [
         row
         for row in analyzed_tracks
-        if (row.energy_learned if energy_source == "learned" and row.energy_learned is not None else row.energy_abs) is not None
+        if resolve_effective_energy(row)[0] is not None
         and row.bass_abs is not None
         and row.drums_abs is not None
         and row.harmonic_abs is not None
@@ -426,11 +433,7 @@ def compute_relative_playlist_preview(
     def bounds(values: list[float]) -> tuple[float, float]:
         return float(np.percentile(values, 10)), float(np.percentile(values, 90))
 
-    energy_values = [
-        float(track.energy_learned if energy_source == "learned" and track.energy_learned is not None else track.energy_abs)
-        for track in eligible_tracks
-        if (track.energy_learned if energy_source == "learned" and track.energy_learned is not None else track.energy_abs) is not None
-    ]
+    energy_values = [float(resolve_effective_energy(track)[0]) for track in eligible_tracks if resolve_effective_energy(track)[0] is not None]
     bass_values = [float(track.bass_abs) for track in eligible_tracks if track.bass_abs is not None]
     drums_values = [float(track.drums_abs) for track in eligible_tracks if track.drums_abs is not None]
     groove_values = [float(track.groove_abs) for track in eligible_tracks if track.groove_abs is not None]
@@ -456,9 +459,9 @@ def compute_relative_playlist_preview(
 
     previews: list[RelativeTrackPreview] = []
     for track in eligible_tracks:
-        effective_energy = float(
-            track.energy_learned if energy_source == "learned" and track.energy_learned is not None else track.energy_abs
-        )
+        effective_energy, energy_source_used = resolve_effective_energy(track)
+        if effective_energy is None:
+            continue
         energy_rel = robust_scale(effective_energy, *energy_bounds)
         bass_rel = robust_scale(float(track.bass_abs), *bass_bounds)
         drums_rel = robust_scale(float(track.drums_abs), *drums_bounds)
@@ -472,7 +475,7 @@ def compute_relative_playlist_preview(
                 title=track.title,
                 artist=track.artist,
                 file_path=track.file_path,
-                energy_source_used="learned" if energy_source == "learned" and track.energy_learned is not None else "heuristic",
+                energy_source_used=energy_source_used,
                 energy_rel=round(energy_rel, 4),
                 bass_rel=round(bass_rel, 4),
                 drums_rel=round(drums_rel, 4),

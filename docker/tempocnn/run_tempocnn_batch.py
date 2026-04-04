@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
+import os
 import sys
 
 import numpy as np
 
 import essentia.standard as es
+
+
+TEMPOCNN_AUDIO_WORKERS = max(1, min(4, os.cpu_count() or 1))
 
 
 def detect_gpu_counts() -> tuple[int | None, int | None]:
@@ -18,8 +23,11 @@ def detect_gpu_counts() -> tuple[int | None, int | None]:
     return physical, logical
 
 
-def analyze_track(model, track_path: str) -> dict[str, object]:
-    tempo_audio = es.MonoLoader(filename=track_path, sampleRate=11025, resampleQuality=4)()
+def load_tempo_audio(track_path: str):
+    return es.MonoLoader(filename=track_path, sampleRate=11025, resampleQuality=4)()
+
+
+def analyze_audio(model, track_path: str, tempo_audio) -> dict[str, object]:
     global_tempo, local_tempi, local_probs = model(tempo_audio)
 
     local_tempi_array = np.asarray(local_tempi, dtype=float)
@@ -51,6 +59,27 @@ def analyze_track(model, track_path: str) -> dict[str, object]:
     }
 
 
+def analyze_tracks(model, track_paths: list[str]) -> list[dict[str, object]]:
+    worker_count = max(1, min(TEMPOCNN_AUDIO_WORKERS, len(track_paths)))
+
+    def load_one(track_path: str):
+        return track_path, load_tempo_audio(track_path)
+
+    if worker_count == 1:
+        loaded = [load_one(track_path) for track_path in track_paths]
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            loaded = list(executor.map(load_one, track_paths))
+
+    results: list[dict[str, object]] = []
+    for track_path, tempo_audio in loaded:
+        try:
+            results.append(analyze_audio(model, track_path, tempo_audio))
+        except Exception as exc:
+            results.append({"track_path": str(track_path), "error": str(exc)})
+    return results
+
+
 def main(argv: list[str]) -> int:
     if len(argv) < 3:
         print(
@@ -63,13 +92,7 @@ def main(argv: list[str]) -> int:
     track_paths = argv[2:]
     tf_physical_gpu_count, tf_logical_gpu_count = detect_gpu_counts()
     model = es.TempoCNN(graphFilename=model_path)
-    results: list[dict[str, object]] = []
-
-    for track_path in track_paths:
-        try:
-            results.append(analyze_track(model, track_path))
-        except Exception as exc:
-            results.append({"track_path": track_path, "error": str(exc)})
+    results = analyze_tracks(model, track_paths)
 
     print(
         json.dumps(

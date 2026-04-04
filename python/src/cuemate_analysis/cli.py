@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import csv
 import json
 from pathlib import Path
@@ -13,13 +14,17 @@ from cuemate_analysis.config import load_runtime_settings
 from cuemate_analysis.database import Database
 from cuemate_analysis.ingest import discover_audio_files, make_playlist_id, read_track_metadata
 from cuemate_analysis.key_backend import (
+    KeyEstimate,
     MUSICALKEYCNN_POLICY_FULL_TRACK,
     estimate_musicalkeycnn_keys,
+    purge_musicalkeycnn_cache,
     resolve_musicalkeycnn_model_path,
 )
+from cuemate_analysis.persistent_inference_cache import resolve_inference_cache_path
 from cuemate_analysis.tempo_backend import (
     TempoEstimate,
     estimate_tempocnn_bpms,
+    purge_tempocnn_cache,
     resolve_tempocnn_model_path,
 )
 
@@ -53,6 +58,12 @@ def summarize_estimate(estimate: TempoEstimate) -> str:
     )
 
 
+def summarize_key_estimate(estimate: KeyEstimate) -> str:
+    if not estimate.available or estimate.key is None:
+        return f"unavailable ({estimate.elapsed_ms:.1f} ms)" if estimate.elapsed_ms is not None else "unavailable"
+    return f"{estimate.details.get('display_key', estimate.key)} in {estimate.elapsed_ms:.1f} ms"
+
+
 def build_bpm_payload(path: Path, metadata, estimate: TempoEstimate) -> dict[str, object]:
     return {
         "file_path": path.as_posix(),
@@ -60,6 +71,66 @@ def build_bpm_payload(path: Path, metadata, estimate: TempoEstimate) -> dict[str
         "artist": metadata.artist,
         "tagged_bpm": metadata.bpm_tag,
         "estimate": estimate.to_payload(),
+    }
+
+
+def prefetch_bpm_and_key_estimates(paths: list[Path], settings) -> tuple[dict[Path, TempoEstimate], dict[Path, KeyEstimate]]:
+    if not paths:
+        return {}, {}
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        tempo_future = executor.submit(estimate_tempocnn_bpms, paths)
+        key_future = executor.submit(
+            estimate_musicalkeycnn_keys,
+            paths,
+            model_path=settings.analysis.key_model_path,
+            device=settings.analysis.key_device,
+            policy=settings.analysis.key_policy,
+        )
+        return tempo_future.result(), key_future.result()
+
+
+def build_bpm_key_payload(
+    path: Path,
+    metadata,
+    bpm_estimate: TempoEstimate,
+    key_estimate: KeyEstimate,
+) -> dict[str, object]:
+    return {
+        "file_path": path.as_posix(),
+        "title": metadata.title,
+        "artist": metadata.artist,
+        "tagged_bpm": metadata.bpm_tag,
+        "tagged_key": metadata.key_tag,
+        "bpm": bpm_estimate.to_payload(),
+        "key": key_estimate.to_payload(),
+    }
+
+
+def build_fast_playlist_bpm_payload(row, path: Path, estimate: TempoEstimate) -> dict[str, object]:
+    return {
+        "file_path": path.as_posix(),
+        "title": row["title"],
+        "artist": row["artist"],
+        "tagged_bpm": None,
+        "estimate": estimate.to_payload(),
+    }
+
+
+def build_fast_playlist_bpm_key_payload(
+    row,
+    path: Path,
+    bpm_estimate: TempoEstimate,
+    key_estimate: KeyEstimate,
+) -> dict[str, object]:
+    return {
+        "file_path": path.as_posix(),
+        "title": row["title"],
+        "artist": row["artist"],
+        "tagged_bpm": None,
+        "tagged_key": None,
+        "bpm": bpm_estimate.to_payload(),
+        "key": key_estimate.to_payload(),
     }
 
 
@@ -127,6 +198,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Emit the BPM payload as JSON.",
     )
 
+    analyze_bpm_key_parser = subparsers.add_parser(
+        "analyze-bpm-key",
+        help="Estimate BPM and key for one file with TempoCNN and MusicalKeyCNN only.",
+    )
+    analyze_bpm_key_parser.add_argument("path", help="Audio file to analyze.")
+    analyze_bpm_key_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit the BPM+key payload as JSON.",
+    )
+
     analyze_bpm_playlist_parser = subparsers.add_parser(
         "analyze-bpm-playlist",
         help="Estimate BPM for an imported playlist with the production TempoCNN path.",
@@ -146,6 +228,48 @@ def build_parser() -> argparse.ArgumentParser:
     analyze_bpm_playlist_parser.add_argument(
         "--output",
         help="Optional output path for a CSV report.",
+    )
+
+    analyze_bpm_key_playlist_parser = subparsers.add_parser(
+        "analyze-bpm-key-playlist",
+        help="Estimate BPM and key for an imported playlist with TempoCNN and MusicalKeyCNN only.",
+    )
+    analyze_bpm_key_playlist_parser.add_argument("--playlist", required=True, help="Playlist name to analyze.")
+    analyze_bpm_key_playlist_parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Optional track limit for a faster pass.",
+    )
+    analyze_bpm_key_playlist_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit the playlist BPM+key payload as JSON.",
+    )
+    analyze_bpm_key_playlist_parser.add_argument(
+        "--output",
+        help="Optional output path for a CSV report.",
+    )
+
+    purge_cache_parser = subparsers.add_parser(
+        "purge-model-cache",
+        help="Purge persisted TempoCNN and MusicalKeyCNN caches and clear warm service state.",
+    )
+    purge_cache_parser.add_argument(
+        "--backend",
+        choices=["all", "tempocnn", "musicalkeycnn"],
+        default="all",
+        help="Limit the purge to one backend.",
+    )
+    purge_cache_parser.add_argument(
+        "--playlist",
+        help="Optional playlist name to scope the purge to imported track file paths.",
+    )
+    purge_cache_parser.add_argument(
+        "--path",
+        action="append",
+        default=[],
+        help="Optional file path to purge. Can be passed multiple times.",
     )
 
     return parser
@@ -207,14 +331,11 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
                 or item["row"]["analysis_mode"] != args.analysis_mode
             ]
             prefetched_tempocnn_estimates: dict[Path, TempoEstimate] = {}
-            prefetched_musicalkeycnn_estimates = {}
+            prefetched_musicalkeycnn_estimates: dict[Path, KeyEstimate] = {}
             if pending_paths:
-                prefetched_tempocnn_estimates = estimate_tempocnn_bpms(pending_paths)
-                prefetched_musicalkeycnn_estimates = estimate_musicalkeycnn_keys(
+                prefetched_tempocnn_estimates, prefetched_musicalkeycnn_estimates = prefetch_bpm_and_key_estimates(
                     pending_paths,
-                    model_path=settings.analysis.key_model_path,
-                    device=settings.analysis.key_device,
-                    policy=settings.analysis.key_policy,
+                    settings,
                 )
 
             for item in chunk:
@@ -366,6 +487,31 @@ def handle_analyze_bpm(args: argparse.Namespace) -> int:
     return 0
 
 
+def handle_analyze_bpm_key(args: argparse.Namespace) -> int:
+    path = Path(args.path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Audio file was not found: {path}")
+
+    metadata = read_track_metadata(path)
+    bpm_estimate = estimate_tempocnn_bpms([path])[path.resolve()]
+    key_estimate = estimate_musicalkeycnn_keys([path])[path.resolve()]
+    payload = build_bpm_key_payload(path, metadata, bpm_estimate, key_estimate)
+
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+
+    print(f"File: {payload['file_path']}")
+    print(f"Track: {metadata.artist or 'Unknown artist'} - {metadata.title or path.stem}")
+    print(f"BPM: {summarize_estimate(bpm_estimate)}")
+    if bpm_estimate.confidence is not None:
+        print(f"BPM Confidence: {bpm_estimate.confidence:.2f}")
+    print(f"Key: {summarize_key_estimate(key_estimate)}")
+    if key_estimate.confidence is not None:
+        print(f"Key Confidence: {key_estimate.confidence:.2f}")
+    return 0
+
+
 def handle_analyze_bpm_playlist(args: argparse.Namespace) -> int:
     settings = load_runtime_settings()
     with Database(settings.database_path) as database:
@@ -387,9 +533,8 @@ def handle_analyze_bpm_playlist(args: argparse.Namespace) -> int:
         for row in chunk:
             index = int(row["position"])
             path = Path(row["file_path"]).resolve()
-            metadata = read_track_metadata(path)
             estimate = prefetched_tempocnn_estimates[path]
-            payload = build_bpm_payload(path, metadata, estimate)
+            payload = build_fast_playlist_bpm_payload(row, path, estimate)
             payload["track_id"] = row["track_id"]
             payload["position"] = index
             payload_rows.append(payload)
@@ -447,6 +592,129 @@ def handle_analyze_bpm_playlist(args: argparse.Namespace) -> int:
     return 0
 
 
+def handle_analyze_bpm_key_playlist(args: argparse.Namespace) -> int:
+    settings = load_runtime_settings()
+    with Database(settings.database_path) as database:
+        rows = database.get_playlist_tracks(args.playlist)
+        if not rows:
+            raise SystemExit(f"Playlist '{args.playlist}' was not found.")
+
+    if args.limit and args.limit > 0:
+        rows = rows[: args.limit]
+
+    payload_rows: list[dict[str, object]] = []
+    total = len(rows)
+    if not args.json:
+        print(f"Playlist '{args.playlist}' BPM+key pass with TempoCNN + MusicalKeyCNN")
+
+    for chunk in chunk_items(rows):
+        chunk_paths = [Path(row["file_path"]) for row in chunk]
+        prefetched_tempocnn_estimates, prefetched_musicalkeycnn_estimates = prefetch_bpm_and_key_estimates(
+            chunk_paths,
+            settings,
+        )
+
+        for row in chunk:
+            index = int(row["position"])
+            path = Path(row["file_path"]).resolve()
+            bpm_estimate = prefetched_tempocnn_estimates[path]
+            key_estimate = prefetched_musicalkeycnn_estimates[path]
+            payload = build_fast_playlist_bpm_key_payload(row, path, bpm_estimate, key_estimate)
+            payload["track_id"] = row["track_id"]
+            payload["position"] = index
+            payload_rows.append(payload)
+            if not args.json:
+                title = payload["title"] or Path(str(payload["file_path"])).stem
+                print(
+                    f"[{index}/{total}] {title} [{payload['track_id']}] :: "
+                    f"{summarize_estimate(bpm_estimate)} :: {summarize_key_estimate(key_estimate)}"
+                )
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "playlist": args.playlist,
+                    "tracks": payload_rows,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+    if args.output:
+        output_path = Path(args.output).expanduser().resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        rows_for_csv: list[dict[str, object]] = []
+        for item in payload_rows:
+            bpm_estimate = TempoEstimate(**item["bpm"])
+            key_estimate = KeyEstimate(**item["key"])
+            rows_for_csv.append(
+                {
+                    "position": item["position"],
+                    "track_id": item["track_id"],
+                    "title": item["title"],
+                    "artist": item["artist"],
+                    "file_path": item["file_path"],
+                    "bpm": bpm_estimate.bpm,
+                    "bpm_confidence": bpm_estimate.confidence,
+                    "bpm_elapsed_ms": bpm_estimate.elapsed_ms,
+                    "key": key_estimate.key,
+                    "key_confidence": key_estimate.confidence,
+                    "key_elapsed_ms": key_estimate.elapsed_ms,
+                }
+            )
+        fieldnames = list(rows_for_csv[0].keys()) if rows_for_csv else [
+            "position", "track_id", "title", "artist", "file_path",
+            "bpm", "bpm_confidence", "bpm_elapsed_ms", "key", "key_confidence", "key_elapsed_ms",
+        ]
+        with output_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows_for_csv)
+        if not args.json:
+            print(f"Wrote CSV report to {output_path}")
+    return 0
+
+
+def handle_purge_model_cache(args: argparse.Namespace) -> int:
+    settings = load_runtime_settings()
+    scoped_paths: list[str] = []
+
+    if args.playlist:
+        with Database(settings.database_path) as database:
+            rows = database.get_playlist_tracks(args.playlist)
+            if not rows:
+                raise SystemExit(f"Playlist '{args.playlist}' was not found.")
+            scoped_paths.extend([str(Path(row["file_path"]).resolve()) for row in rows])
+
+    if args.path:
+        scoped_paths.extend([str(Path(path).expanduser().resolve()) for path in args.path])
+
+    deduped_paths = sorted({str(Path(path).resolve()) for path in scoped_paths})
+    deleted_tempocnn = 0
+    deleted_musicalkeycnn = 0
+
+    if args.backend in {"all", "tempocnn"}:
+        deleted_tempocnn = purge_tempocnn_cache(file_paths=deduped_paths or None)
+    if args.backend in {"all", "musicalkeycnn"}:
+        deleted_musicalkeycnn = purge_musicalkeycnn_cache(file_paths=deduped_paths or None)
+
+    scope_label = "all cached tracks"
+    if deduped_paths:
+        scope_label = f"{len(deduped_paths)} scoped file(s)"
+
+    print(f"Purged model inference cache for {scope_label}.")
+    if args.backend in {"all", "tempocnn"}:
+        print(f"- TempoCNN rows removed: {deleted_tempocnn}")
+        print("- TempoCNN warm service state cleared")
+    if args.backend in {"all", "musicalkeycnn"}:
+        print(f"- MusicalKeyCNN rows removed: {deleted_musicalkeycnn}")
+        print("- MusicalKeyCNN warm service state cleared")
+    print(f"- Persistent cache DB: {resolve_inference_cache_path()}")
+    print("- Re-run analysis with --force if you want stored playlist analysis rows refreshed too.")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -462,8 +730,14 @@ def main(argv: list[str] | None = None) -> int:
             return handle_show_track(args)
         if args.command == "analyze-bpm":
             return handle_analyze_bpm(args)
+        if args.command == "analyze-bpm-key":
+            return handle_analyze_bpm_key(args)
         if args.command == "analyze-bpm-playlist":
             return handle_analyze_bpm_playlist(args)
+        if args.command == "analyze-bpm-key-playlist":
+            return handle_analyze_bpm_key_playlist(args)
+        if args.command == "purge-model-cache":
+            return handle_purge_model_cache(args)
     except sqlite3.OperationalError as exc:
         message = str(exc)
         if "no such table" in message.lower():

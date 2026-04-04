@@ -54,6 +54,7 @@ ENHARMONIC_NOTES = {
     "B#": "C",
     "E#": "F",
 }
+MUSICALKEYCNN_OVERRIDE_CONFIDENCE = 0.5
 
 
 def utc_now() -> str:
@@ -242,6 +243,7 @@ def detect_key(y: np.ndarray, sr: int) -> dict[str, str | int | float]:
 def resolve_key(tagged_key: str | None, detected: dict[str, str | int | float]) -> dict[str, str | int | float | None]:
     parsed_tag = parse_key_label(tagged_key)
     detected_source = str(detected.get("key_source", "chroma"))
+    detected_confidence = float(detected.get("key_confidence", 0.0) or 0.0)
 
     if parsed_tag is not None:
         if parsed_tag["key"] == detected["key"]:
@@ -252,6 +254,21 @@ def resolve_key(tagged_key: str | None, detected: dict[str, str | int | float]) 
                 "key_imported": None,
                 "key_tagged": tagged_key,
                 "key_agreement": 1,
+            }
+
+        if (
+            detected_source == "musicalkeycnn"
+            and detected_confidence >= MUSICALKEYCNN_OVERRIDE_CONFIDENCE
+        ):
+            return {
+                "key": detected["key"],
+                "key_number": detected["key_number"],
+                "key_letter": detected["key_letter"],
+                "key_confidence": detected_confidence,
+                "key_source": "musicalkeycnn_override_tag",
+                "key_imported": None,
+                "key_tagged": tagged_key,
+                "key_agreement": 0,
             }
 
         return {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -13,6 +14,11 @@ from urllib import request as urllib_request
 import librosa
 
 from cuemate_analysis.analysis import detect_key
+from cuemate_analysis.persistent_inference_cache import (
+    ModelInferenceCacheEntry,
+    PersistentInferenceCache,
+    resolve_inference_cache_path,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_MUSICALKEYCNN_MODEL = REPO_ROOT / "python" / "models" / "musicalkeycnn" / "keynet.pt"
@@ -31,6 +37,7 @@ MUSICALKEYCNN_POLICY_CHOICES = {
     MUSICALKEYCNN_POLICY_BALANCED,
     MUSICALKEYCNN_POLICY_FULL_TRACK,
 }
+MUSICALKEYCNN_PERSISTED_CACHE_VERSION = "musicalkeycnn-cache-v1"
 
 
 @dataclass(frozen=True)
@@ -235,7 +242,7 @@ def service_container_matches(
     return required_targets.issubset(targets)
 
 
-def wait_for_musicalkeycnn_service_health(service_port: int, *, timeout_seconds: float = 20.0) -> tuple[bool, str]:
+def wait_for_musicalkeycnn_service_health(service_port: int, *, timeout_seconds: float = 45.0) -> tuple[bool, str]:
     health_url = f"http://127.0.0.1:{service_port}/health"
     deadline = time.time() + timeout_seconds
     last_error = "service health check timed out"
@@ -391,6 +398,120 @@ def build_musicalkeycnn_success_estimate(
     )
 
 
+def build_musicalkeycnn_cache_descriptor(
+    track_path: Path,
+    *,
+    model_path: Path,
+    device: str,
+    policy: str,
+) -> dict[str, object]:
+    stat_result = track_path.stat()
+    descriptor_payload = {
+        "version": MUSICALKEYCNN_PERSISTED_CACHE_VERSION,
+        "track_path": track_path.resolve().as_posix(),
+        "file_mtime_ns": int(stat_result.st_mtime_ns),
+        "file_size": int(stat_result.st_size),
+        "model_path": model_path.resolve().as_posix(),
+        "device": device,
+        "policy": policy,
+    }
+    cache_key = hashlib.sha1(json.dumps(descriptor_payload, sort_keys=True).encode("utf-8")).hexdigest()
+    return {
+        "cache_key": cache_key,
+        "file_path": descriptor_payload["track_path"],
+        "file_mtime_ns": descriptor_payload["file_mtime_ns"],
+        "file_size": descriptor_payload["file_size"],
+        "model_signature": f"{MUSICALKEYCNN_PERSISTED_CACHE_VERSION}:{model_path.name}:{device}:{policy}",
+    }
+
+
+def load_cached_musicalkeycnn_estimates(
+    paths: list[Path],
+    *,
+    model_path: Path,
+    device: str,
+    policy: str,
+) -> tuple[dict[Path, KeyEstimate], dict[Path, dict[str, object]]]:
+    if not paths:
+        return {}, {}
+    started = time.perf_counter()
+    descriptors = {
+        path: build_musicalkeycnn_cache_descriptor(
+            path,
+            model_path=model_path,
+            device=device,
+            policy=policy,
+        )
+        for path in paths
+    }
+    try:
+        with PersistentInferenceCache(resolve_inference_cache_path()) as cache:
+            payloads = cache.fetch_payloads(
+                KEY_BACKEND_MUSICALKEYCNN,
+                [str(item["cache_key"]) for item in descriptors.values()],
+            )
+    except Exception:
+        return {}, descriptors
+
+    elapsed_ms = round((time.perf_counter() - started) * 1000.0 / max(len(paths), 1), 1)
+    estimates: dict[Path, KeyEstimate] = {}
+    for path, descriptor in descriptors.items():
+        payload = payloads.get(str(descriptor["cache_key"]))
+        if payload is None:
+            continue
+        notes = ["Persistent inference cache hit.", *payload.get("notes", [])]
+        estimates[path] = KeyEstimate(
+            **{
+                **payload,
+                "elapsed_ms": elapsed_ms,
+                "notes": notes,
+            }
+        )
+    return estimates, descriptors
+
+
+def persist_musicalkeycnn_estimates(
+    estimates: dict[Path, KeyEstimate],
+    descriptors: dict[Path, dict[str, object]],
+) -> None:
+    entries: list[ModelInferenceCacheEntry] = []
+    for path, estimate in estimates.items():
+        if not estimate.available or not estimate.key:
+            continue
+        descriptor = descriptors.get(path)
+        if descriptor is None:
+            continue
+        entries.append(
+            ModelInferenceCacheEntry(
+                backend=KEY_BACKEND_MUSICALKEYCNN,
+                cache_key=str(descriptor["cache_key"]),
+                file_path=str(descriptor["file_path"]),
+                file_mtime_ns=int(descriptor["file_mtime_ns"]),
+                file_size=int(descriptor["file_size"]),
+                model_signature=str(descriptor["model_signature"]),
+                payload=estimate.to_payload(),
+            )
+        )
+    if not entries:
+        return
+    try:
+        with PersistentInferenceCache(resolve_inference_cache_path()) as cache:
+            cache.upsert_entries(entries)
+    except Exception:
+        return
+
+
+def purge_musicalkeycnn_cache(file_paths: list[str] | None = None) -> int:
+    deleted = 0
+    try:
+        with PersistentInferenceCache(resolve_inference_cache_path()) as cache:
+            deleted = cache.purge(backend=KEY_BACKEND_MUSICALKEYCNN, file_paths=file_paths)
+    except Exception:
+        deleted = 0
+    remove_docker_container(resolve_musicalkeycnn_service_name(None))
+    return deleted
+
+
 def estimate_musicalkeycnn_keys(
     track_paths: list[Path | str],
     *,
@@ -407,6 +528,16 @@ def estimate_musicalkeycnn_keys(
     resolved_image_name = resolve_musicalkeycnn_image_name(image_name)
     normalized_device = normalize_musicalkeycnn_device_choice(device)
     normalized_policy = normalize_musicalkeycnn_policy_choice(policy)
+    cached_estimates, cache_descriptors = load_cached_musicalkeycnn_estimates(
+        resolved_paths,
+        model_path=resolved_model_path,
+        device=normalized_device,
+        policy=normalized_policy,
+    )
+    pending_paths = [path for path in resolved_paths if path not in cached_estimates]
+    if not pending_paths:
+        return cached_estimates
+
     service_name = resolve_musicalkeycnn_service_name(None)
     service_port = resolve_musicalkeycnn_service_port(None)
 
@@ -417,45 +548,47 @@ def estimate_musicalkeycnn_keys(
         ]
         return {
             path: build_musicalkeycnn_unavailable_estimate(elapsed_ms=None, notes=notes)
-            for path in resolved_paths
+            for path in pending_paths
         }
 
     started = time.perf_counter()
-    container_track_paths = {path: windows_path_to_container_path(path) for path in resolved_paths}
+    container_track_paths = {path: windows_path_to_container_path(path) for path in pending_paths}
     service_ready, startup_notes = ensure_musicalkeycnn_service(
         model_path=resolved_model_path,
         image_name=resolved_image_name,
         device=normalized_device,
         service_name=service_name,
         service_port=service_port,
-        drive_letters=[path.drive.rstrip(":").lower() for path in [*resolved_paths, resolved_model_path]],
+        drive_letters=[path.drive.rstrip(":").lower() for path in [*pending_paths, resolved_model_path]],
     )
     if not service_ready:
-        return {
+        uncached_unavailable = {
             path: build_musicalkeycnn_unavailable_estimate(elapsed_ms=None, notes=startup_notes)
-            for path in resolved_paths
+            for path in pending_paths
         }
+        return {**cached_estimates, **uncached_unavailable}
 
     service_payload, request_notes = request_musicalkeycnn_service(
         service_port=service_port,
-        track_paths=[container_track_paths[path] for path in resolved_paths],
+        track_paths=[container_track_paths[path] for path in pending_paths],
         model_path=(
             container_path_for_model(resolved_model_path)[1]
         ),
         device=normalized_device,
         policy=normalized_policy,
     )
-    elapsed_ms = round((time.perf_counter() - started) * 1000.0 / max(len(resolved_paths), 1), 1)
+    elapsed_ms = round((time.perf_counter() - started) * 1000.0 / max(len(pending_paths), 1), 1)
     if service_payload is None:
         notes = [*startup_notes, *request_notes]
-        return {
+        uncached_unavailable = {
             path: build_musicalkeycnn_unavailable_estimate(elapsed_ms=elapsed_ms, notes=notes)
-            for path in resolved_paths
+            for path in pending_paths
         }
+        return {**cached_estimates, **uncached_unavailable}
 
     results_by_track = {str(item.get("track_path")): item for item in service_payload.get("results", [])}
     estimates: dict[Path, KeyEstimate] = {}
-    for path in resolved_paths:
+    for path in pending_paths:
         item = results_by_track.get(container_track_paths[path])
         if item is None:
             estimates[path] = build_musicalkeycnn_unavailable_estimate(
@@ -482,9 +615,10 @@ def estimate_musicalkeycnn_keys(
             device=normalized_device,
             policy=normalized_policy,
             notes=["Warm Docker service path."],
-            batch_size=len(resolved_paths),
+            batch_size=len(pending_paths),
         )
-    return estimates
+    persist_musicalkeycnn_estimates(estimates, cache_descriptors)
+    return {**cached_estimates, **estimates}
 
 
 def estimate_musicalkeycnn_key(

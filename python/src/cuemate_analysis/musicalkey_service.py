@@ -4,13 +4,14 @@ import json
 import os
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 from cuemate_analysis.musicalkey_runtime import (
     MUSICALKEYCNN_POLICY_BALANCED,
     detect_gpu_counts,
     load_model,
     normalize_policy_choice,
-    predict_key,
+    predict_keys,
     warm_pipeline,
 )
 
@@ -87,11 +88,36 @@ class MusicalKeyHandler(BaseHTTPRequestHandler):
             return
 
         results: list[dict[str, object]] = []
-        for track_path in track_paths:
-            try:
-                results.append(predict_key(model, runner_device, str(track_path), policy=normalized_policy))
-            except Exception as exc:
-                results.append({"track_path": str(track_path), "error": str(exc)})
+        try:
+            resolved_track_paths = [str(track_path) for track_path in track_paths]
+            cached_results: dict[str, dict[str, object]] = {}
+            missing_track_paths: list[str] = []
+            for track_path in resolved_track_paths:
+                cache_key = build_cache_key(model_path, normalized_policy, track_path)
+                cached = RESULT_CACHE.get(cache_key)
+                if cached is None:
+                    missing_track_paths.append(track_path)
+                    continue
+                cached_results[track_path] = dict(cached)
+
+            computed_results: dict[str, dict[str, object]] = {}
+            if missing_track_paths:
+                for item in predict_keys(model, runner_device, missing_track_paths, policy=normalized_policy):
+                    track_path = str(item.get("track_path") or "")
+                    computed_results[track_path] = item
+                    if "error" not in item and track_path:
+                        RESULT_CACHE[build_cache_key(model_path, normalized_policy, track_path)] = dict(item)
+
+            results = [
+                dict(cached_results.get(track_path) or computed_results.get(track_path) or {"track_path": track_path, "error": "missing_result"})
+                for track_path in resolved_track_paths
+            ]
+        except Exception:
+            for track_path in track_paths:
+                try:
+                    results.extend(predict_keys(model, runner_device, [str(track_path)], policy=normalized_policy))
+                except Exception as exc:
+                    results.append({"track_path": str(track_path), "error": str(exc)})
 
         self._send_json(
             HTTPStatus.OK,
@@ -103,6 +129,20 @@ class MusicalKeyHandler(BaseHTTPRequestHandler):
                 "results": results,
             },
         )
+
+
+RESULT_CACHE: dict[tuple[str, str, str, int, int], dict[str, object]] = {}
+
+
+def build_cache_key(model_path: str, policy: str, track_path: str) -> tuple[str, str, str, int, int]:
+    stat_result = Path(track_path).stat()
+    return (
+        model_path,
+        policy,
+        str(Path(track_path).resolve()),
+        int(stat_result.st_mtime_ns),
+        int(stat_result.st_size),
+    )
 
 
 def main() -> int:

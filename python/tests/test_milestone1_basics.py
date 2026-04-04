@@ -141,3 +141,38 @@ def test_resolve_key_with_backend_falls_back_to_tag_when_musicalkeycnn_is_unavai
 
     assert resolved["key"] == "8A"
     assert resolved["key_source"] == "tag_only_fallback"
+
+
+def test_resolve_key_prefers_high_confidence_musicalkeycnn_over_conflicting_tag() -> None:
+    resolved = resolve_key_with_backend(
+        ImportedTrack(
+            id="trk_test",
+            file_path=Path("D:/fake/track.wav"),
+            file_hash="hash",
+            title="Track",
+            artist="Artist",
+            genre=None,
+            duration_seconds=10.0,
+            bpm_tag=None,
+            key_tag="2A",
+        ),
+        np.zeros(22050, dtype=float),
+        22050,
+        key_backend="musicalkeycnn",
+        prefetched_musicalkeycnn_estimate=KeyEstimate(
+            backend="musicalkeycnn",
+            key="3A",
+            key_number=3,
+            key_letter="A",
+            confidence=0.78,
+            elapsed_ms=10.0,
+            details={"pitch": "A#", "mode": "minor"},
+            notes=[],
+            available=True,
+        ),
+    )
+
+    assert resolved["key"] == "3A"
+    assert resolved["key_source"] == "musicalkeycnn_override_tag"
+    assert resolved["key_tagged"] == "2A"
+    assert resolved["key_agreement"] == 0

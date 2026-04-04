@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,11 @@ import librosa
 
 from cuemate_analysis.analysis import detect_bpm
 from cuemate_analysis.config import RuntimeSettings
+from cuemate_analysis.persistent_inference_cache import (
+    ModelInferenceCacheEntry,
+    PersistentInferenceCache,
+    resolve_inference_cache_path,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -31,6 +37,7 @@ GPU_FALLBACK_MARKERS = (
     "nvidia-container-runtime",
     "unknown flag: --gpus",
 )
+TEMPOCNN_PERSISTED_CACHE_VERSION = "tempocnn-cache-v1"
 
 
 @dataclass(frozen=True)
@@ -345,7 +352,7 @@ def service_container_matches(
     return required_targets.issubset(targets)
 
 
-def wait_for_tempocnn_service_health(service_port: int, *, timeout_seconds: float = 20.0) -> tuple[bool, str]:
+def wait_for_tempocnn_service_health(service_port: int, *, timeout_seconds: float = 45.0) -> tuple[bool, str]:
     health_url = f"http://127.0.0.1:{service_port}/health"
     deadline = time.time() + timeout_seconds
     last_error = "service health check timed out"
@@ -507,6 +514,112 @@ def build_tempocnn_success_estimate(
     )
 
 
+def build_tempocnn_cache_descriptor(
+    track_path: Path,
+    *,
+    model_path: Path,
+    accelerator: str,
+) -> dict[str, object]:
+    stat_result = track_path.stat()
+    descriptor_payload = {
+        "version": TEMPOCNN_PERSISTED_CACHE_VERSION,
+        "track_path": track_path.resolve().as_posix(),
+        "file_mtime_ns": int(stat_result.st_mtime_ns),
+        "file_size": int(stat_result.st_size),
+        "model_path": model_path.resolve().as_posix(),
+        "accelerator": accelerator,
+    }
+    cache_key = hashlib.sha1(json.dumps(descriptor_payload, sort_keys=True).encode("utf-8")).hexdigest()
+    return {
+        "cache_key": cache_key,
+        "file_path": descriptor_payload["track_path"],
+        "file_mtime_ns": descriptor_payload["file_mtime_ns"],
+        "file_size": descriptor_payload["file_size"],
+        "model_signature": f"{TEMPOCNN_PERSISTED_CACHE_VERSION}:{model_path.name}:{accelerator}",
+    }
+
+
+def load_cached_tempocnn_estimates(
+    paths: list[Path],
+    *,
+    model_path: Path,
+    accelerator: str,
+) -> tuple[dict[Path, TempoEstimate], dict[Path, dict[str, object]]]:
+    if not paths:
+        return {}, {}
+    started = time.perf_counter()
+    descriptors = {
+        path: build_tempocnn_cache_descriptor(path, model_path=model_path, accelerator=accelerator)
+        for path in paths
+    }
+    try:
+        with PersistentInferenceCache(resolve_inference_cache_path()) as cache:
+            payloads = cache.fetch_payloads(
+                TEMPO_BACKEND_TEMPOCNN,
+                [str(item["cache_key"]) for item in descriptors.values()],
+            )
+    except Exception:
+        return {}, descriptors
+
+    elapsed_ms = round((time.perf_counter() - started) * 1000.0 / max(len(paths), 1), 1)
+    estimates: dict[Path, TempoEstimate] = {}
+    for path, descriptor in descriptors.items():
+        payload = payloads.get(str(descriptor["cache_key"]))
+        if payload is None:
+            continue
+        notes = ["Persistent inference cache hit.", *payload.get("notes", [])]
+        estimates[path] = TempoEstimate(
+            **{
+                **payload,
+                "elapsed_ms": elapsed_ms,
+                "notes": notes,
+            }
+        )
+    return estimates, descriptors
+
+
+def persist_tempocnn_estimates(
+    estimates: dict[Path, TempoEstimate],
+    descriptors: dict[Path, dict[str, object]],
+) -> None:
+    entries: list[ModelInferenceCacheEntry] = []
+    for path, estimate in estimates.items():
+        if not estimate.available or estimate.bpm is None:
+            continue
+        descriptor = descriptors.get(path)
+        if descriptor is None:
+            continue
+        entries.append(
+            ModelInferenceCacheEntry(
+                backend=TEMPO_BACKEND_TEMPOCNN,
+                cache_key=str(descriptor["cache_key"]),
+                file_path=str(descriptor["file_path"]),
+                file_mtime_ns=int(descriptor["file_mtime_ns"]),
+                file_size=int(descriptor["file_size"]),
+                model_signature=str(descriptor["model_signature"]),
+                payload=estimate.to_payload(),
+            )
+        )
+    if not entries:
+        return
+    try:
+        with PersistentInferenceCache(resolve_inference_cache_path()) as cache:
+            cache.upsert_entries(entries)
+    except Exception:
+        return
+
+
+def purge_tempocnn_cache(file_paths: list[str] | None = None) -> int:
+    deleted = 0
+    try:
+        with PersistentInferenceCache(resolve_inference_cache_path()) as cache:
+            deleted = cache.purge(backend=TEMPO_BACKEND_TEMPOCNN, file_paths=file_paths)
+    except Exception:
+        deleted = 0
+    remove_docker_container(resolve_tempocnn_service_name(None))
+    return deleted
+
+
 def estimate_tempocnn_bpms(
     paths: list[Path],
     *,
@@ -542,8 +655,17 @@ def estimate_tempocnn_bpms(
             for path in paths
         }
 
-    command, container_paths = build_tempocnn_batch_docker_command(
+    cached_estimates, cache_descriptors = load_cached_tempocnn_estimates(
         resolved_paths,
+        model_path=resolved_model_path,
+        accelerator=resolved_accelerator,
+    )
+    pending_paths = [path for path in resolved_paths if path not in cached_estimates]
+    if not pending_paths:
+        return cached_estimates
+
+    command, container_paths = build_tempocnn_batch_docker_command(
+        pending_paths,
         resolved_model_path,
         image_name=resolved_image_name,
         accelerator=resolved_accelerator,
@@ -557,11 +679,11 @@ def estimate_tempocnn_bpms(
             service_started = time.perf_counter()
             container_track_paths = {
                 path: windows_path_to_container_path(path)
-                for path in resolved_paths
+                for path in pending_paths
             }
             service_name = resolve_tempocnn_service_name(None)
             service_port = resolve_tempocnn_service_port(None)
-            drive_letters = [path.drive.rstrip(":").lower() for path in [*resolved_paths, resolved_model_path]]
+            drive_letters = [path.drive.rstrip(":").lower() for path in [*pending_paths, resolved_model_path]]
             service_ready, startup_notes = ensure_tempocnn_service(
                 drive_letters=drive_letters,
                 image_name=resolved_image_name,
@@ -572,7 +694,7 @@ def estimate_tempocnn_bpms(
             if service_ready:
                 service_payload, service_error_notes = request_tempocnn_service(
                     service_port=service_port,
-                    track_paths=[container_track_paths[path] for path in resolved_paths],
+                    track_paths=[container_track_paths[path] for path in pending_paths],
                     model_path=container_model_path,
                 )
                 if service_payload is not None:
@@ -582,16 +704,16 @@ def estimate_tempocnn_bpms(
                     batch_results = {
                         item.get("track_path"): item for item in service_payload.get("results", [])
                     }
-                    return {
+                    uncached_results = {
                         path: (
                             build_tempocnn_unavailable_estimate(
-                                elapsed_ms=service_elapsed_ms / max(len(resolved_paths), 1),
+                                elapsed_ms=service_elapsed_ms / max(len(pending_paths), 1),
                                 notes=["TempoCNN service did not return a result for this track."],
                             )
                             if batch_results.get(container_track_paths[path]) is None
                             else (
                                 build_tempocnn_unavailable_estimate(
-                                    elapsed_ms=service_elapsed_ms / max(len(resolved_paths), 1),
+                                    elapsed_ms=service_elapsed_ms / max(len(pending_paths), 1),
                                     notes=[f"TempoCNN service failed for this track: {batch_results[container_track_paths[path]]['error']}"],
                                 )
                                 if batch_results[container_track_paths[path]].get("error")
@@ -601,16 +723,18 @@ def estimate_tempocnn_bpms(
                                         "tf_physical_gpu_count": tf_physical_gpu_count,
                                         "tf_logical_gpu_count": tf_logical_gpu_count,
                                     },
-                                    elapsed_ms=service_elapsed_ms / max(len(resolved_paths), 1),
+                                    elapsed_ms=service_elapsed_ms / max(len(pending_paths), 1),
                                     model_path=resolved_model_path,
                                     image_name=resolved_image_name,
                                     notes=["Warm Docker service path."],
-                                    batch_size=len(resolved_paths),
+                                    batch_size=len(pending_paths),
                                 )
                             )
                         )
-                        for path in resolved_paths
+                        for path in pending_paths
                     }
+                    persist_tempocnn_estimates(uncached_results, cache_descriptors)
+                    return {**cached_estimates, **uncached_results}
                 service_notes.extend(service_error_notes)
             else:
                 service_notes.extend(startup_notes)
@@ -626,14 +750,14 @@ def estimate_tempocnn_bpms(
             and should_retry_on_cpu(completed.stderr)
         ):
             retry_command, retry_container_paths = build_tempocnn_batch_docker_command(
-                resolved_paths,
+                pending_paths,
                 resolved_model_path,
                 image_name=resolved_image_name,
                 accelerator="cpu",
             )
             completed = run_docker_command(
                 retry_command,
-                timeout=max(240, len(resolved_paths) * 30),
+                timeout=max(240, len(pending_paths) * 30),
             )
             container_paths = retry_container_paths
             fallback_note = "Docker GPU runtime was unavailable, so TempoCNN retried in CPU mode."
@@ -644,7 +768,7 @@ def estimate_tempocnn_bpms(
                 elapsed_ms=elapsed_ms,
                 notes=[f"TempoCNN Docker invocation failed: {exc}"],
             )
-            for path in resolved_paths
+            for path in pending_paths
         }
 
     elapsed_ms = round((time.perf_counter() - started) * 1000.0, 1)
@@ -657,16 +781,16 @@ def estimate_tempocnn_bpms(
                 elapsed_ms=elapsed_ms,
                 notes=notes,
             )
-            for path in resolved_paths
+            for path in pending_paths
         }
 
     tf_physical_gpu_count = payload.get("tf_physical_gpu_count")
     tf_logical_gpu_count = payload.get("tf_logical_gpu_count")
     batch_results = {item.get("track_path"): item for item in payload.get("results", [])}
-    per_track_elapsed_ms = round(elapsed_ms / max(len(resolved_paths), 1), 1)
+    per_track_elapsed_ms = round(elapsed_ms / max(len(pending_paths), 1), 1)
     result_map: dict[Path, TempoEstimate] = {}
 
-    for path in resolved_paths:
+    for path in pending_paths:
         container_track_path = container_paths[path]
         item = batch_results.get(container_track_path)
         if item is None:
@@ -689,17 +813,17 @@ def estimate_tempocnn_bpms(
         if fallback_note:
             item_notes.append(fallback_note)
         item_notes.extend(service_notes)
-        item_notes.append(f"Batch run size: {len(resolved_paths)} track(s).")
+        item_notes.append(f"Batch run size: {len(pending_paths)} track(s).")
         result_map[path] = build_tempocnn_success_estimate(
             item_payload,
             elapsed_ms=per_track_elapsed_ms,
             model_path=resolved_model_path,
             image_name=resolved_image_name,
             notes=item_notes,
-            batch_size=len(resolved_paths),
+            batch_size=len(pending_paths),
         )
-
-    return result_map
+    persist_tempocnn_estimates(result_map, cache_descriptors)
+    return {**cached_estimates, **result_map}
 
 
 def estimate_tempocnn_bpm(

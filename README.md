@@ -1,6 +1,6 @@
 # CueMate Engine
 
-CueMate Engine is a monorepo with a hard split between the Python analysis plane and the Go decision plane. The repository now includes the first Milestone 1 slice from the decision engine plan: local playlist import, absolute feature analysis on PC, and SQLite persistence. Scoring, relative features, windowed features, and the Go API are still deferred.
+CueMate Engine is a monorepo with a hard split between the Python analysis plane and the Go decision plane. The repository now includes the first Milestone 1 slice from the decision engine plan: local playlist import, absolute feature analysis on PC, and SQLite persistence.
 
 ## Repository layout
 
@@ -137,12 +137,31 @@ python -m cuemate_analysis analyze-bpm-playlist --playlist "Fred again"
 python -m cuemate_analysis analyze-bpm-playlist --playlist "Fred again" --limit 5 --output .\data\benchmarks\fred-again-bpm.csv
 ```
 
+Analyze just BPM + key with the production TempoCNN and MusicalKeyCNN workers:
+
+```powershell
+python -m cuemate_analysis analyze-bpm-key "D:\path\to\track.wav"
+python -m cuemate_analysis analyze-bpm-key-playlist --playlist "Fred again"
+python -m cuemate_analysis analyze-bpm-key-playlist --playlist "Fred again" --limit 5 --output .\data\benchmarks\fred-again-bpm-key.csv
+```
+
+Purge persisted TempoCNN and MusicalKeyCNN caches, and clear the warm service state so the next run is fully fresh:
+
+```powershell
+python -m cuemate_analysis purge-model-cache
+python -m cuemate_analysis purge-model-cache --backend tempocnn
+python -m cuemate_analysis purge-model-cache --playlist "Fred again"
+```
+
 Speed notes:
 
 - TempoCNN is now used for BPM only
 - MusicalKeyCNN is the primary key backend for playlist analysis
 - `analyze-bpm` and `analyze-bpm-playlist` are the intended BPM-only commands
+- `analyze-bpm-key` and `analyze-bpm-key-playlist` are the intended fast paths when you only want BPM + key
 - TempoCNN and MusicalKeyCNN both use warm Docker workers so repeated analysis avoids model cold starts
+- both warm workers now cache results for unchanged files, so rerunning the same BPM/key playlist pass is dramatically faster
+- those persistent caches live in `data/inference-cache.db` and can be purged on demand with `purge-model-cache`
 - playlist analysis batches TempoCNN and MusicalKeyCNN work so the models stay loaded
 - MusicalKeyCNN runs through its own warm Docker worker, separate from the TempoCNN BPM worker
 - the host-side analyzer still computes the remaining absolute features locally with `librosa`

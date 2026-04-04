@@ -36,3 +36,5 @@ go/coverage.out
 dist/
 build/
 tmp/
+data/*.db
+data/*.db-*

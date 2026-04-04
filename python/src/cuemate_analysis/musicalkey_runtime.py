@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+import os
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +27,7 @@ MUSICALKEYCNN_POLICY_CHOICES = {
     MUSICALKEYCNN_POLICY_BALANCED,
     MUSICALKEYCNN_POLICY_FULL_TRACK,
 }
+MUSICALKEYCNN_PREPROCESS_WORKERS = max(1, min(4, os.cpu_count() or 1))
 
 
 @dataclass(frozen=True)
@@ -328,20 +331,15 @@ def warm_pipeline(model: nn.Module, device: torch.device) -> None:
         _ = torch.softmax(logits, dim=1)
 
 
-def predict_key(
-    model: nn.Module,
-    device: torch.device,
+def build_prediction_payload(
     track_path: str | Path,
+    device: torch.device,
+    spec_tensor: torch.Tensor,
+    probabilities: torch.Tensor,
     *,
-    policy: str = MUSICALKEYCNN_POLICY_FULL_TRACK,
+    policy: str,
 ) -> dict[str, Any]:
-    normalized_policy = normalize_policy_choice(policy)
-    spec_tensor = preprocess_audio_for_policy(track_path, policy=normalized_policy).to(device)
-    with torch.no_grad():
-        logits = model(spec_tensor)
-        probabilities = torch.softmax(logits, dim=1).mean(dim=0, keepdim=True)
-        top_probabilities, top_indices = torch.topk(probabilities, k=2, dim=1)
-
+    top_probabilities, top_indices = torch.topk(probabilities, k=2, dim=1)
     top_index = int(top_indices[0, 0].item())
     second_index = int(top_indices[0, 1].item())
     top_probability = float(top_probabilities[0, 0].item())
@@ -364,8 +362,8 @@ def predict_key(
         "top_margin": top_margin,
         "runner_device": str(device),
         "sample_rate": MUSICALKEYCNN_SAMPLE_RATE,
-        "policy": normalized_policy,
-        "excerpt_seconds": None if normalized_policy == MUSICALKEYCNN_POLICY_FULL_TRACK else MUSICALKEYCNN_EXCERPT_SECONDS,
+        "policy": policy,
+        "excerpt_seconds": None if policy == MUSICALKEYCNN_POLICY_FULL_TRACK else MUSICALKEYCNN_EXCERPT_SECONDS,
         "excerpt_count": int(spec_tensor.shape[0]),
         "second_choice": {
             "class_index": second_info.class_index,
@@ -375,3 +373,61 @@ def predict_key(
             "probability": second_probability,
         },
     }
+
+
+def preprocess_tracks_for_policy(
+    track_paths: list[str | Path],
+    *,
+    policy: str,
+) -> list[tuple[str, torch.Tensor]]:
+    normalized_policy = normalize_policy_choice(policy)
+    worker_count = max(1, min(MUSICALKEYCNN_PREPROCESS_WORKERS, len(track_paths)))
+
+    def preprocess_one(track_path: str | Path) -> tuple[str, torch.Tensor]:
+        return (
+            Path(track_path).resolve().as_posix(),
+            preprocess_audio_for_policy(track_path, policy=normalized_policy),
+        )
+
+    if worker_count == 1:
+        return [preprocess_one(track_path) for track_path in track_paths]
+
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        return list(executor.map(preprocess_one, track_paths))
+
+
+def predict_keys(
+    model: nn.Module,
+    device: torch.device,
+    track_paths: list[str | Path],
+    *,
+    policy: str = MUSICALKEYCNN_POLICY_FULL_TRACK,
+) -> list[dict[str, Any]]:
+    normalized_policy = normalize_policy_choice(policy)
+    preprocessed_tracks = preprocess_tracks_for_policy(track_paths, policy=normalized_policy)
+    results: list[dict[str, Any]] = []
+
+    with torch.no_grad():
+        for resolved_track_path, spec_tensor in preprocessed_tracks:
+            logits = model(spec_tensor.to(device))
+            probabilities = torch.softmax(logits, dim=1).mean(dim=0, keepdim=True)
+            results.append(
+                build_prediction_payload(
+                    resolved_track_path,
+                    device,
+                    spec_tensor,
+                    probabilities,
+                    policy=normalized_policy,
+                )
+            )
+    return results
+
+
+def predict_key(
+    model: nn.Module,
+    device: torch.device,
+    track_path: str | Path,
+    *,
+    policy: str = MUSICALKEYCNN_POLICY_FULL_TRACK,
+) -> dict[str, Any]:
+    return predict_keys(model, device, [track_path], policy=policy)[0]

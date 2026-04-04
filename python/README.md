@@ -70,6 +70,9 @@ python -m cuemate_analysis analyze-playlist --playlist "My Playlist" --analysis-
 python -m cuemate_analysis analyze-playlist --playlist "My Playlist" --analysis-mode full --force
 python -m cuemate_analysis analyze-bpm "D:\path\to\track.wav"
 python -m cuemate_analysis analyze-bpm-playlist --playlist "My Playlist"
+python -m cuemate_analysis analyze-bpm-key "D:\path\to\track.wav"
+python -m cuemate_analysis analyze-bpm-key-playlist --playlist "My Playlist"
+python -m cuemate_analysis purge-model-cache
 python -m cuemate_analysis list-playlist --name "My Playlist"
 python -m cuemate_analysis show-track --track-id trk_example123
 ```
@@ -79,6 +82,7 @@ Important notes:
 - `tempocnn` is now the primary BPM backend used by `analyze-playlist`
 - `musicalkeycnn` is now the primary key backend used by `analyze-playlist`
 - `analyze-bpm` and `analyze-bpm-playlist` are the intended BPM-only commands
+- `analyze-bpm-key` and `analyze-bpm-key-playlist` are the intended fast paths when you only want BPM + key
 - if TempoCNN is unavailable for a track, analysis falls back to the current librosa baseline automatically and records `baseline_fallback` as the source
 - TempoCNN now runs through Docker and will try GPU before falling back to CPU
 - TempoCNN now handles BPM only; key extraction is no longer part of the TempoCNN container path
@@ -86,6 +90,8 @@ Important notes:
 - MusicalKeyCNN now defaults to `full_track`
 - if MusicalKeyCNN is unavailable for a track, analysis now falls back to a tagged key only when one exists
 - repeated requests now go through warm TempoCNN and MusicalKeyCNN service containers when possible
+- repeated requests for unchanged files are cached inside those warm services, so reruns are much faster than the first pass
+- those persistent model caches are also stored in `data/inference-cache.db`, and `purge-model-cache` clears both the persistent rows and the warm service state
 - playlist analysis batches TempoCNN tracks through the warm service so the model stays loaded
 - the default TempoCNN model shipped in the repo is `deepsquare-k16-3.pb`
 - the default MusicalKeyCNN checkpoint shipped in the local repo cache is `keynet.pt`

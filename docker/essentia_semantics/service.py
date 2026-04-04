@@ -20,7 +20,7 @@ TEMPO_RESULT_CACHE: dict[tuple[str, str, int, int], dict[str, object]] = {}
 SEMANTIC_RESULT_CACHE: dict[tuple[str, str, int, int, str], dict[str, object]] = {}
 TEMPO_AUDIO_WORKERS = max(1, min(4, os.cpu_count() or 1))
 SEMANTIC_AUDIO_WORKERS = max(1, min(4, os.cpu_count() or 1))
-SEMANTIC_INFERENCE_WORKERS = max(1, min(3, int(os.getenv("ESSENTIA_SEMANTIC_INFERENCE_WORKERS", "1"))))
+SEMANTIC_INFERENCE_WORKERS = max(1, min(3, int(os.getenv("ESSENTIA_SEMANTIC_INFERENCE_WORKERS", "2"))))
 SAMPLE_RATE = 16000
 TEMPO_SAMPLE_RATE = 11025
 MUSICNN_BATCH_SIZE = int(os.getenv("ESSENTIA_SEMANTIC_MUSICNN_BATCH_SIZE", "256"))
@@ -199,6 +199,18 @@ def load_semantic_audio(track_path: str):
     return es.MonoLoader(filename=track_path, sampleRate=SAMPLE_RATE, resampleQuality=4)()
 
 
+def load_semantic_excerpt(track_path: str, start_time: float, end_time: float):
+    safe_start = max(0.0, float(start_time))
+    safe_end = max(safe_start + 0.05, float(end_time))
+    return es.EasyLoader(
+        filename=track_path,
+        sampleRate=SAMPLE_RATE,
+        downmix="mix",
+        startTime=safe_start,
+        endTime=safe_end,
+    )()
+
+
 def aggregate_prediction(value: Any) -> np.ndarray:
     array = np.asarray(value, dtype=float)
     if array.ndim == 0:
@@ -324,6 +336,54 @@ def extract_peak_window(audio: np.ndarray, excerpt_seconds: float) -> np.ndarray
     return audio[best_start:best_start + excerpt_samples]
 
 
+def decode_middle_excerpt(track_path: str, duration_seconds: float | None, excerpt_seconds: float) -> np.ndarray:
+    if duration_seconds is None or duration_seconds <= 0:
+        return load_semantic_audio(track_path)
+    excerpt = max(0.05, float(excerpt_seconds))
+    if duration_seconds <= excerpt:
+        return load_semantic_excerpt(track_path, 0.0, duration_seconds)
+    start = max(0.0, (float(duration_seconds) - excerpt) / 2.0)
+    end = min(float(duration_seconds), start + excerpt)
+    return load_semantic_excerpt(track_path, start, end)
+
+
+def decode_window_by_ratio(
+    track_path: str,
+    duration_seconds: float | None,
+    *,
+    start_ratio: float,
+    excerpt_seconds: float,
+) -> np.ndarray:
+    if duration_seconds is None or duration_seconds <= 0:
+        return load_semantic_audio(track_path)
+    excerpt = max(0.05, float(excerpt_seconds))
+    total = float(duration_seconds)
+    if total <= excerpt:
+        return load_semantic_excerpt(track_path, 0.0, total)
+    max_start = max(total - excerpt, 0.0)
+    start = max(0.0, min(max_start, float(start_ratio) * max_start))
+    end = min(total, start + excerpt)
+    return load_semantic_excerpt(track_path, start, end)
+
+
+def decode_peak_excerpt(
+    track_path: str,
+    duration_seconds: float | None,
+    peak_time_ratio: float | None,
+    excerpt_seconds: float,
+) -> np.ndarray:
+    if duration_seconds is None or duration_seconds <= 0 or peak_time_ratio is None:
+        return decode_middle_excerpt(track_path, duration_seconds, excerpt_seconds)
+    excerpt = max(0.05, float(excerpt_seconds))
+    total = float(duration_seconds)
+    if total <= excerpt:
+        return load_semantic_excerpt(track_path, 0.0, total)
+    peak_time = max(0.0, min(total, float(peak_time_ratio) * total))
+    start = max(0.0, min(total - excerpt, peak_time - (excerpt / 2.0)))
+    end = min(total, start + excerpt)
+    return load_semantic_excerpt(track_path, start, end)
+
+
 def weighted_average_samples(samples: list[tuple[float, dict[str, float]]]) -> dict[str, float]:
     total_weight = sum(weight for weight, _ in samples) or 1.0
     keys = samples[0][1].keys()
@@ -333,8 +393,11 @@ def weighted_average_samples(samples: list[tuple[float, dict[str, float]]]) -> d
     }
 
 
-def analyze_semantic_audio(bundle, track_path: str, semantic_audio: np.ndarray, auxiliary: dict[str, float | None], request_cfg: dict[str, float]) -> dict[str, object]:
-    middle = analyze_semantic_segment(bundle, track_path, extract_center_excerpt(semantic_audio, request_cfg["default_excerpt_seconds"]))
+def analyze_semantic_audio(bundle, track_path: str, auxiliary: dict[str, float | None], request_cfg: dict[str, float]) -> dict[str, object]:
+    duration_seconds = auxiliary.get("duration_seconds")
+    peak_time_ratio = auxiliary.get("peak_time_ratio")
+    middle_audio = decode_middle_excerpt(track_path, duration_seconds, request_cfg["default_excerpt_seconds"])
+    middle = analyze_semantic_segment(bundle, track_path, middle_audio)
     semantic_confidence = estimate_semantic_confidence(middle)
     semantic_fused = compute_fused_proxy(middle, auxiliary)
     triggers: list[str] = []
@@ -353,10 +416,10 @@ def analyze_semantic_audio(bundle, track_path: str, semantic_audio: np.ndarray, 
     if triggers:
         multisample_seconds = request_cfg["multisample_excerpt_seconds"]
         samples = [
-            (0.15, analyze_semantic_segment(bundle, track_path, extract_window(semantic_audio, 0.0, multisample_seconds))),
-            (0.40, analyze_semantic_segment(bundle, track_path, extract_center_excerpt(semantic_audio, multisample_seconds))),
-            (0.30, analyze_semantic_segment(bundle, track_path, extract_peak_window(semantic_audio, multisample_seconds))),
-            (0.15, analyze_semantic_segment(bundle, track_path, extract_window(semantic_audio, 1.0, multisample_seconds))),
+            (0.15, analyze_semantic_segment(bundle, track_path, decode_window_by_ratio(track_path, duration_seconds, start_ratio=0.0, excerpt_seconds=multisample_seconds))),
+            (0.40, analyze_semantic_segment(bundle, track_path, decode_middle_excerpt(track_path, duration_seconds, multisample_seconds))),
+            (0.30, analyze_semantic_segment(bundle, track_path, decode_peak_excerpt(track_path, duration_seconds, peak_time_ratio, multisample_seconds))),
+            (0.15, analyze_semantic_segment(bundle, track_path, decode_window_by_ratio(track_path, duration_seconds, start_ratio=1.0, excerpt_seconds=multisample_seconds))),
         ]
         averaged = weighted_average_samples(samples)
         return {
@@ -383,10 +446,35 @@ def build_tempo_cache_key(model_path: str, track_path: str) -> tuple[str, str, i
     return (model_path, str(Path(track_path).resolve()), int(stat_result.st_mtime_ns), int(stat_result.st_size))
 
 
-def build_semantic_cache_key(model_root: str, family_policy: str, track_path: str, sampling_mode: str) -> tuple[str, str, int, int, str]:
+def semantic_request_fingerprint(request_cfg: dict[str, float]) -> str:
+    payload = {
+        "default_excerpt_seconds": float(request_cfg["default_excerpt_seconds"]),
+        "multisample_excerpt_seconds": float(request_cfg["multisample_excerpt_seconds"]),
+        "mismatch_threshold": float(request_cfg["mismatch_threshold"]),
+        "confidence_threshold": float(request_cfg["confidence_threshold"]),
+        "structure_rms_cv_threshold": float(request_cfg["structure_rms_cv_threshold"]),
+        "outlier_zscore_threshold": float(request_cfg["outlier_zscore_threshold"]),
+    }
+    return hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+
+
+def build_semantic_cache_key(
+    model_root: str,
+    family_policy: str,
+    track_path: str,
+    sampling_mode: str,
+    request_cfg: dict[str, float],
+) -> tuple[str, str, int, int, str]:
     stat_result = Path(track_path).stat()
     artifact_fingerprint = fingerprint_model_artifacts(model_root)
-    return (artifact_fingerprint, str(Path(track_path).resolve()), int(stat_result.st_mtime_ns), int(stat_result.st_size), f"{family_policy}:{sampling_mode}")
+    request_fingerprint = semantic_request_fingerprint(request_cfg)
+    return (
+        artifact_fingerprint,
+        str(Path(track_path).resolve()),
+        int(stat_result.st_mtime_ns),
+        int(stat_result.st_size),
+        f"{family_policy}:{sampling_mode}:{request_fingerprint}",
+    )
 
 
 def analyze_tempo_tracks(model, track_paths: list[str]) -> list[dict[str, object]]:
@@ -423,52 +511,90 @@ def analyze_semantic_tracks(
     auxiliary_features_by_track: dict[str, dict[str, float | None]],
     request_cfg: dict[str, float],
 ) -> list[dict[str, object]]:
-    worker_count = max(1, min(SEMANTIC_AUDIO_WORKERS, len(track_paths)))
-
-    def load_one(track_path: str):
-        try:
-            return track_path, load_semantic_audio(track_path), None
-        except Exception as exc:
-            return track_path, None, str(exc)
-
-    if worker_count == 1:
-        loaded = [load_one(track_path) for track_path in track_paths]
-    else:
-        loaded = list(AUDIO_LOAD_EXECUTOR.map(load_one, track_paths))
-
     results: list[dict[str, object]] = []
-    pending: list[tuple[str, np.ndarray]] = []
-    for track_path, semantic_audio, load_error in loaded:
-        if load_error is not None or semantic_audio is None:
-            results.append({"track_path": track_path, "error": load_error or "audio_load_failed"})
-            continue
-        pending.append((track_path, semantic_audio))
-    if not pending:
-        return results
+    pending = list(track_paths)
 
-    bundle = load_thread_bundle(model_root, family_policy)
-
-    for track_path, semantic_audio in pending:
-        auxiliary = dict(auxiliary_features_by_track.get(track_path, {}) or {})
-        cache_key = build_semantic_cache_key(model_root, family_policy, track_path, "adaptive")
+    cached_by_track: dict[str, dict[str, object]] = {}
+    pending_uncached: list[str] = []
+    for track_path in pending:
+        cache_key = build_semantic_cache_key(
+            model_root,
+            family_policy,
+            track_path,
+            "adaptive",
+            request_cfg,
+        )
         cached = SEMANTIC_RESULT_CACHE.get(cache_key)
         if cached is not None:
-            results.append(dict(cached))
+            cached_by_track[track_path] = dict(cached)
             continue
-        try:
-            payload = analyze_semantic_audio(bundle, track_path, semantic_audio, auxiliary, request_cfg)
-            payload.update(
-                {
-                    "family_map": dict(bundle["family_map"]),
-                    "runner_device": bundle["runner_device"],
-                    "tf_physical_gpu_count": bundle["tf_physical_gpu_count"],
-                    "tf_logical_gpu_count": bundle["tf_logical_gpu_count"],
-                }
-            )
-            SEMANTIC_RESULT_CACHE[cache_key] = dict(payload)
-            results.append(payload)
-        except Exception as exc:
-            results.append({"track_path": track_path, "error": str(exc)})
+        pending_uncached.append(track_path)
+
+    def analyze_one(track_path: str) -> dict[str, object]:
+        bundle = load_thread_bundle(model_root, family_policy)
+        auxiliary = dict(auxiliary_features_by_track.get(track_path, {}) or {})
+        payload = analyze_semantic_audio(bundle, track_path, auxiliary, request_cfg)
+        payload.update(
+            {
+                "family_map": dict(bundle["family_map"]),
+                "runner_device": bundle["runner_device"],
+                "tf_physical_gpu_count": bundle["tf_physical_gpu_count"],
+                "tf_logical_gpu_count": bundle["tf_logical_gpu_count"],
+            }
+        )
+        cache_key = build_semantic_cache_key(
+            model_root,
+            family_policy,
+            track_path,
+            "adaptive",
+            request_cfg,
+        )
+        SEMANTIC_RESULT_CACHE[cache_key] = dict(payload)
+        return payload
+
+    computed_by_track: dict[str, dict[str, object]] = {}
+    if pending_uncached:
+        inference_worker_count = max(1, min(SEMANTIC_INFERENCE_WORKERS, len(pending_uncached)))
+        if inference_worker_count == 1:
+            computed_payloads = []
+            for item in pending_uncached:
+                try:
+                    computed_payloads.append(analyze_one(item))
+                except Exception as exc:
+                    computed_payloads.append({"track_path": item, "error": str(exc)})
+        else:
+            computed_payloads = []
+            futures = [INFERENCE_EXECUTOR.submit(analyze_one, item) for item in pending_uncached]
+            for future, item in zip(futures, pending_uncached):
+                try:
+                    computed_payloads.append(future.result())
+                except Exception as exc:
+                    computed_payloads.append({"track_path": item, "error": str(exc)})
+        computed_by_track = {str(item.get("track_path")): item for item in computed_payloads}
+
+    mode_counts: dict[str, int] = {}
+    trigger_counts: dict[str, int] = {}
+    for payload in computed_by_track.values():
+        if "error" in payload:
+            continue
+        mode = str(payload.get("sampling_mode") or "unknown")
+        mode_counts[mode] = mode_counts.get(mode, 0) + 1
+        for trigger in payload.get("sampling_triggers") or []:
+            clean = str(trigger)
+            trigger_counts[clean] = trigger_counts.get(clean, 0) + 1
+
+    for track_path in pending:
+        item = cached_by_track.get(track_path) or computed_by_track.get(track_path)
+        if item is None:
+            results.append({"track_path": track_path, "error": "missing_result"})
+            continue
+        if "error" not in item:
+            item = {
+                **item,
+                "batch_sampling_mode_counts": dict(mode_counts),
+                "batch_sampling_trigger_counts": dict(trigger_counts),
+            }
+        results.append(item)
     return results
 
 

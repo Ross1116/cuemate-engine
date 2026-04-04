@@ -10,6 +10,7 @@ from pathlib import Path
 import sqlite3
 import sys
 import time
+import numpy as np
 
 from cuemate_analysis.analysis import (
     DspLaneResult,
@@ -193,6 +194,17 @@ def print_backend_diagnostics(label: str, estimates: list[object], *, requested_
     ]
     runner_devices = sorted({device for estimate in estimates if (device := estimate_runner_device(estimate))})
     gpu_summaries = sorted({summary for estimate in estimates if (summary := estimate_gpu_summary(estimate))})
+    sampling_mode_counts: dict[str, int] = {}
+    sampling_trigger_counts: dict[str, int] = {}
+    for estimate in estimates:
+        details = getattr(estimate, "details", {}) or {}
+        mode = details.get("sampling_mode")
+        if mode:
+            clean_mode = str(mode)
+            sampling_mode_counts[clean_mode] = sampling_mode_counts.get(clean_mode, 0) + 1
+        for trigger in details.get("sampling_triggers") or []:
+            clean_trigger = str(trigger)
+            sampling_trigger_counts[clean_trigger] = sampling_trigger_counts.get(clean_trigger, 0) + 1
 
     print(f"{label} diagnostics:")
     if requested_device:
@@ -205,6 +217,14 @@ def print_backend_diagnostics(label: str, estimates: list[object], *, requested_
         print(f"- runner_device(s): {', '.join(runner_devices)}")
     for summary in gpu_summaries:
         print(f"- {summary}")
+    if sampling_mode_counts:
+        mode_summary = ", ".join(f"{name}={count}" for name, count in sorted(sampling_mode_counts.items()))
+        print(f"- sampling_modes: {mode_summary}")
+    if sampling_trigger_counts:
+        trigger_summary = ", ".join(
+            f"{name}={count}" for name, count in sorted(sampling_trigger_counts.items())
+        )
+        print(f"- sampling_triggers: {trigger_summary}")
 
 
 def build_bpm_payload(path: Path, metadata, estimate: TempoEstimate) -> dict[str, object]:
@@ -376,6 +396,7 @@ def build_essentia_auxiliary_features_by_path(
     paths: list[Path] = []
     proxy_values: dict[Path, float] = {}
     structure_values: dict[Path, float] = {}
+    peak_time_ratios: dict[Path, float] = {}
     for item in items:
         row = item.row if isinstance(item, PreparedTrack) else item
         path = (item.resolved_path if isinstance(item, PreparedTrack) else Path(row["file_path"]).resolve())
@@ -390,11 +411,14 @@ def build_essentia_auxiliary_features_by_path(
         dsp_result = (dsp_results or {}).get(path)
         loudness_norm = optional_value("loudness_norm")
         bass_abs = optional_value("bass_abs")
+        duration_seconds = optional_value("duration_seconds")
         if dsp_result is not None and dsp_result.available:
             if loudness_norm is None and dsp_result.loudness is not None:
                 loudness_norm = dsp_result.loudness.get("loudness_norm")
             if bass_abs is None:
                 bass_abs = dsp_result.bass_abs
+            if duration_seconds is None and dsp_result.artifacts is not None:
+                duration_seconds = dsp_result.artifacts.duration_seconds
             if dsp_result.energy is not None and dsp_result.loudness is not None:
                 proxy_values[path] = float(
                     (0.75 * float(dsp_result.energy.get("energy_abs", 0.0)))
@@ -402,15 +426,31 @@ def build_essentia_auxiliary_features_by_path(
                     + (0.10 * float(dsp_result.bass_abs or 0.0))
                 )
             if dsp_result.artifacts is not None and dsp_result.artifacts.rms.size:
-                rms_mean = float(dsp_result.artifacts.rms.mean())
-                if rms_mean > 1e-9:
-                    structure_values[path] = float(dsp_result.artifacts.rms.std() / rms_mean)
+                # Use coarse section-level RMS variation instead of frame-level jitter.
+                # Frame-level CV fires on almost every energetic rhythmic track and
+                # makes adaptive semantics effectively multisample-by-default.
+                section_frames = max(
+                    8,
+                    int(round((3.0 * float(dsp_result.artifacts.sr)) / float(dsp_result.artifacts.hop_length))),
+                )
+                rms = dsp_result.artifacts.rms
+                pad = (-len(rms)) % section_frames
+                coarse = np.pad(rms, (0, pad), mode="edge") if pad else rms
+                coarse = coarse.reshape(-1, section_frames).mean(axis=1)
+                coarse_mean = float(coarse.mean())
+                if coarse_mean > 1e-9:
+                    structure_values[path] = float(coarse.std() / coarse_mean)
+                if dsp_result.artifacts.duration_seconds > 1e-9:
+                    coarse_index = int(np.argmax(coarse))
+                    coarse_count = max(len(coarse), 1)
+                    peak_time_ratios[path] = float((coarse_index + 0.5) / coarse_count)
 
         auxiliary_features_by_path[path] = {
             "loudness_norm": loudness_norm,
             "drums_abs": optional_value("drums_abs"),
             "groove_abs": optional_value("groove_abs"),
             "bass_abs": bass_abs,
+            "duration_seconds": duration_seconds,
         }
 
     if proxy_values:
@@ -420,6 +460,7 @@ def build_essentia_auxiliary_features_by_path(
         for path, payload in auxiliary_features_by_path.items():
             payload["dsp_proxy_energy"] = proxy_values.get(path)
             payload["structure_rms_cv"] = structure_values.get(path)
+            payload["peak_time_ratio"] = peak_time_ratios.get(path)
             value = proxy_values.get(path)
             if value is not None and proxy_std > 1e-9:
                 payload["playlist_outlier_score"] = abs(value - proxy_mean) / proxy_std

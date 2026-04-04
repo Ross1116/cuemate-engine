@@ -584,6 +584,7 @@ def build_essentia_semantic_cache_descriptor(
     model_signature: str,
     device: str,
     family_policy: str,
+    request_settings_signature: str,
 ) -> dict[str, object]:
     stat_result = track_path.stat()
     descriptor_payload = {
@@ -594,6 +595,7 @@ def build_essentia_semantic_cache_descriptor(
         "model_signature": model_signature,
         "device": device,
         "family_policy": family_policy,
+        "request_settings_signature": request_settings_signature,
     }
     cache_key = hashlib.sha1(json.dumps(descriptor_payload, sort_keys=True).encode("utf-8")).hexdigest()
     return {
@@ -601,8 +603,31 @@ def build_essentia_semantic_cache_descriptor(
         "file_path": descriptor_payload["track_path"],
         "file_mtime_ns": descriptor_payload["file_mtime_ns"],
         "file_size": descriptor_payload["file_size"],
-        "model_signature": f"{ESSENTIA_SEMANTIC_CACHE_VERSION}:{model_signature}:{device}:{family_policy}",
+        "model_signature": (
+            f"{ESSENTIA_SEMANTIC_CACHE_VERSION}:{model_signature}:{device}:"
+            f"{family_policy}:{request_settings_signature}"
+        ),
     }
+
+
+def build_essentia_semantic_request_settings_signature(
+    *,
+    default_excerpt_seconds: float,
+    multisample_excerpt_seconds: float,
+    mismatch_threshold: float,
+    confidence_threshold: float,
+    structure_rms_cv_threshold: float,
+    outlier_zscore_threshold: float,
+) -> str:
+    payload = {
+        "default_excerpt_seconds": float(default_excerpt_seconds),
+        "multisample_excerpt_seconds": float(multisample_excerpt_seconds),
+        "mismatch_threshold": float(mismatch_threshold),
+        "confidence_threshold": float(confidence_threshold),
+        "structure_rms_cv_threshold": float(structure_rms_cv_threshold),
+        "outlier_zscore_threshold": float(outlier_zscore_threshold),
+    }
+    return hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:12]
 
 
 def load_cached_essentia_semantic_estimates(
@@ -611,12 +636,19 @@ def load_cached_essentia_semantic_estimates(
     model_signature: str,
     device: str,
     family_policy: str,
+    request_settings_signature: str,
 ) -> tuple[dict[Path, EssentiaSemanticEstimate], dict[Path, dict[str, object]]]:
     if not paths:
         return {}, {}
     started = time.perf_counter()
     descriptors = {
-        path: build_essentia_semantic_cache_descriptor(path, model_signature=model_signature, device=device, family_policy=family_policy)
+        path: build_essentia_semantic_cache_descriptor(
+            path,
+            model_signature=model_signature,
+            device=device,
+            family_policy=family_policy,
+            request_settings_signature=request_settings_signature,
+        )
         for path in paths
     }
     try:
@@ -713,6 +745,14 @@ def estimate_essentia_semantic_batch(
     resolved_image_name = resolve_essentia_semantic_image_name(image_name)
     normalized_device = normalize_essentia_semantic_device_choice(device)
     normalized_family_policy = normalize_essentia_semantic_family_policy(family_policy)
+    request_settings_signature = build_essentia_semantic_request_settings_signature(
+        default_excerpt_seconds=default_excerpt_seconds,
+        multisample_excerpt_seconds=multisample_excerpt_seconds,
+        mismatch_threshold=mismatch_threshold,
+        confidence_threshold=confidence_threshold,
+        structure_rms_cv_threshold=structure_rms_cv_threshold,
+        outlier_zscore_threshold=outlier_zscore_threshold,
+    )
     manifest = build_essentia_semantic_model_manifest(resolved_model_root, family_policy=normalized_family_policy)
     try:
         model_signature = build_essentia_semantic_manifest_signature(manifest, device=normalized_device)
@@ -725,6 +765,7 @@ def estimate_essentia_semantic_batch(
         model_signature=model_signature,
         device=normalized_device,
         family_policy=normalized_family_policy,
+        request_settings_signature=request_settings_signature,
     )
     pending_paths = [path for path in resolved_paths if path not in cached_estimates]
     if not pending_paths:

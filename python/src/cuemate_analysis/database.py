@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
 import sqlite3
 from typing import Any, Iterable
 
@@ -84,6 +85,15 @@ class Database:
                 "UPDATE playlists SET track_count = ?, updated_at = ? WHERE id = ?",
                 (count, timestamp, playlist_id),
             )
+            # Mark canonical relative state stale for this playlist (if a stats row exists).
+            self.connection.execute(
+                """
+                UPDATE playlist_stats
+                SET is_stale = 1, stale_reason = 'playlist_membership_changed', stale_marked_at = ?
+                WHERE playlist_id = ?
+                """,
+                (timestamp, playlist_id),
+            )
 
     def get_playlist(self, name: str) -> sqlite3.Row | None:
         return self.connection.execute(
@@ -142,6 +152,14 @@ class Database:
         ).fetchall()
 
     def get_table_columns(self, table_name: str) -> set[str]:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", table_name):
+            raise ValueError(f"Unsafe table name: {table_name}")
+        exists = self.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table_name,),
+        ).fetchone()
+        if exists is None:
+            return set()
         rows = self.connection.execute(f"PRAGMA table_info({table_name})").fetchall()
         return {str(row[1]) for row in rows}
 
@@ -384,6 +402,7 @@ class Database:
               f.key_tagged,
               f.key_agreement,
               f.energy_abs,
+              f.energy_heuristic_abs,
               f.energy_sustained,
               f.energy_peak,
               f.danceability_abs,
@@ -419,3 +438,139 @@ class Database:
         if row is None:
             return None
         return {key: row[key] for key in row.keys()}
+
+    # ------------------------------------------------------------------
+    # Canonical relative persistence (Phase 2)
+    # ------------------------------------------------------------------
+
+    def replace_canonical_relative_rows(
+        self,
+        playlist_id: str,
+        track_rows: list[dict[str, Any]],
+        stats_row: dict[str, Any],
+        timestamp: str,
+    ) -> None:
+        """Atomically replace all track_features_rel rows for a playlist and upsert playlist_stats."""
+        with self.connection:
+            self.connection.execute(
+                "DELETE FROM track_features_rel WHERE playlist_id = ?",
+                (playlist_id,),
+            )
+            for row in track_rows:
+                self.connection.execute(
+                    """
+                    INSERT INTO track_features_rel (
+                      playlist_id, track_id, position,
+                      energy_rel, bass_rel, drums_rel, vocals_rel, groove_rel,
+                      energy_spread, bass_spread, drums_spread, vocals_spread, groove_spread,
+                      intensity_band, intensity_membership, role_hints,
+                      valid_as_of_track_count,
+                      relative_signature, analysis_signature, config_signature,
+                      refreshed_at
+                    ) VALUES (
+                      :playlist_id, :track_id, :position,
+                      :energy_rel, :bass_rel, :drums_rel, :vocals_rel, :groove_rel,
+                      :energy_spread, :bass_spread, :drums_spread, :vocals_spread, :groove_spread,
+                      :intensity_band, :intensity_membership, :role_hints,
+                      :valid_as_of_track_count,
+                      :relative_signature, :analysis_signature, :config_signature,
+                      :refreshed_at
+                    )
+                    """,
+                    row,
+                )
+            self.connection.execute(
+                """
+                INSERT INTO playlist_stats (
+                  playlist_id,
+                  track_count_total, track_count_analyzed, eligible_track_count,
+                  energy_spread, bass_spread, drums_spread, vocals_spread,
+                  harmonic_spread, groove_spread,
+                  avg_harmonic, key_diversity, bpm_range,
+                  adapted_weights, adaptation_strength, weight_adaptation_notes,
+                  status, energy_source_used, relative_signature,
+                  refreshed_at, is_stale, stale_reason, stale_marked_at
+                ) VALUES (
+                  :playlist_id,
+                  :track_count_total, :track_count_analyzed, :eligible_track_count,
+                  :energy_spread, :bass_spread, :drums_spread, :vocals_spread,
+                  :harmonic_spread, :groove_spread,
+                  :avg_harmonic, :key_diversity, :bpm_range,
+                  :adapted_weights, :adaptation_strength, :weight_adaptation_notes,
+                  :status, :energy_source_used, :relative_signature,
+                  :refreshed_at, 0, NULL, NULL
+                )
+                ON CONFLICT(playlist_id) DO UPDATE SET
+                  track_count_total    = excluded.track_count_total,
+                  track_count_analyzed = excluded.track_count_analyzed,
+                  eligible_track_count = excluded.eligible_track_count,
+                  energy_spread    = excluded.energy_spread,
+                  bass_spread      = excluded.bass_spread,
+                  drums_spread     = excluded.drums_spread,
+                  vocals_spread    = excluded.vocals_spread,
+                  harmonic_spread  = excluded.harmonic_spread,
+                  groove_spread    = excluded.groove_spread,
+                  avg_harmonic     = excluded.avg_harmonic,
+                  key_diversity    = excluded.key_diversity,
+                  bpm_range        = excluded.bpm_range,
+                  adapted_weights         = excluded.adapted_weights,
+                  adaptation_strength     = excluded.adaptation_strength,
+                  weight_adaptation_notes = excluded.weight_adaptation_notes,
+                  status             = excluded.status,
+                  energy_source_used = excluded.energy_source_used,
+                  relative_signature = excluded.relative_signature,
+                  refreshed_at       = excluded.refreshed_at,
+                  is_stale           = 0,
+                  stale_reason       = NULL,
+                  stale_marked_at    = NULL
+                """,
+                stats_row,
+            )
+
+    def get_playlist_stats(self, playlist_id: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM playlist_stats WHERE playlist_id = ?",
+            (playlist_id,),
+        ).fetchone()
+
+    def get_persisted_relative_rows(self, playlist_id: str) -> list[sqlite3.Row]:
+        return self.connection.execute(
+            """
+            SELECT r.*, t.title, t.artist, t.file_path
+            FROM track_features_rel r
+            JOIN tracks t ON t.id = r.track_id
+            WHERE r.playlist_id = ?
+            ORDER BY r.position ASC
+            """,
+            (playlist_id,),
+        ).fetchall()
+
+    def get_playlists_containing_tracks(self, track_ids: Iterable[str]) -> list[str]:
+        """Return playlist_ids of all playlists that contain any of the given track_ids."""
+        ids = list(track_ids)
+        if not ids:
+            return []
+        placeholders = ", ".join("?" * len(ids))
+        rows = self.connection.execute(
+            f"SELECT DISTINCT playlist_id FROM playlist_tracks WHERE track_id IN ({placeholders})",
+            ids,
+        ).fetchall()
+        return [str(row[0]) for row in rows]
+
+    def mark_playlists_stale(
+        self,
+        playlist_ids: Iterable[str],
+        reason: str,
+        timestamp: str,
+    ) -> None:
+        """Mark playlist_stats rows stale. Playlists without a stats row are ignored (treated as needs-refresh)."""
+        with self.connection:
+            for playlist_id in playlist_ids:
+                self.connection.execute(
+                    """
+                    UPDATE playlist_stats
+                    SET is_stale = 1, stale_reason = ?, stale_marked_at = ?
+                    WHERE playlist_id = ?
+                    """,
+                    (reason, timestamp, playlist_id),
+                )

@@ -188,7 +188,22 @@ def _load_semantic_calibration(repo_root: Path) -> SemanticCalibrationSettings:
     )
 
 
-def _analysis_signature(config_signature: str, analysis_config: AnalysisSettings) -> str:
+def _serialize_semantic_calibration(calibration: SemanticCalibrationSettings) -> dict[str, Any]:
+    return {
+        "calibration_version": calibration.calibration_version,
+        "heads": {
+            head_name: {"offset": entry.offset, "scale": entry.scale}
+            for head_name, entry in sorted(calibration.heads.items())
+        },
+    }
+
+
+def _analysis_signature(
+    config_signature: str,
+    analysis_config: AnalysisSettings,
+    *,
+    semantic_calibration: SemanticCalibrationSettings,
+) -> str:
     payload = {
         "config_signature": config_signature,
         "seed": analysis_config.analysis_signature_seed,
@@ -204,6 +219,7 @@ def _analysis_signature(config_signature: str, analysis_config: AnalysisSettings
         "essentia_semantic_device": analysis_config.essentia_semantic_device,
         "essentia_semantic_model_family_policy": analysis_config.essentia_semantic_model_family_policy,
         "essentia_semantic_model_root": analysis_config.essentia_semantic_model_root,
+        "semantic_calibration": _serialize_semantic_calibration(semantic_calibration),
     }
     digest = hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
     return f"m1-{digest[:12]}"
@@ -214,6 +230,7 @@ def _relative_signature(
     thresholds: ThresholdSettings,
     scoring: ScoringSettings,
     weight_adaptation: WeightAdaptationSettings,
+    energy_source: str,
 ) -> str:
     payload = {
         "config_signature": config_signature,
@@ -223,6 +240,7 @@ def _relative_signature(
         "weight_floors": scoring.weight_floors,
         "weight_adaptation_mode": weight_adaptation.mode,
         "adaptation_strength": weight_adaptation.adaptation_strength,
+        "energy_source": energy_source,
     }
     digest = hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
     return f"m2exp-{digest[:12]}"
@@ -316,7 +334,11 @@ def load_runtime_settings(repo_root: Path | None = None) -> RuntimeSettings:
         database_path=database_path,
         database_url=database_url,
         config_signature=config_signature,
-        analysis_signature=_analysis_signature(config_signature, analysis_settings),
+        analysis_signature=_analysis_signature(
+            config_signature,
+            analysis_settings,
+            semantic_calibration=semantic_calibration,
+        ),
         analysis=analysis_settings,
         thresholds=thresholds,
         scoring=scoring,
@@ -325,10 +347,11 @@ def load_runtime_settings(repo_root: Path | None = None) -> RuntimeSettings:
     )
 
 
-def build_relative_experiment_signature(settings: RuntimeSettings) -> str:
+def build_relative_experiment_signature(settings: RuntimeSettings, *, energy_source: str = "canonical") -> str:
     return _relative_signature(
         settings.config_signature,
         settings.thresholds,
         settings.scoring,
         settings.weight_adaptation,
+        energy_source,
     )

@@ -4,4 +4,5 @@
 ALTER TABLE track_features_abs ADD COLUMN energy_heuristic_abs REAL;
 
 -- migrate:down
+-- Irreversible on SQLite without rebuilding track_features_abs.
 SELECT 1;

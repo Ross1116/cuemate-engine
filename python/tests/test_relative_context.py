@@ -179,6 +179,24 @@ def _load_relative_rows(database_path: Path, playlist_name: str):
     return rows
 
 
+def _settings_for_database(database_path: Path):
+    settings = load_runtime_settings()
+    return settings.__class__(
+        repo_root=settings.repo_root,
+        env_path=settings.env_path,
+        config_path=settings.config_path,
+        database_path=database_path,
+        database_url=f"sqlite:{database_path.as_posix()}",
+        config_signature=settings.config_signature,
+        analysis_signature=settings.analysis_signature,
+        analysis=settings.analysis,
+        thresholds=settings.thresholds,
+        scoring=settings.scoring,
+        weight_adaptation=settings.weight_adaptation,
+        semantic_calibration=settings.semantic_calibration,
+    )
+
+
 def test_robust_scale_handles_normal_and_zero_spread() -> None:
     assert robust_scale(0.5, 0.0, 1.0) == 0.5
     assert robust_scale(0.5, 0.5, 0.5) == 0.5
@@ -313,24 +331,7 @@ def test_relative_preview_can_use_essentia_fused_with_heuristic_fallback() -> No
 
 def test_cli_analyze_relative_playlist_json_and_csv(tmp_path: Path, monkeypatch, capsys) -> None:
     database_path = _create_relative_test_db(tmp_path, "CLI", 12)
-    settings = load_runtime_settings()
-    monkeypatch.setattr(
-        "cuemate_analysis.cli.load_runtime_settings",
-        lambda: settings.__class__(
-            repo_root=settings.repo_root,
-            env_path=settings.env_path,
-            config_path=settings.config_path,
-            database_path=database_path,
-            database_url=f"sqlite:{database_path.as_posix()}",
-            config_signature=settings.config_signature,
-            analysis_signature=settings.analysis_signature,
-            analysis=settings.analysis,
-            thresholds=settings.thresholds,
-            scoring=settings.scoring,
-            weight_adaptation=settings.weight_adaptation,
-            semantic_calibration=settings.semantic_calibration,
-        ),
-    )
+    monkeypatch.setattr("cuemate_analysis.cli.load_runtime_settings", lambda: _settings_for_database(database_path))
     output_path = tmp_path / "relative.csv"
 
     assert main(["analyze-relative-playlist", "--playlist", "CLI", "--json"]) == 0
@@ -343,3 +344,60 @@ def test_cli_analyze_relative_playlist_json_and_csv(tmp_path: Path, monkeypatch,
     csv_text = output_path.read_text(encoding="utf-8")
     assert "intensity_membership" in csv_text
     assert "role_hints" in csv_text
+
+
+def test_refresh_relative_playlist_persists_canonical_tables(tmp_path: Path, monkeypatch, capsys) -> None:
+    database_path = _create_relative_test_db(tmp_path, "Persisted", 12)
+    monkeypatch.setattr("cuemate_analysis.cli.load_runtime_settings", lambda: _settings_for_database(database_path))
+
+    assert main(["refresh-relative-playlist", "--playlist", "Persisted", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["playlist"] == "Persisted"
+    assert len(payload["tracks"]) == 12
+
+    connection = sqlite3.connect(database_path)
+    track_count = connection.execute("SELECT COUNT(*) FROM track_features_rel WHERE playlist_id = 'plt_test'").fetchone()[0]
+    stats_row = connection.execute(
+        "SELECT is_stale, energy_source_used, status FROM playlist_stats WHERE playlist_id = 'plt_test'"
+    ).fetchone()
+    connection.close()
+
+    assert track_count == 12
+    assert stats_row == (0, "canonical", "ok")
+
+
+def test_canonical_relative_auto_refreshes_when_missing(tmp_path: Path, monkeypatch, capsys) -> None:
+    database_path = _create_relative_test_db(tmp_path, "Auto", 12)
+    monkeypatch.setattr("cuemate_analysis.cli.load_runtime_settings", lambda: _settings_for_database(database_path))
+
+    assert main(["analyze-relative-playlist", "--playlist", "Auto", "--energy-source", "canonical", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["playlist_stats"]["status"] == "ok"
+
+    connection = sqlite3.connect(database_path)
+    persisted_count = connection.execute("SELECT COUNT(*) FROM track_features_rel WHERE playlist_id = 'plt_test'").fetchone()[0]
+    stats_row = connection.execute(
+        "SELECT is_stale FROM playlist_stats WHERE playlist_id = 'plt_test'"
+    ).fetchone()
+    connection.close()
+
+    assert persisted_count == 12
+    assert stats_row == (0,)
+
+
+def test_canonical_relative_reads_persisted_rows_when_current(tmp_path: Path, monkeypatch, capsys) -> None:
+    database_path = _create_relative_test_db(tmp_path, "Current", 12)
+    monkeypatch.setattr("cuemate_analysis.cli.load_runtime_settings", lambda: _settings_for_database(database_path))
+
+    assert main(["refresh-relative-playlist", "--playlist", "Current", "--json"]) == 0
+    capsys.readouterr()
+
+    def fail_if_recomputed(*args, **kwargs):
+        raise AssertionError("canonical path should have read persisted relative rows")
+
+    monkeypatch.setattr("cuemate_analysis.cli.compute_relative_playlist_preview", fail_if_recomputed)
+
+    assert main(["analyze-relative-playlist", "--playlist", "Current", "--energy-source", "canonical", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["playlist"] == "Current"
+    assert len(payload["tracks"]) == 12

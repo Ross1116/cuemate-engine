@@ -1,9 +1,11 @@
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from cuemate_analysis.essentia_semantic_backend import (
     build_essentia_semantic_manifest_signature,
     build_essentia_semantic_model_manifest,
     build_essentia_semantic_success_estimate,
+    service_container_matches,
+    windows_path_to_container_path,
 )
 
 
@@ -94,3 +96,31 @@ def test_success_estimate_leaves_fused_score_empty_when_primary_semantics_missin
 
     assert estimate.energy_essentia_fused is None
     assert estimate.energy_essentia_bucket is None
+
+
+def test_windows_path_to_container_path_preserves_posix_absolute_paths() -> None:
+    assert windows_path_to_container_path(PurePosixPath("/workspace/audio/test.wav")) == "/workspace/audio/test.wav"
+
+
+def test_service_container_matches_rejects_device_mismatch() -> None:
+    details = {
+        "State": {"Running": True},
+        "Config": {
+            "Image": "cuemate-essentia-semantics:local",
+            "Env": [
+                "CUEMATE_ESSENTIA_SEMANTIC_DEVICE=cpu",
+            ],
+        },
+        "Mounts": [
+            {"Destination": "/workspace"},
+            {"Destination": "/host/d"},
+        ],
+    }
+
+    assert service_container_matches(
+        details,
+        drive_letters=["d"],
+        image_name="cuemate-essentia-semantics:local",
+        requested_device="cuda",
+        requires_external_model_mount=False,
+    ) is False

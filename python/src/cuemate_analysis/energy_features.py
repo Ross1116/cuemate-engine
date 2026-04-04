@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import math
 
 import numpy as np
 
@@ -22,13 +23,17 @@ FEATURE_NAMES = [
 
 
 def clamp(value: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
-    return float(max(minimum, min(maximum, value)))
+    sanitized = _safe_float(value, fallback=minimum)
+    return float(max(minimum, min(maximum, sanitized)))
 
 
 def _safe_float(value: float | None, fallback: float = 0.5) -> float:
     if value is None:
         return fallback
-    return float(value)
+    numeric = float(value)
+    if not math.isfinite(numeric):
+        return fallback
+    return numeric
 
 
 @dataclass(frozen=True)

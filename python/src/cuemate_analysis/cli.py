@@ -17,7 +17,7 @@ from cuemate_analysis.analysis import (
     compute_dsp_lane_result,
     utc_now,
 )
-from cuemate_analysis.config import load_runtime_settings
+from cuemate_analysis.config import RuntimeSettings, load_runtime_settings
 from cuemate_analysis.database import Database
 from cuemate_analysis.dj_import import list_dj_playlists, load_dj_playlist
 from cuemate_analysis.essentia_semantic_backend import (
@@ -46,8 +46,10 @@ from cuemate_analysis.key_backend import (
 )
 from cuemate_analysis.persistent_inference_cache import resolve_inference_cache_path
 from cuemate_analysis.relative_context import (
+    RelativePlaylistPreview,
     compute_relative_playlist_preview,
     preview_to_json,
+    refresh_canonical_relative_playlist,
     row_to_relative_track_input,
 )
 from cuemate_analysis.tempo_backend import (
@@ -715,6 +717,27 @@ def build_parser() -> argparse.ArgumentParser:
              "'essentia_fused' is a deprecated alias for 'canonical'.",
     )
 
+    refresh_relative_playlist_parser = subparsers.add_parser(
+        "refresh-relative-playlist",
+        help="Refresh and persist canonical playlist-relative context for one playlist.",
+    )
+    refresh_relative_playlist_parser.add_argument("--playlist", required=True, help="Playlist name to refresh.")
+    refresh_relative_playlist_parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Optional output limit for the printed preview after refresh.",
+    )
+    refresh_relative_playlist_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit the refreshed relative-context payload as JSON.",
+    )
+    refresh_relative_playlist_parser.add_argument(
+        "--output",
+        help="Optional output path for a CSV report.",
+    )
+
     analyze_energy_playlist_parser = subparsers.add_parser(
         "analyze-energy-playlist",
         help="Compare experimental absolute-energy candidates for a playlist without persisting results.",
@@ -942,6 +965,8 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
 
         total = len(rows)
         processed = 0
+        playlist_id: str = str(rows[0]["playlist_id"]) if rows else ""
+        updated_track_ids: list[str] = []
         dsp_diagnostics: list[DspLaneResult] = []
         tempo_diagnostics: list[TempoEstimate] = []
         key_diagnostics: list[KeyEstimate] = []
@@ -1075,6 +1100,7 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
                     missing_lanes = [lane for lane, status in lane_status.items() if status == "failed"]
                     degraded = bool(missing_lanes)
                     database.upsert_track_features(result)
+                    updated_track_ids.append(track.id)
                     duration_seconds = round(time.perf_counter() - start_time, 3)
                     database.mark_analysis_job_completed(
                         job_id,
@@ -1113,6 +1139,38 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
             essentia_diagnostics,
             requested_device=settings.analysis.essentia_semantic_device,
         )
+
+    if args.analysis_mode == "full" and processed > 0 and playlist_id:
+        with Database(settings.database_path) as database:
+            # Refresh canonical relative rows for the analyzed playlist.
+            if hasattr(database, "get_playlist_relative_inputs"):
+                try:
+                    rel_rows = database.get_playlist_relative_inputs(playlist_name)
+                    rel_inputs = [row_to_relative_track_input(row) for row in rel_rows]
+                    refresh_canonical_relative_playlist(
+                        rel_inputs,
+                        settings,
+                        playlist_name=playlist_name,
+                        playlist_id=playlist_id,
+                        database=database,
+                        timestamp=utc_now(),
+                    )
+                    print(f"Refreshed canonical relative data for '{playlist_name}'.")
+                except Exception as exc:
+                    print(f"Warning: canonical relative refresh failed for '{playlist_name}': {exc}", file=sys.stderr)
+
+            # Mark all other playlists containing changed tracks as stale.
+            if (
+                updated_track_ids
+                and hasattr(database, "get_playlists_containing_tracks")
+                and hasattr(database, "mark_playlists_stale")
+            ):
+                linked = database.get_playlists_containing_tracks(updated_track_ids)
+                stale_targets = [pid for pid in linked if pid != playlist_id]
+                if stale_targets:
+                    database.mark_playlists_stale(stale_targets, "absolute_track_changed", utc_now())
+                    print(f"Marked {len(stale_targets)} linked playlist(s) stale.")
+
     return 0
 
 
@@ -1143,6 +1201,7 @@ def handle_show_track(args: argparse.Namespace) -> int:
             raise SystemExit(f"Track '{args.track_id}' was not found.")
     details["energy_summary"] = {
         "heuristic": details.get("energy_abs"),
+        "heuristic_legacy": details.get("energy_heuristic_abs"),
         "essentia_fused": details.get("energy_essentia_fused"),
         "essentia_bucket": details.get("energy_essentia_bucket"),
     }
@@ -1398,115 +1457,318 @@ def handle_analyze_bpm_key_playlist(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_canonical_relative_preview_and_print(
+    preview: "RelativePlaylistPreview",
+    *,
+    playlist_name: str,
+    energy_source: str,
+    args: argparse.Namespace,
+    abs_rows: list,
+) -> None:
+    """Print relative playlist results in text or JSON, shared by canonical and legacy paths."""
+    if args.json:
+        print(preview_to_json(preview))
+        return
+
+    stats = preview.playlist_stats
+    source_label = "persisted canonical" if energy_source == "canonical" else energy_source
+    print(
+        f"Playlist '{playlist_name}' relative-context :: "
+        f"status={stats.status} :: analyzed={stats.track_count_analyzed}/{stats.track_count_total} :: "
+        f"eligible={stats.eligible_track_count}"
+    )
+    print(f"Energy source: {source_label}")
+    print(f"Relative signature: {stats.relative_signature}")
+    if stats.adapted_weights is not None and stats.adaptation_strength is not None:
+        print(f"Adapted weights enabled :: adaptation_strength={stats.adaptation_strength:.2f}")
+    else:
+        print("Adapted weights skipped")
+    for note in stats.weight_adaptation_notes:
+        print(f"- {note}")
+    if energy_source == "canonical" and abs_rows:
+        essentia_count = sum(1 for row in abs_rows if row["energy_essentia_fused"] is not None)
+        if essentia_count:
+            print(f"Canonical energy diagnostics: essentia_fused_rows={essentia_count}/{len(abs_rows)}")
+    for track in preview.tracks:
+        title = track.title or Path(track.file_path).stem
+        print(
+            f"[{track.position}/{stats.track_count_total}] {title} :: "
+            f"energy_rel={track.energy_rel:.3f} :: {track.intensity_band} :: "
+            f"{', '.join(track.role_hints)}"
+        )
+
+
+def _write_relative_csv(preview: "RelativePlaylistPreview", output_path: Path, args: argparse.Namespace) -> None:
+    rows_for_csv: list[dict[str, object]] = []
+    for track in preview.tracks:
+        rows_for_csv.append(
+            {
+                "position": track.position,
+                "track_id": track.track_id,
+                "playlist_id": track.playlist_id,
+                "title": track.title,
+                "artist": track.artist,
+                "file_path": track.file_path,
+                "energy_rel": track.energy_rel,
+                "bass_rel": track.bass_rel,
+                "drums_rel": track.drums_rel,
+                "vocals_rel": track.vocals_rel,
+                "groove_rel": track.groove_rel,
+                "energy_spread": track.energy_spread,
+                "bass_spread": track.bass_spread,
+                "drums_spread": track.drums_spread,
+                "vocals_spread": track.vocals_spread,
+                "groove_spread": track.groove_spread,
+                "intensity_band": track.intensity_band,
+                "intensity_membership": json.dumps(track.intensity_membership, sort_keys=True),
+                "role_hints": json.dumps(track.role_hints),
+                "valid_as_of_track_count": track.valid_as_of_track_count,
+                "analysis_signature": track.analysis_signature,
+                "config_signature": track.config_signature,
+            }
+        )
+    fieldnames = list(rows_for_csv[0].keys()) if rows_for_csv else [
+        "position", "track_id", "playlist_id", "title", "artist", "file_path",
+        "energy_rel", "bass_rel", "drums_rel", "vocals_rel", "groove_rel",
+        "energy_spread", "bass_spread", "drums_spread", "vocals_spread", "groove_spread",
+        "intensity_band", "intensity_membership", "role_hints", "valid_as_of_track_count",
+        "analysis_signature", "config_signature",
+    ]
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows_for_csv)
+    if not args.json:
+        print(f"Wrote CSV report to {output_path}")
+
+
+def _limit_relative_preview(
+    preview: RelativePlaylistPreview,
+    *,
+    limit: int,
+) -> RelativePlaylistPreview:
+    if limit <= 0 or len(preview.tracks) <= limit:
+        return preview
+    return RelativePlaylistPreview(
+        playlist=preview.playlist,
+        playlist_id=preview.playlist_id,
+        is_limited=True,
+        limited_track_count=limit,
+        playlist_stats=preview.playlist_stats,
+        tracks=preview.tracks[:limit],
+    )
+
+
+def _refresh_canonical_relative_preview(
+    database: Database,
+    *,
+    playlist_name: str,
+    playlist_id: str,
+    settings: RuntimeSettings,
+    abs_rows: list,
+    announce_reason: str | None = None,
+    json_mode: bool = False,
+) -> RelativePlaylistPreview:
+    if announce_reason and not json_mode:
+        print(f"Refreshing canonical relative data ({announce_reason})...")
+    rel_inputs = [row_to_relative_track_input(row) for row in abs_rows]
+    return refresh_canonical_relative_playlist(
+        rel_inputs,
+        settings,
+        playlist_name=playlist_name,
+        playlist_id=playlist_id,
+        database=database,
+        timestamp=utc_now(),
+    )
+
+
 def handle_analyze_relative_playlist(args: argparse.Namespace) -> int:
     settings = load_runtime_settings()
-    with Database(settings.database_path) as database:
-        rows = database.get_playlist_relative_inputs(args.playlist)
-        if not rows:
-            raise SystemExit(f"Playlist '{args.playlist}' was not found.")
-
-    if args.limit and args.limit > 0:
-        rows = rows[: args.limit]
 
     energy_source = args.energy_source or settings.analysis.energy_source_default
-    # Normalize deprecated alias
+    # Normalize deprecated / legacy aliases
     if energy_source == "essentia_fused":
         energy_source = "canonical"
-    # Map old config value for backward compat
     if energy_source == "heuristic":
         energy_source = "heuristic_legacy"
 
-    preview = compute_relative_playlist_preview(
-        [row_to_relative_track_input(row) for row in rows],
-        settings,
+    with Database(settings.database_path) as database:
+        abs_rows = database.get_playlist_relative_inputs(args.playlist)
+        if not abs_rows:
+            raise SystemExit(f"Playlist '{args.playlist}' was not found.")
+
+        playlist_id = str(abs_rows[0]["playlist_id"])
+
+        if energy_source == "canonical":
+            # Persisted-first: check whether rows are current or stale.
+            stats_row = database.get_playlist_stats(playlist_id)
+            needs_refresh = (
+                stats_row is None
+                or bool(stats_row["is_stale"])
+            )
+            if needs_refresh:
+                reason = "missing" if stats_row is None else stats_row["stale_reason"]
+                preview = _refresh_canonical_relative_preview(
+                    database,
+                    playlist_name=args.playlist,
+                    playlist_id=playlist_id,
+                    settings=settings,
+                    abs_rows=abs_rows,
+                    announce_reason=reason,
+                    json_mode=args.json,
+                )
+            else:
+                # Read from persisted tables and reconstruct preview shape.
+                preview = _load_persisted_canonical_preview(
+                    database, args.playlist, playlist_id, abs_rows, settings
+                )
+            if args.limit and args.limit > 0:
+                preview = _limit_relative_preview(preview, limit=args.limit)
+        else:
+            # heuristic_legacy: always compute in-memory, never persist.
+            if args.limit and args.limit > 0:
+                abs_rows = abs_rows[: args.limit]
+            rel_inputs = [row_to_relative_track_input(row) for row in abs_rows]
+            preview = compute_relative_playlist_preview(
+                rel_inputs,
+                settings,
+                playlist_name=args.playlist,
+                is_limited=bool(args.limit and args.limit > 0),
+                energy_source="heuristic_legacy",
+            )
+
+    _run_canonical_relative_preview_and_print(
+        preview,
         playlist_name=args.playlist,
-        is_limited=bool(args.limit and args.limit > 0),
         energy_source=energy_source,
+        args=args,
+        abs_rows=abs_rows,
     )
 
-    if args.json:
-        print(preview_to_json(preview))
-    else:
-        stats = preview.playlist_stats
-        print(
-            f"Playlist '{args.playlist}' relative-context preview :: "
-            f"status={stats.status} :: analyzed={stats.track_count_analyzed}/{stats.track_count_total} :: "
-            f"eligible={stats.eligible_track_count}"
+    if args.output:
+        _write_relative_csv(preview, Path(args.output).expanduser().resolve(), args)
+
+    return 0
+
+
+def handle_refresh_relative_playlist(args: argparse.Namespace) -> int:
+    settings = load_runtime_settings()
+    with Database(settings.database_path) as database:
+        abs_rows = database.get_playlist_relative_inputs(args.playlist)
+        if not abs_rows:
+            raise SystemExit(f"Playlist '{args.playlist}' was not found.")
+        playlist_id = str(abs_rows[0]["playlist_id"])
+        preview = _refresh_canonical_relative_preview(
+            database,
+            playlist_name=args.playlist,
+            playlist_id=playlist_id,
+            settings=settings,
+            abs_rows=abs_rows,
+            announce_reason="manual_refresh",
+            json_mode=args.json,
         )
-        print("Relative scores are computed against the eligible analyzed tracks in this playlist slice.")
-        print(f"Energy source: {energy_source}")
-        print(f"Relative signature: {stats.relative_signature}")
-        if stats.adapted_weights is not None and stats.adaptation_strength is not None:
-            print(f"Adapted weights enabled :: adaptation_strength={stats.adaptation_strength:.2f}")
-        else:
-            print("Adapted weights skipped")
-        for note in stats.weight_adaptation_notes:
-            print(f"- {note}")
-        if energy_source == "canonical":
-            essentia_rows = [row for row in rows if row["energy_essentia_fused"] is not None]
-            if essentia_rows:
-                signatures = sorted({str(row["essentia_semantic_signature"]) for row in essentia_rows if row["essentia_semantic_signature"]})
-                sources = sorted({str(row["essentia_semantic_source"]) for row in essentia_rows if row["essentia_semantic_source"]})
-                print("Canonical energy diagnostics:")
-                print(f"- essentia_fused_rows: {len(essentia_rows)}/{len(rows)}")
-                if signatures:
-                    print(f"- semantic_signature(s): {', '.join(signatures)}")
-                if sources:
-                    print(f"- semantic_source(s): {', '.join(sources)}")
-        for track in preview.tracks:
-            title = track.title or Path(track.file_path).stem
-            print(
-                f"[{track.position}/{stats.track_count_total}] {title} :: "
-                f"energy_rel={track.energy_rel:.3f} ({track.energy_source_used}) :: {track.intensity_band} :: "
-                f"{', '.join(track.role_hints)}"
-            )
+
+    if args.limit and args.limit > 0:
+        preview = _limit_relative_preview(preview, limit=args.limit)
+
+    _run_canonical_relative_preview_and_print(
+        preview,
+        playlist_name=args.playlist,
+        energy_source="canonical",
+        args=args,
+        abs_rows=abs_rows,
+    )
 
     if args.output:
-        output_path = Path(args.output).expanduser().resolve()
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        rows_for_csv: list[dict[str, object]] = []
-        for track in preview.tracks:
-            rows_for_csv.append(
-                {
-                    "position": track.position,
-                    "track_id": track.track_id,
-                    "playlist_id": track.playlist_id,
-                    "title": track.title,
-                    "artist": track.artist,
-                    "file_path": track.file_path,
-                    "energy_source_used": track.energy_source_used,
-                    "energy_rel": track.energy_rel,
-                    "bass_rel": track.bass_rel,
-                    "drums_rel": track.drums_rel,
-                    "vocals_rel": track.vocals_rel,
-                    "groove_rel": track.groove_rel,
-                    "energy_spread": track.energy_spread,
-                    "bass_spread": track.bass_spread,
-                    "drums_spread": track.drums_spread,
-                    "vocals_spread": track.vocals_spread,
-                    "groove_spread": track.groove_spread,
-                    "intensity_band": track.intensity_band,
-                    "intensity_membership": json.dumps(track.intensity_membership, sort_keys=True),
-                    "role_hints": json.dumps(track.role_hints),
-                    "valid_as_of_track_count": track.valid_as_of_track_count,
-                    "analysis_signature": track.analysis_signature,
-                    "config_signature": track.config_signature,
-                }
-            )
-        fieldnames = list(rows_for_csv[0].keys()) if rows_for_csv else [
-            "position", "track_id", "playlist_id", "title", "artist", "file_path",
-            "energy_source_used", "energy_rel", "bass_rel", "drums_rel", "vocals_rel", "groove_rel",
-            "energy_spread", "bass_spread", "drums_spread", "vocals_spread", "groove_spread",
-            "intensity_band", "intensity_membership", "role_hints", "valid_as_of_track_count",
-            "analysis_signature", "config_signature",
-        ]
-        with output_path.open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(rows_for_csv)
-        if not args.json:
-            print(f"Wrote CSV report to {output_path}")
+        _write_relative_csv(preview, Path(args.output).expanduser().resolve(), args)
+
     return 0
+
+
+def _load_persisted_canonical_preview(
+    database: "Database",
+    playlist_name: str,
+    playlist_id: str,
+    abs_rows: list,
+    settings: "RuntimeSettings",
+) -> "RelativePlaylistPreview":
+    """Reconstruct a RelativePlaylistPreview from persisted track_features_rel + playlist_stats."""
+    from cuemate_analysis.relative_context import (
+        RelativePlaylistPreview,
+        RelativeTrackPreview,
+        PlaylistStatsPreview,
+    )
+    from cuemate_analysis.config import build_relative_experiment_signature
+
+    stats_row = database.get_playlist_stats(playlist_id)
+    track_rows = database.get_persisted_relative_rows(playlist_id)
+
+    tracks: list[RelativeTrackPreview] = []
+    for row in track_rows:
+        tracks.append(RelativeTrackPreview(
+            track_id=str(row["track_id"]),
+            playlist_id=playlist_id,
+            position=int(row["position"]),
+            title=row["title"] if row["title"] else None,
+            artist=row["artist"] if row["artist"] else None,
+            file_path=str(row["file_path"]),
+            energy_source_used="canonical",
+            energy_rel=float(row["energy_rel"]),
+            bass_rel=float(row["bass_rel"]),
+            drums_rel=float(row["drums_rel"]),
+            vocals_rel=float(row["vocals_rel"]) if row["vocals_rel"] is not None else None,
+            groove_rel=float(row["groove_rel"]),
+            energy_spread=float(row["energy_spread"]),
+            bass_spread=float(row["bass_spread"]),
+            drums_spread=float(row["drums_spread"]),
+            vocals_spread=float(row["vocals_spread"]),
+            groove_spread=float(row["groove_spread"]),
+            intensity_band=str(row["intensity_band"]),
+            intensity_membership=json.loads(str(row["intensity_membership"])),
+            role_hints=json.loads(str(row["role_hints"])),
+            valid_as_of_track_count=int(row["valid_as_of_track_count"]),
+            analyzed_at=None,
+            analysis_signature=str(row["analysis_signature"]),
+            config_signature=str(row["config_signature"]),
+        ))
+
+    def _opt_float(v: object) -> float | None:
+        return float(v) if v is not None else None
+
+    relative_sig = (
+        str(stats_row["relative_signature"])
+        if stats_row
+        else build_relative_experiment_signature(settings, energy_source="canonical")
+    )
+    stats = PlaylistStatsPreview(
+        playlist_id=playlist_id,
+        track_count_total=int(stats_row["track_count_total"]) if stats_row else len(abs_rows),
+        track_count_analyzed=int(stats_row["track_count_analyzed"]) if stats_row else 0,
+        eligible_track_count=int(stats_row["eligible_track_count"]) if stats_row else 0,
+        avg_harmonic=_opt_float(stats_row["avg_harmonic"]) if stats_row else None,
+        key_diversity=_opt_float(stats_row["key_diversity"]) if stats_row else None,
+        bpm_range=_opt_float(stats_row["bpm_range"]) if stats_row else None,
+        energy_spread=_opt_float(stats_row["energy_spread"]) if stats_row else None,
+        bass_spread=_opt_float(stats_row["bass_spread"]) if stats_row else None,
+        drums_spread=_opt_float(stats_row["drums_spread"]) if stats_row else None,
+        vocals_spread=_opt_float(stats_row["vocals_spread"]) if stats_row else None,
+        harmonic_spread=_opt_float(stats_row["harmonic_spread"]) if stats_row else None,
+        groove_spread=_opt_float(stats_row["groove_spread"]) if stats_row else None,
+        adapted_weights=json.loads(str(stats_row["adapted_weights"])) if stats_row and stats_row["adapted_weights"] else None,
+        adaptation_strength=_opt_float(stats_row["adaptation_strength"]) if stats_row else None,
+        weight_adaptation_notes=json.loads(str(stats_row["weight_adaptation_notes"])) if stats_row and stats_row["weight_adaptation_notes"] else [],
+        status=str(stats_row["status"]) if stats_row else "insufficient_tracks",
+        relative_signature=relative_sig,
+    )
+    return RelativePlaylistPreview(
+        playlist=playlist_name,
+        playlist_id=playlist_id,
+        is_limited=False,
+        limited_track_count=stats.track_count_total,
+        playlist_stats=stats,
+        tracks=tracks,
+    )
 
 
 def handle_analyze_energy_playlist(args: argparse.Namespace) -> int:
@@ -1844,6 +2106,8 @@ def main(argv: list[str] | None = None) -> int:
             return handle_analyze_bpm_key_playlist(args)
         if args.command == "analyze-relative-playlist":
             return handle_analyze_relative_playlist(args)
+        if args.command == "refresh-relative-playlist":
+            return handle_refresh_relative_playlist(args)
         if args.command == "analyze-energy-playlist":
             return handle_analyze_energy_playlist(args)
         if args.command == "download-essentia-semantic-models":

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
+import hashlib
 import json
 import os
 from http import HTTPStatus
@@ -91,8 +92,27 @@ def infer_positive_index(metadata: dict[str, Any], *, keyword: str, default_inde
     return default_index
 
 
+def fingerprint_model_artifacts(model_root: str) -> str:
+    paths = resolve_model_paths(model_root)
+    identity: list[dict[str, object]] = []
+    for name, path in sorted(paths.items()):
+        stat_result = path.stat()
+        identity.append(
+            {
+                "name": name,
+                "path": path.resolve().as_posix(),
+                "mtime_ns": int(stat_result.st_mtime_ns),
+                "size": int(stat_result.st_size),
+            }
+        )
+    digest = json.dumps(identity, sort_keys=True).encode("utf-8")
+    return hashlib.sha1(digest).hexdigest()[:16]
+
+
 def make_bundle_cache_key(model_root: str, family_policy: str) -> str:
-    return f"{Path(model_root).resolve().as_posix()}::{family_policy}"
+    resolved_root = Path(model_root).resolve().as_posix()
+    artifact_fingerprint = fingerprint_model_artifacts(model_root)
+    return f"{resolved_root}::{artifact_fingerprint}::{family_policy}"
 
 
 def validate_model_paths(model_root: str) -> dict[str, Path]:
@@ -239,8 +259,9 @@ def analyze_audio(bundle, track_path: str, semantic_audio) -> dict[str, object]:
 
 def build_cache_key(model_root: str, family_policy: str, track_path: str) -> tuple[str, str, int, int, str]:
     stat_result = Path(track_path).stat()
+    artifact_fingerprint = fingerprint_model_artifacts(model_root)
     return (
-        str(Path(model_root).resolve()),
+        artifact_fingerprint,
         str(Path(track_path).resolve()),
         int(stat_result.st_mtime_ns),
         int(stat_result.st_size),

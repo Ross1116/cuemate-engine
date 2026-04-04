@@ -4,7 +4,8 @@
     "Calibration offsets and scales for Essentia MusicNN semantic heads.",
     "Applied after raw inference to correct saturation/compression before fusion.",
     "Raw persisted head values are NOT modified; calibration is applied on read.",
-    "Formula: calibrated = clamp((raw - offset) * scale)"
+    "Formula: calibrated = clamp((raw - offset) * scale)",
+    "valence_abs is persisted and calibration-ready, but it is not currently part of the fused energy_abs formula."
   ],
   "heads": {
     "danceability_abs": {

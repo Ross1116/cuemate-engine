@@ -2,6 +2,7 @@ import numpy as np
 from pathlib import Path
 
 from cuemate_analysis.analysis import resolve_bpm, resolve_bpm_with_backend, resolve_key_with_backend
+from cuemate_analysis.config import build_relative_experiment_signature, load_runtime_settings
 from cuemate_analysis.cli import build_effective_analysis_signature
 from cuemate_analysis.analysis import parse_key_label
 from cuemate_analysis.ingest import discover_audio_files, make_playlist_id, make_track_id
@@ -59,6 +60,15 @@ def test_effective_analysis_signature_includes_production_models(tmp_path: Path)
     assert signature.startswith("m1-stable-tempo-tempocnn-")
     assert "-auto-key-musicalkeycnn-" in signature
     assert "-auto-full_track-essentia-" in signature
+
+
+def test_relative_signature_changes_with_energy_source() -> None:
+    settings = load_runtime_settings()
+
+    canonical = build_relative_experiment_signature(settings, energy_source="canonical")
+    legacy = build_relative_experiment_signature(settings, energy_source="heuristic_legacy")
+
+    assert canonical != legacy
 
 
 def test_resolve_bpm_with_backend_falls_back_to_baseline_when_tempocnn_is_unavailable(

@@ -199,12 +199,12 @@ class TrackDspArtifacts:
     def harmonic_chroma(self) -> np.ndarray:
         if self._harmonic_chroma is None:
             try:
-                self._harmonic_chroma = librosa.feature.chroma_stft(S=self.magnitude, sr=self.sr)
+                self._harmonic_chroma = librosa.feature.chroma_stft(S=self.harmonic_magnitude, sr=self.sr)
             except Exception:
                 try:
-                    self._harmonic_chroma = librosa.feature.chroma_stft(y=self.y, sr=self.sr)
+                    self._harmonic_chroma = librosa.feature.chroma_stft(y=self.harmonic_waveform, sr=self.sr)
                 except Exception:
-                    self._harmonic_chroma = librosa.feature.chroma_cqt(y=self.y, sr=self.sr)
+                    self._harmonic_chroma = librosa.feature.chroma_cqt(y=self.harmonic_waveform, sr=self.sr)
         return self._harmonic_chroma
 
 

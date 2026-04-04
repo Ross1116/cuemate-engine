@@ -31,6 +31,21 @@ DIMENSION_TO_SCORER = {
 VOCAL_CONFIDENCE_THRESHOLD = 0.5
 
 
+def resolve_relative_energy_value(
+    track: "RelativeTrackInput",
+    energy_source: str,
+) -> tuple[float | None, str]:
+    if energy_source == "heuristic_legacy":
+        if track.energy_heuristic_abs is not None:
+            return float(track.energy_heuristic_abs), "heuristic_legacy"
+        if track.energy_abs is not None:
+            return float(track.energy_abs), "heuristic_legacy_fallback"
+        return None, "missing"
+    if track.energy_abs is not None:
+        return float(track.energy_abs), "canonical"
+    return None, "missing"
+
+
 @dataclass(frozen=True)
 class RelativeTrackInput:
     playlist_id: str
@@ -293,11 +308,13 @@ def apply_low_discrimination_adjustment(
 def build_weight_profile_from_playlist_features(
     playlist_features: list[RelativeTrackInput],
     *,
+    small_playlist_limit: int,
     static_weights: dict[str, float],
     weight_floors: dict[str, float],
     adaptation_strength: float,
+    energy_source: str,
 ) -> tuple[dict[str, float] | None, dict[str, Any]]:
-    if len(playlist_features) < 12:
+    if len(playlist_features) < small_playlist_limit:
         return None, {}
 
     avg_harmonic = float(np.mean([track.harmonic_abs for track in playlist_features if track.harmonic_abs is not None]))
@@ -306,7 +323,12 @@ def build_weight_profile_from_playlist_features(
     key_diversity = min(1.0, unique_keys / min(len(playlist_features), 12))
     drums_values = [float(track.drums_abs) for track in playlist_features if track.drums_abs is not None]
     bass_values = [float(track.bass_abs) for track in playlist_features if track.bass_abs is not None]
-    energy_values = [float(track.energy_abs) for track in playlist_features if track.energy_abs is not None]
+    energy_values = [
+        float(resolved)
+        for track in playlist_features
+        for resolved, _source_used in [resolve_relative_energy_value(track, energy_source)]
+        if resolved is not None
+    ]
     harmonic_values = [float(track.harmonic_abs) for track in playlist_features if track.harmonic_abs is not None]
     groove_values = [float(track.groove_abs) for track in playlist_features if track.groove_abs is not None]
     vocal_values = [float(track.vocals_abs) for track in playlist_features if track.vocals_abs is not None]
@@ -375,27 +397,20 @@ def compute_relative_playlist_preview(
     is_limited: bool,
     energy_source: str = "heuristic",
 ) -> RelativePlaylistPreview:
-    relative_signature = build_relative_experiment_signature(settings)
+    if energy_source == "essentia_fused":
+        energy_source = "canonical"
+    if energy_source == "heuristic":
+        energy_source = "heuristic_legacy"
+
+    relative_signature = build_relative_experiment_signature(settings, energy_source=energy_source)
     playlist_id = rows[0].playlist_id if rows else None
     track_count_total = len(rows)
     analyzed_tracks = [row for row in rows if row.has_absolute_analysis]
-    def resolve_effective_energy(track: RelativeTrackInput) -> tuple[float | None, str]:
-        if energy_source == "heuristic_legacy":
-            if track.energy_heuristic_abs is not None:
-                return float(track.energy_heuristic_abs), "heuristic_legacy"
-            # Fallback: pre-contract-change rows may not have energy_heuristic_abs
-            if track.energy_abs is not None:
-                return float(track.energy_abs), "heuristic_legacy_fallback"
-            return None, "missing"
-        # canonical (default): use energy_abs which is now the fused canonical score
-        if track.energy_abs is not None:
-            return float(track.energy_abs), "canonical"
-        return None, "missing"
 
     eligible_tracks = [
         row
         for row in analyzed_tracks
-        if resolve_effective_energy(row)[0] is not None
+        if resolve_relative_energy_value(row, energy_source)[0] is not None
         and row.bass_abs is not None
         and row.drums_abs is not None
         and row.harmonic_abs is not None
@@ -441,7 +456,12 @@ def compute_relative_playlist_preview(
     def bounds(values: list[float]) -> tuple[float, float]:
         return float(np.percentile(values, 10)), float(np.percentile(values, 90))
 
-    energy_values = [float(resolve_effective_energy(track)[0]) for track in eligible_tracks if resolve_effective_energy(track)[0] is not None]
+    energy_values = [
+        float(resolved)
+        for track in eligible_tracks
+        for resolved, _source_used in [resolve_relative_energy_value(track, energy_source)]
+        if resolved is not None
+    ]
     bass_values = [float(track.bass_abs) for track in eligible_tracks if track.bass_abs is not None]
     drums_values = [float(track.drums_abs) for track in eligible_tracks if track.drums_abs is not None]
     groove_values = [float(track.groove_abs) for track in eligible_tracks if track.groove_abs is not None]
@@ -467,7 +487,7 @@ def compute_relative_playlist_preview(
 
     previews: list[RelativeTrackPreview] = []
     for track in eligible_tracks:
-        effective_energy, energy_source_used = resolve_effective_energy(track)
+        effective_energy, energy_source_used = resolve_relative_energy_value(track, energy_source)
         if effective_energy is None:
             continue
         energy_rel = robust_scale(effective_energy, *energy_bounds)
@@ -516,9 +536,11 @@ def compute_relative_playlist_preview(
     if settings.weight_adaptation.mode == "auto" and eligible_track_count >= settings.thresholds.small_playlist_limit:
         adapted_weights, weight_stats = build_weight_profile_from_playlist_features(
             eligible_tracks,
+            small_playlist_limit=settings.thresholds.small_playlist_limit,
             static_weights=settings.scoring.static_weights,
             weight_floors=settings.scoring.weight_floors,
             adaptation_strength=settings.weight_adaptation.adaptation_strength,
+            energy_source=energy_source,
         )
         if weight_stats:
             adaptation_strength = float(weight_stats["adaptation_strength"])
@@ -560,3 +582,83 @@ def compute_relative_playlist_preview(
 
 def preview_to_json(preview: RelativePlaylistPreview) -> str:
     return json.dumps(preview.to_payload(), indent=2, sort_keys=True)
+
+
+def _preview_to_db_rows(
+    preview: RelativePlaylistPreview,
+    playlist_id: str,
+    timestamp: str,
+) -> tuple[list[dict], dict]:
+    """Convert a RelativePlaylistPreview into the DB row format for replace_canonical_relative_rows."""
+    track_rows: list[dict] = []
+    for track in preview.tracks:
+        track_rows.append({
+            "playlist_id": playlist_id,
+            "track_id": track.track_id,
+            "position": track.position,
+            "energy_rel": track.energy_rel,
+            "bass_rel": track.bass_rel,
+            "drums_rel": track.drums_rel,
+            "vocals_rel": track.vocals_rel,
+            "groove_rel": track.groove_rel,
+            "energy_spread": track.energy_spread,
+            "bass_spread": track.bass_spread,
+            "drums_spread": track.drums_spread,
+            "vocals_spread": track.vocals_spread,
+            "groove_spread": track.groove_spread,
+            "intensity_band": track.intensity_band,
+            "intensity_membership": json.dumps(track.intensity_membership, sort_keys=True),
+            "role_hints": json.dumps(track.role_hints),
+            "valid_as_of_track_count": track.valid_as_of_track_count,
+            "relative_signature": track.analysis_signature and preview.playlist_stats.relative_signature or preview.playlist_stats.relative_signature,
+            "analysis_signature": track.analysis_signature or "",
+            "config_signature": track.config_signature or "",
+            "refreshed_at": timestamp,
+        })
+
+    stats = preview.playlist_stats
+    stats_row = {
+        "playlist_id": playlist_id,
+        "track_count_total": stats.track_count_total,
+        "track_count_analyzed": stats.track_count_analyzed,
+        "eligible_track_count": stats.eligible_track_count,
+        "energy_spread": stats.energy_spread,
+        "bass_spread": stats.bass_spread,
+        "drums_spread": stats.drums_spread,
+        "vocals_spread": stats.vocals_spread,
+        "harmonic_spread": stats.harmonic_spread,
+        "groove_spread": stats.groove_spread,
+        "avg_harmonic": stats.avg_harmonic,
+        "key_diversity": stats.key_diversity,
+        "bpm_range": stats.bpm_range,
+        "adapted_weights": json.dumps(stats.adapted_weights, sort_keys=True) if stats.adapted_weights is not None else None,
+        "adaptation_strength": stats.adaptation_strength,
+        "weight_adaptation_notes": json.dumps(stats.weight_adaptation_notes),
+        "status": stats.status,
+        "energy_source_used": "canonical",
+        "relative_signature": stats.relative_signature,
+        "refreshed_at": timestamp,
+    }
+    return track_rows, stats_row
+
+
+def refresh_canonical_relative_playlist(
+    rows: list[RelativeTrackInput],
+    settings: "RuntimeSettings",
+    *,
+    playlist_name: str,
+    playlist_id: str,
+    database: Any,
+    timestamp: str,
+) -> RelativePlaylistPreview:
+    """Compute canonical relative preview and persist it atomically to track_features_rel + playlist_stats."""
+    preview = compute_relative_playlist_preview(
+        rows,
+        settings,
+        playlist_name=playlist_name,
+        is_limited=False,
+        energy_source="canonical",
+    )
+    track_rows, stats_row = _preview_to_db_rows(preview, playlist_id, timestamp)
+    database.replace_canonical_relative_rows(playlist_id, track_rows, stats_row, timestamp)
+    return preview

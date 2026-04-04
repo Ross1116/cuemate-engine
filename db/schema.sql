@@ -60,8 +60,26 @@ CREATE TABLE track_features_abs (
   analyzed_at TEXT NOT NULL,
   analysis_signature TEXT NOT NULL,
   config_signature TEXT NOT NULL,
-  scoring_contract_id_at_analysis TEXT
-, energy_hybrid REAL, energy_learned REAL, energy_learned_bucket TEXT, energy_model_signature TEXT, energy_model_source TEXT, energy_model_inferred_at TEXT, danceability_abs REAL, arousal_abs REAL, valence_abs REAL, mood_aggressive_abs REAL, mood_party_abs REAL, mood_relaxed_abs REAL, energy_essentia_fused REAL, energy_essentia_bucket TEXT, essentia_semantic_signature TEXT, essentia_semantic_source TEXT, essentia_semantic_inferred_at TEXT, energy_heuristic_abs REAL);
+  scoring_contract_id_at_analysis TEXT,
+  energy_hybrid REAL,
+  energy_learned REAL,
+  energy_learned_bucket TEXT,
+  energy_model_signature TEXT,
+  energy_model_source TEXT,
+  energy_model_inferred_at TEXT,
+  danceability_abs REAL,
+  arousal_abs REAL,
+  valence_abs REAL,
+  mood_aggressive_abs REAL,
+  mood_party_abs REAL,
+  mood_relaxed_abs REAL,
+  energy_essentia_fused REAL,
+  energy_essentia_bucket TEXT,
+  essentia_semantic_signature TEXT,
+  essentia_semantic_source TEXT,
+  essentia_semantic_inferred_at TEXT,
+  energy_heuristic_abs REAL
+);
 CREATE TABLE analysis_jobs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   playlist_id TEXT REFERENCES playlists(id) ON DELETE SET NULL,
@@ -90,6 +108,66 @@ CREATE TABLE IF NOT EXISTS "playlist_tracks" (
   PRIMARY KEY (playlist_id, track_id),
   UNIQUE (playlist_id, position)
 );
+CREATE TABLE track_features_rel (
+  playlist_id TEXT NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+  track_id    TEXT NOT NULL REFERENCES tracks(id)    ON DELETE CASCADE,
+  position    INTEGER NOT NULL,
+  -- canonical relative scores
+  energy_rel  REAL NOT NULL,
+  bass_rel    REAL NOT NULL,
+  drums_rel   REAL NOT NULL,
+  vocals_rel  REAL,
+  groove_rel  REAL NOT NULL,
+  -- per-track spread context (playlist-level, duplicated for fast per-track reads)
+  energy_spread REAL NOT NULL,
+  bass_spread   REAL NOT NULL,
+  drums_spread  REAL NOT NULL,
+  vocals_spread REAL NOT NULL,
+  groove_spread REAL NOT NULL,
+  -- classification outputs
+  intensity_band       TEXT NOT NULL,
+  intensity_membership TEXT NOT NULL,  -- JSON: {"low":…,"groove":…,"drive":…,"peak":…}
+  role_hints           TEXT NOT NULL,  -- JSON array
+  valid_as_of_track_count INTEGER NOT NULL,
+  -- provenance
+  relative_signature  TEXT NOT NULL,
+  analysis_signature  TEXT NOT NULL,
+  config_signature    TEXT NOT NULL,
+  refreshed_at        TEXT NOT NULL,
+  PRIMARY KEY (playlist_id, track_id)
+);
+CREATE INDEX idx_track_features_rel_playlist
+  ON track_features_rel(playlist_id, position ASC);
+CREATE TABLE playlist_stats (
+  playlist_id TEXT PRIMARY KEY REFERENCES playlists(id) ON DELETE CASCADE,
+  -- track counts
+  track_count_total    INTEGER NOT NULL,
+  track_count_analyzed INTEGER NOT NULL,
+  eligible_track_count INTEGER NOT NULL,
+  -- spread stats (nullable when eligible_track_count < min_for_relative)
+  energy_spread    REAL,
+  bass_spread      REAL,
+  drums_spread     REAL,
+  vocals_spread    REAL,
+  harmonic_spread  REAL,
+  groove_spread    REAL,
+  avg_harmonic     REAL,
+  key_diversity    REAL,
+  bpm_range        REAL,
+  -- weight adaptation outputs
+  adapted_weights         TEXT,   -- JSON object or NULL
+  adaptation_strength     REAL,
+  weight_adaptation_notes TEXT,   -- JSON array
+  -- status / provenance
+  status              TEXT NOT NULL,  -- "ok","relative_only","insufficient_tracks"
+  energy_source_used  TEXT NOT NULL DEFAULT 'canonical',
+  relative_signature  TEXT NOT NULL,
+  refreshed_at        TEXT NOT NULL,
+  -- stale-state fields
+  is_stale         INTEGER NOT NULL DEFAULT 0,  -- 0=current, 1=stale
+  stale_reason     TEXT,    -- "absolute_track_changed","playlist_membership_changed","relative_signature_changed"
+  stale_marked_at  TEXT
+);
 -- Dbmate schema migrations
 INSERT INTO "schema_migrations" (version) VALUES
   ('20260403112734'),
@@ -98,4 +176,5 @@ INSERT INTO "schema_migrations" (version) VALUES
   ('20260404173000'),
   ('20260404193000'),
   ('20260404210000'),
-  ('20260404220000');
+  ('20260404220000'),
+  ('20260404230000');

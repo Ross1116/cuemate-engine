@@ -22,12 +22,13 @@ def test_energy_candidate_set_is_bounded_and_discriminative() -> None:
     calm_candidates = build_energy_candidate_set(calm.astype(np.float32), sr)
     driving_candidates = build_energy_candidate_set(driving.astype(np.float32), sr)
 
-    for value in calm_candidates.to_payload().values():
+    allowed_negative_fields = {"loudness_lufs"}
+    for key, value in calm_candidates.to_payload().items():
         if isinstance(value, float):
-            assert 0.0 <= value <= 1.0 or value < 0.0
-    for value in driving_candidates.to_payload().values():
+            assert 0.0 <= value <= 1.0 or (key in allowed_negative_fields and value < 0.0)
+    for key, value in driving_candidates.to_payload().items():
         if isinstance(value, float):
-            assert 0.0 <= value <= 1.0 or value < 0.0
+            assert 0.0 <= value <= 1.0 or (key in allowed_negative_fields and value < 0.0)
 
     assert driving_candidates.baseline > calm_candidates.baseline
     assert driving_candidates.club_fusion > calm_candidates.club_fusion

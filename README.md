@@ -259,7 +259,7 @@ GPU notes:
 
 ## Intent for the next commits
 
-- add Milestone 2 relative-feature and windowed-feature tables and refresh logic
+- add Milestone 2 relative-feature tables and refresh logic
 - add the Python gRPC scoring service on top of the persisted analysis data
 - add the Go API and orchestration packages under `go/cmd/` and `go/internal/`
 - add service Dockerfiles only when real app entrypoints exist

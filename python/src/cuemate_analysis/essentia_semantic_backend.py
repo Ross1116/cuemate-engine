@@ -128,12 +128,12 @@ def normalize_essentia_semantic_family_policy(value: str | None) -> str:
 
 
 def windows_path_to_container_path(path: Path | PurePath) -> str:
-    resolved = path.resolve() if isinstance(path, Path) else path
+    resolved = path if isinstance(path, PurePath) and not isinstance(path, Path) else path.resolve()
     posix_path = resolved.as_posix()
     drive = resolved.drive.rstrip(":").lower()
     if not drive:
         if resolved.is_absolute():
-            return f"/host{posix_path}"
+            return posix_path
         raise ValueError(f"Expected a Windows drive path or POSIX absolute path, got: {resolved}")
     tail = posix_path[2:] if len(posix_path) >= 2 and posix_path[1] == ":" else posix_path
     return f"/host/{drive}{tail}"
@@ -342,12 +342,21 @@ def service_container_matches(
     *,
     drive_letters: list[str],
     image_name: str,
+    requested_device: str,
     requires_external_model_mount: bool,
     expected_model_source: str | None = None,
 ) -> bool:
     if not details.get("State", {}).get("Running"):
         return False
     if str(details.get("Config", {}).get("Image") or "") != image_name:
+        return False
+    env_values = {
+        str(item).split("=", 1)[0]: str(item).split("=", 1)[1]
+        for item in (details.get("Config", {}).get("Env") or [])
+        if "=" in str(item)
+    }
+    container_device = env_values.get("CUEMATE_ESSENTIA_SEMANTIC_DEVICE")
+    if container_device is not None and container_device != requested_device:
         return False
     mounts = details.get("Mounts", [])
     targets = {str(item.get("Destination") or "") for item in mounts}
@@ -396,6 +405,7 @@ def ensure_essentia_semantic_service(
         details,
         drive_letters=drive_letters,
         image_name=image_name,
+        requested_device=device,
         requires_external_model_mount=bool(extra_mounts),
         expected_model_source=expected_model_source,
     ):

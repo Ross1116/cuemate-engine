@@ -169,6 +169,25 @@ def track_from_playlist_row(row) -> object:
     )
 
 
+def should_skip_analysis(
+    row,
+    track,
+    *,
+    effective_analysis_signature: str,
+    config_signature: str,
+    analysis_mode: str,
+    force: bool,
+) -> bool:
+    if force:
+        return False
+    return (
+        row["source_file_hash"] == track.file_hash
+        and row["analysis_signature"] == effective_analysis_signature
+        and row["analysis_mode"] == analysis_mode
+        and row["config_signature"] == config_signature
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cuemate-analysis",
@@ -475,11 +494,14 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
             pending_paths = [
                 item["track"].file_path
                 for item in prepared_tracks
-                if args.force
-                or item["row"]["source_file_hash"] != item["track"].file_hash
-                or item["row"]["analysis_signature"] != effective_analysis_signature
-                or item["row"]["analysis_mode"] != args.analysis_mode
-                or item["row"]["config_signature"] != settings.config_signature
+                if not should_skip_analysis(
+                    item["row"],
+                    item["track"],
+                    effective_analysis_signature=effective_analysis_signature,
+                    config_signature=settings.config_signature,
+                    analysis_mode=args.analysis_mode,
+                    force=args.force,
+                )
             ]
             prefetched_tempocnn_estimates: dict[Path, TempoEstimate] = {}
             prefetched_musicalkeycnn_estimates: dict[Path, KeyEstimate] = {}
@@ -510,12 +532,13 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
                     )
                     database.mark_analysis_job_started(job_id, created_at)
                     database.upsert_track(track, utc_now())
-                    if (
-                        not args.force
-                        and row["source_file_hash"] == track.file_hash
-                        and row["analysis_signature"] == effective_analysis_signature
-                        and row["analysis_mode"] == args.analysis_mode
-                        and row["config_signature"] == settings.config_signature
+                    if should_skip_analysis(
+                        row,
+                        track,
+                        effective_analysis_signature=effective_analysis_signature,
+                        config_signature=settings.config_signature,
+                        analysis_mode=args.analysis_mode,
+                        force=args.force,
                     ):
                         duration_seconds = round(time.perf_counter() - start_time, 3)
                         database.mark_analysis_job_completed(

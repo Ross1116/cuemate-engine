@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path, PurePath
 import subprocess
@@ -38,6 +39,7 @@ MUSICALKEYCNN_POLICY_CHOICES = {
     MUSICALKEYCNN_POLICY_FULL_TRACK,
 }
 MUSICALKEYCNN_PERSISTED_CACHE_VERSION = "musicalkeycnn-cache-v1"
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -517,7 +519,8 @@ def persist_musicalkeycnn_estimates(
     try:
         with PersistentInferenceCache(resolve_inference_cache_path()) as cache:
             cache.upsert_entries(entries)
-    except Exception:
+    except Exception as exc:
+        logger.debug("Failed to persist MusicalKeyCNN inference cache entries.", exc_info=exc)
         return
 
 

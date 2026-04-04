@@ -48,8 +48,11 @@ def _normalize_playlist_name(value: str) -> str:
 def _resolve_playlist_choice(available: dict[str, T], requested: str) -> T:
     normalized = _normalize_playlist_name(requested)
     exact = {name: value for name, value in available.items() if _normalize_playlist_name(name) == normalized}
-    if exact:
+    if len(exact) == 1:
         return next(iter(exact.values()))
+    if len(exact) > 1:
+        joined = ", ".join(sorted(exact))
+        raise ValueError(f"Playlist name '{requested}' is ambiguous. Use one of: {joined}")
 
     leaf_matches = {
         name: value
@@ -153,6 +156,7 @@ def load_rekordbox_playlist(library_path: Path, playlist_name: str) -> list[DJPl
 def _clean_traktor_dir(raw_value: str | None) -> str:
     if not raw_value:
         return ""
+    # Traktor encodes Windows directories with a leading '/:' marker and may mix separators.
     clean = raw_value.replace("/:","\\").replace("/", "\\")
     while "\\\\" in clean:
         clean = clean.replace("\\\\", "\\")
@@ -329,7 +333,9 @@ def load_serato_playlist(library_path: Path, playlist_name: str) -> list[DJPlayl
 
     unique_paths: dict[str, Path] = {}
     for path in discovered_paths:
-        unique_paths[path.as_posix().casefold()] = path
+        key = path.as_posix().casefold()
+        if key not in unique_paths:
+            unique_paths[key] = path
 
     return [
         DJPlaylistTrack(

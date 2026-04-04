@@ -8,12 +8,34 @@ CREATE TABLE playlist_tracks__new (
   UNIQUE (playlist_id, position)
 );
 
+CREATE TEMP TABLE playlist_tracks__deduped AS
+WITH ranked_tracks AS (
+  SELECT
+    playlist_id,
+    track_id,
+    position,
+    added_at,
+    ROW_NUMBER() OVER (
+      PARTITION BY playlist_id, position
+      ORDER BY added_at ASC, track_id ASC
+    ) AS row_rank
+  FROM playlist_tracks
+)
+SELECT
+  playlist_id,
+  track_id,
+  position,
+  added_at
+FROM ranked_tracks
+WHERE row_rank = 1;
+
 INSERT INTO playlist_tracks__new (playlist_id, track_id, position, added_at)
 SELECT playlist_id, track_id, position, added_at
-FROM playlist_tracks;
+FROM playlist_tracks__deduped;
 
 DROP TABLE playlist_tracks;
 ALTER TABLE playlist_tracks__new RENAME TO playlist_tracks;
+DROP TABLE playlist_tracks__deduped;
 
 -- migrate:down
 CREATE TABLE playlist_tracks__rollback (

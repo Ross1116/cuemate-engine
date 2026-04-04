@@ -44,7 +44,7 @@ def discover_audio_files(paths: Iterable[str | Path]) -> list[Path]:
             resolved = candidate.resolve()
             discovered[_normalized_path_identity(resolved)] = resolved
 
-    return sorted(discovered.values(), key=lambda candidate: str(candidate).lower())
+    return sorted(discovered.values(), key=_normalized_path_identity)
 
 
 def make_track_id(path: Path) -> str:
@@ -53,7 +53,7 @@ def make_track_id(path: Path) -> str:
 
 
 def make_playlist_id(name: str) -> str:
-    normalized = name.strip().lower().encode("utf-8")
+    normalized = name.strip().encode("utf-8")
     return f"plt_{hashlib.sha1(normalized).hexdigest()[:16]}"
 
 

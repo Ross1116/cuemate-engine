@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -15,6 +16,8 @@ from cuemate_analysis.musicalkey_runtime import (
     predict_keys,
     warm_pipeline,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class MusicalKeyHandler(BaseHTTPRequestHandler):
@@ -56,6 +59,9 @@ class MusicalKeyHandler(BaseHTTPRequestHandler):
             payload = json.loads(raw_body.decode("utf-8"))
         except Exception as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"invalid_json: {exc}"})
+            return
+        if not isinstance(payload, dict):
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_json_shape"})
             return
 
         model_path = str(payload.get("model_path") or "").strip()
@@ -162,6 +168,7 @@ def build_cache_key(
 
 
 def main() -> int:
+    logging.basicConfig(level=logging.INFO)
     port = int(os.getenv("MUSICALKEYCNN_SERVICE_PORT", "47832"))
     default_model = os.getenv("CUEMATE_MUSICALKEYCNN_DEFAULT_MODEL")
     default_device = os.getenv("CUEMATE_MUSICALKEYCNN_DEFAULT_DEVICE", "auto")
@@ -169,8 +176,9 @@ def main() -> int:
         try:
             model, runner_device = load_model(default_model, device_choice=default_device)
             warm_pipeline(model, runner_device)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.exception("Failed to warm default MusicalKeyCNN model '%s': %s", default_model, exc)
+            raise
     server = ThreadingHTTPServer(("127.0.0.1", port), MusicalKeyHandler)
     server.serve_forever()
     return 0

@@ -30,7 +30,6 @@ CueMate Engine is a monorepo with a hard split between the Python analysis plane
 
 For a clean Windows bootstrap from a fresh clone, follow:
 
-- [Bootstrap on Windows](d:/Personal%20Projects/CueMate/cuemate-engine/docs/bootstrap-windows.md)
 - [Bootstrap on Windows](./docs/bootstrap-windows.md)
 
 ## Environment setup

@@ -41,7 +41,7 @@ $command += @(
 
 Push-Location $repoRoot
 try {
-    & docker @command | Out-Null
+    $containerId = (& docker @command | Select-Object -First 1).Trim()
     if ($LASTEXITCODE -ne 0) {
         exit $LASTEXITCODE
     }
@@ -60,6 +60,14 @@ try {
         Start-Sleep -Milliseconds 500
     }
 
+    if ($containerId) {
+        try {
+            & docker rm -f $containerId | Out-Null
+        }
+        catch {
+            Write-Warning "Failed to clean up timed-out TempoCNN container ${containerId}: $_"
+        }
+    }
     Write-Error "TempoCNN service did not become healthy on $healthUrl within 20 seconds."
     exit 1
 }

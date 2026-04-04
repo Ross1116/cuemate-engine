@@ -12,13 +12,18 @@
     "per_track_timeout_seconds": 120,
     "model_preload": true,
     "fast_pass_enabled": true,
-    "analysis_signature_seed": "m1-absolute-v1",
-    "energy_source_default": "heuristic",
+    "analysis_signature_seed": "m1-canonical-v2",
+    "energy_source_default": "canonical",
     "essentia_semantics_enabled": true,
     "essentia_semantic_image": "cuemate-essentia-semantics:local",
     "essentia_semantic_device": "auto",
     "essentia_semantic_model_family_policy": "best_per_task",
-    "essentia_semantic_model_root": "python/models/essentia_semantics"
+    "essentia_semantic_model_root": "python/models/essentia_semantics",
+    "full_chunk_size": 4,
+    "tempo_chunk_size": 8,
+    "key_chunk_size": 8,
+    "essentia_chunk_size": 4,
+    "dsp_workers": 4
   },
   "thresholds": {
     "small_playlist_limit": 12,

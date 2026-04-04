@@ -17,10 +17,8 @@ CREATE TABLE tracks (
   duration_seconds REAL,
   import_source TEXT,
   imported_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  imported_bpm REAL,
-  imported_key TEXT
-);
+  updated_at TEXT NOT NULL
+, imported_bpm REAL, imported_key TEXT);
 CREATE INDEX idx_tracks_file_hash ON tracks(file_hash);
 CREATE TABLE playlists (
   id TEXT PRIMARY KEY,
@@ -50,23 +48,6 @@ CREATE TABLE track_features_abs (
   energy_abs REAL NOT NULL,
   energy_sustained REAL,
   energy_peak REAL,
-  energy_hybrid REAL,
-  energy_learned REAL,
-  energy_learned_bucket TEXT,
-  energy_model_signature TEXT,
-  energy_model_source TEXT,
-  energy_model_inferred_at TEXT,
-  danceability_abs REAL,
-  arousal_abs REAL,
-  valence_abs REAL,
-  mood_aggressive_abs REAL,
-  mood_party_abs REAL,
-  mood_relaxed_abs REAL,
-  energy_essentia_fused REAL,
-  energy_essentia_bucket TEXT,
-  essentia_semantic_signature TEXT,
-  essentia_semantic_source TEXT,
-  essentia_semantic_inferred_at TEXT,
   loudness_lufs REAL NOT NULL,
   loudness_norm REAL NOT NULL,
   bass_abs REAL NOT NULL,
@@ -80,7 +61,7 @@ CREATE TABLE track_features_abs (
   analysis_signature TEXT NOT NULL,
   config_signature TEXT NOT NULL,
   scoring_contract_id_at_analysis TEXT
-);
+, energy_hybrid REAL, energy_learned REAL, energy_learned_bucket TEXT, energy_model_signature TEXT, energy_model_source TEXT, energy_model_inferred_at TEXT, danceability_abs REAL, arousal_abs REAL, valence_abs REAL, mood_aggressive_abs REAL, mood_party_abs REAL, mood_relaxed_abs REAL, energy_essentia_fused REAL, energy_essentia_bucket TEXT, essentia_semantic_signature TEXT, essentia_semantic_source TEXT, essentia_semantic_inferred_at TEXT, energy_heuristic_abs REAL);
 CREATE TABLE analysis_jobs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   playlist_id TEXT REFERENCES playlists(id) ON DELETE SET NULL,
@@ -116,4 +97,5 @@ INSERT INTO "schema_migrations" (version) VALUES
   ('20260404143000'),
   ('20260404173000'),
   ('20260404193000'),
-  ('20260404210000');
+  ('20260404210000'),
+  ('20260404220000');

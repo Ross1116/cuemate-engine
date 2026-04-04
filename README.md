@@ -178,6 +178,7 @@ Compute the experimental Phase 1 relative-context preview from persisted absolut
 ```powershell
 python -m cuemate_analysis analyze-relative-playlist --playlist "Fred again"
 python -m cuemate_analysis analyze-relative-playlist --playlist "Fred again" --limit 12 --json
+python -m cuemate_analysis analyze-relative-playlist --playlist "Fred again" --energy-source heuristic_legacy
 python -m cuemate_analysis analyze-relative-playlist --playlist "Fred again" --output .\data\benchmarks\fred-again-relative.csv
 ```
 
@@ -193,7 +194,7 @@ Download the Essentia semantic model bundle and inspect Essentia semantic output
 ```powershell
 python -m cuemate_analysis download-essentia-semantic-models
 python -m cuemate_analysis analyze-essentia-playlist --playlist "Fred again" --limit 12
-python -m cuemate_analysis analyze-relative-playlist --playlist "Fred again" --energy-source essentia_fused
+python -m cuemate_analysis analyze-relative-playlist --playlist "Fred again" --energy-source canonical
 ```
 
 Purge persisted TempoCNN and MusicalKeyCNN caches, and clear the warm service state so the next run is fully fresh:
@@ -215,13 +216,24 @@ Speed notes:
 - `analyze-relative-playlist` is a read-only experimental Milestone 2 Phase 1 preview; it computes relative context from `track_features_abs` and does not persist new tables yet
 - `analyze-energy-playlist` is a read-only experimental workbench for comparing absolute-energy formulas on real playlists before promoting one into the production analyzer
 - `download-essentia-semantic-models` and `analyze-essentia-playlist` are the new model-acquisition and read-only inspection surfaces for Essentia semantic absolute features
-- full playlist analysis can now also persist Essentia semantic outputs and `energy_essentia_fused` in parallel when the Essentia model bundle is available
+- full playlist analysis now persists:
+  - canonical `energy_abs` from the calibrated Essentia-heavy fused intensity score when available
+  - legacy `energy_heuristic_abs` from the local DSP-only heuristic path
+  - raw Essentia semantic heads (`danceability_abs`, `arousal_abs`, `valence_abs`, `mood_aggressive_abs`, `mood_party_abs`, `mood_relaxed_abs`)
+- `analyze-relative-playlist` now defaults to canonical energy via `--energy-source canonical`
+- `--energy-source heuristic_legacy` uses the preserved DSP-only energy lane
+- `--energy-source essentia_fused` is a deprecated compatibility alias for `canonical`
 - TempoCNN, MusicalKeyCNN, and Essentia semantics all use warm Docker workers so repeated analysis avoids model cold starts
 - both warm workers now cache results for unchanged files, so rerunning the same BPM/key playlist pass is dramatically faster
 - those persistent caches live in `data/inference-cache.db` and can be purged on demand with `purge-model-cache`
 - playlist analysis batches TempoCNN and MusicalKeyCNN work so the models stay loaded
 - MusicalKeyCNN runs through its own warm Docker worker, separate from the TempoCNN BPM worker
-- the host-side analyzer still computes the remaining absolute features locally with `librosa`
+- the host-side analyzer still computes the remaining DSP-native primitives locally with `librosa`
+- current canonical absolute-feature split:
+  - DSP-native primitives: `loudness_lufs`, `loudness_norm`, `bass_abs`, `time_signature`, `time_signature_confidence`
+  - DSP-native support signals: `energy_heuristic_abs`, `energy_sustained`, `energy_peak`, `drums_abs`, `harmonic_abs`, `groove_abs`
+  - model-backed semantics: `danceability_abs`, `arousal_abs`, `valence_abs`, `mood_aggressive_abs`, `mood_party_abs`, `mood_relaxed_abs`
+  - canonical fused intensity: `energy_abs`
 
 Manual Docker debug for one track:
 

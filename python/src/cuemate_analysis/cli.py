@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import csv
+from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path
@@ -10,7 +11,12 @@ import sqlite3
 import sys
 import time
 
-from cuemate_analysis.analysis import analyze_track, utc_now
+from cuemate_analysis.analysis import (
+    DspLaneResult,
+    build_analysis_result,
+    compute_dsp_lane_result,
+    utc_now,
+)
 from cuemate_analysis.config import load_runtime_settings
 from cuemate_analysis.database import Database
 from cuemate_analysis.dj_import import list_dj_playlists, load_dj_playlist
@@ -52,6 +58,14 @@ from cuemate_analysis.tempo_backend import (
 )
 
 TEMPOCNN_PROGRESS_BATCH_SIZE = 8
+
+
+@dataclass(frozen=True)
+class PreparedTrack:
+    row: object
+    track: object
+    position: int
+    resolved_path: Path
 
 
 def hash_file_identity(path: Path) -> str:
@@ -208,24 +222,7 @@ def prefetch_bpm_and_key_estimates(paths: list[Path], settings) -> tuple[dict[Pa
 def prefetch_essentia_semantic_estimates(rows, settings) -> dict[Path, EssentiaSemanticEstimate]:
     if not rows or not settings.analysis.essentia_semantics_enabled:
         return {}
-    auxiliary_features_by_path = {}
-    paths: list[Path] = []
-    for row in rows:
-        path = Path(row["file_path"]).resolve()
-        paths.append(path)
-        row_keys = set(row.keys()) if hasattr(row, "keys") else set()
-
-        def optional_value(key: str):
-            if row_keys and key not in row_keys:
-                return None
-            return row[key]
-
-        auxiliary_features_by_path[path] = {
-            "loudness_norm": optional_value("loudness_norm"),
-            "drums_abs": optional_value("drums_abs"),
-            "groove_abs": optional_value("groove_abs"),
-            "bass_abs": optional_value("bass_abs"),
-        }
+    paths, auxiliary_features_by_path = build_essentia_auxiliary_features_by_path(rows)
     return estimate_essentia_semantic_batch(
         paths,
         model_root=settings.analysis.essentia_semantic_model_root,
@@ -284,6 +281,217 @@ def chunk_items(items: list[object], chunk_size: int = TEMPOCNN_PROGRESS_BATCH_S
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive.")
     return [items[index:index + chunk_size] for index in range(0, len(items), chunk_size)]
+
+
+def build_failed_tempo_estimate(error_message: str) -> TempoEstimate:
+    return TempoEstimate(
+        backend="tempocnn",
+        bpm=None,
+        confidence=None,
+        elapsed_ms=None,
+        details={},
+        notes=[error_message],
+        available=False,
+    )
+
+
+def build_failed_key_estimate(error_message: str) -> KeyEstimate:
+    return KeyEstimate(
+        backend="musicalkeycnn",
+        key=None,
+        key_number=None,
+        key_letter=None,
+        confidence=None,
+        elapsed_ms=None,
+        details={},
+        notes=[error_message],
+        available=False,
+    )
+
+
+def build_failed_essentia_estimate(error_message: str) -> EssentiaSemanticEstimate:
+    return EssentiaSemanticEstimate(
+        backend="essentia_semantics",
+        danceability_abs=None,
+        arousal_abs=None,
+        valence_abs=None,
+        mood_aggressive_abs=None,
+        mood_party_abs=None,
+        mood_relaxed_abs=None,
+        energy_essentia_fused=None,
+        energy_essentia_bucket=None,
+        elapsed_ms=None,
+        details={},
+        notes=[error_message],
+        available=False,
+    )
+
+
+def prepare_analysis_chunk(rows) -> tuple[list[PreparedTrack], list[tuple[object, str]]]:
+    prepared_tracks: list[PreparedTrack] = []
+    failures: list[tuple[object, str]] = []
+    for row in rows:
+        try:
+            track = track_from_playlist_row(row)
+            prepared_tracks.append(
+                PreparedTrack(
+                    row=row,
+                    track=track,
+                    position=int(row["position"]),
+                    resolved_path=track.file_path.resolve(),
+                )
+            )
+        except Exception as exc:
+            failures.append((row, str(exc)))
+    return prepared_tracks, failures
+
+
+def build_essentia_auxiliary_features_by_path(items) -> tuple[list[Path], dict[Path, dict[str, object]]]:
+    auxiliary_features_by_path: dict[Path, dict[str, object]] = {}
+    paths: list[Path] = []
+    for item in items:
+        row = item.row if isinstance(item, PreparedTrack) else item
+        path = (item.resolved_path if isinstance(item, PreparedTrack) else Path(row["file_path"]).resolve())
+        paths.append(path)
+        row_keys = set(row.keys()) if hasattr(row, "keys") else set()
+
+        def optional_value(key: str):
+            if row_keys and key not in row_keys:
+                return None
+            return row[key]
+
+        auxiliary_features_by_path[path] = {
+            "loudness_norm": optional_value("loudness_norm"),
+            "drums_abs": optional_value("drums_abs"),
+            "groove_abs": optional_value("groove_abs"),
+            "bass_abs": optional_value("bass_abs"),
+        }
+    return paths, auxiliary_features_by_path
+
+
+def run_dsp_lane(prepared_tracks: list[PreparedTrack], settings, analysis_mode: str) -> dict[Path, DspLaneResult]:
+    if not prepared_tracks:
+        return {}
+    worker_count = max(1, min(settings.analysis.dsp_workers, len(prepared_tracks)))
+    results: dict[Path, DspLaneResult] = {}
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_map = {
+            executor.submit(compute_dsp_lane_result, item.track, settings, analysis_mode): item
+            for item in prepared_tracks
+        }
+        for future, item in future_map.items():
+            try:
+                results[item.resolved_path] = future.result()
+            except Exception as exc:
+                results[item.resolved_path] = DspLaneResult.failure(track_id=item.track.id, error=exc)
+    return results
+
+
+def run_tempo_lane(prepared_tracks: list[PreparedTrack], settings) -> dict[Path, TempoEstimate]:
+    if not prepared_tracks:
+        return {}
+    results: dict[Path, TempoEstimate] = {}
+    for chunk in chunk_items(prepared_tracks, settings.analysis.tempo_chunk_size):
+        chunk_paths = [item.resolved_path for item in chunk]
+        try:
+            results.update(estimate_tempocnn_bpms(chunk_paths))
+        except Exception as exc:
+            failure = f"TempoCNN lane failed: {exc}"
+            for path in chunk_paths:
+                results[path] = build_failed_tempo_estimate(failure)
+    return results
+
+
+def run_key_lane(prepared_tracks: list[PreparedTrack], settings) -> dict[Path, KeyEstimate]:
+    if not prepared_tracks:
+        return {}
+    results: dict[Path, KeyEstimate] = {}
+    for chunk in chunk_items(prepared_tracks, settings.analysis.key_chunk_size):
+        chunk_paths = [item.resolved_path for item in chunk]
+        try:
+            results.update(
+                estimate_musicalkeycnn_keys(
+                    chunk_paths,
+                    model_path=settings.analysis.key_model_path,
+                    device=settings.analysis.key_device,
+                    policy=settings.analysis.key_policy,
+                )
+            )
+        except Exception as exc:
+            failure = f"MusicalKeyCNN lane failed: {exc}"
+            for path in chunk_paths:
+                results[path] = build_failed_key_estimate(failure)
+    return results
+
+
+def run_essentia_lane(
+    prepared_tracks: list[PreparedTrack],
+    settings,
+    analysis_mode: str,
+) -> dict[Path, EssentiaSemanticEstimate]:
+    if analysis_mode != "full" or not settings.analysis.essentia_semantics_enabled or not prepared_tracks:
+        return {}
+    results: dict[Path, EssentiaSemanticEstimate] = {}
+    for chunk in chunk_items(prepared_tracks, settings.analysis.essentia_chunk_size):
+        chunk_paths, auxiliary_features_by_path = build_essentia_auxiliary_features_by_path(chunk)
+        try:
+            results.update(
+                estimate_essentia_semantic_batch(
+                    chunk_paths,
+                    model_root=settings.analysis.essentia_semantic_model_root,
+                    image_name=settings.analysis.essentia_semantic_image,
+                    device=settings.analysis.essentia_semantic_device,
+                    family_policy=settings.analysis.essentia_semantic_model_family_policy,
+                    auxiliary_features_by_path=auxiliary_features_by_path,
+                )
+            )
+        except Exception as exc:
+            failure = f"Essentia semantics lane failed: {exc}"
+            for path in chunk_paths:
+                results[path] = build_failed_essentia_estimate(failure)
+    return results
+
+
+def estimate_lane_status(estimate, *, disabled: bool = False) -> str:
+    if disabled:
+        return "disabled"
+    if estimate is None:
+        return "failed"
+    if getattr(estimate, "available", False):
+        return "cached" if estimate_has_persistent_cache_hit(estimate) else "succeeded"
+    return "failed"
+
+
+def build_job_timing_breakdown(
+    *,
+    args,
+    settings,
+    effective_analysis_signature: str,
+    expected_essentia_semantic_signature: str,
+    lane_status: dict[str, str] | None = None,
+    degraded: bool = False,
+    missing_lanes: list[str] | None = None,
+    skipped: bool = False,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "analysis_mode": args.analysis_mode,
+        "analysis_signature": effective_analysis_signature,
+        "config_signature": settings.config_signature,
+        "tempo_backend": "tempocnn",
+        "tempocnn_accelerator": "auto",
+        "key_backend": "musicalkeycnn",
+        "musicalkeycnn_model": settings.analysis.key_model_path,
+        "musicalkeycnn_device": settings.analysis.key_device,
+        "musicalkeycnn_policy": settings.analysis.key_policy,
+        "essentia_semantics_enabled": settings.analysis.essentia_semantics_enabled,
+        "essentia_semantic_signature": expected_essentia_semantic_signature,
+        "skipped": skipped,
+    }
+    if lane_status is not None:
+        payload["lane_status"] = lane_status
+        payload["degraded"] = degraded
+        payload["missing_lanes"] = missing_lanes or []
+    return payload
 
 
 def track_from_playlist_row(row) -> object:
@@ -499,9 +707,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     analyze_relative_playlist_parser.add_argument(
         "--energy-source",
-        choices=["heuristic", "essentia_fused"],
+        choices=["canonical", "heuristic_legacy", "essentia_fused"],
         default=None,
-        help="Choose which absolute-energy source to use for relative scaling.",
+        help="Choose which absolute-energy source to use for relative scaling. "
+             "'canonical' uses the fused intensity score (energy_abs). "
+             "'heuristic_legacy' uses the old DSP-only heuristic score. "
+             "'essentia_fused' is a deprecated alias for 'canonical'.",
     )
 
     analyze_energy_playlist_parser = subparsers.add_parser(
@@ -567,6 +778,37 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         help="Optional file path to purge. Can be passed multiple times.",
+    )
+
+    benchmark_dsp_parser = subparsers.add_parser(
+        "benchmark-dsp",
+        help="Profile DSP pipeline substep timings for a playlist or explicit file paths.",
+    )
+    benchmark_dsp_parser.add_argument(
+        "--playlist",
+        default=None,
+        help="Playlist name to benchmark (reads file paths from DB).",
+    )
+    benchmark_dsp_parser.add_argument(
+        "--path",
+        action="append",
+        default=[],
+        help="Explicit file path to benchmark. Can be passed multiple times.",
+    )
+    benchmark_dsp_parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Optional track limit for a faster subset pass.",
+    )
+    benchmark_dsp_parser.add_argument(
+        "--output",
+        help="Output path for CSV or JSON report (extension determines format).",
+    )
+    benchmark_dsp_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit summary as JSON to stdout.",
     )
 
     return parser
@@ -684,161 +926,185 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
     )
 
     with Database(settings.database_path) as database:
+        if hasattr(database, "get_table_columns"):
+            track_feature_columns = database.get_table_columns("track_features_abs")
+            required_columns = {"energy_heuristic_abs"}
+            missing_columns = sorted(required_columns - track_feature_columns)
+            if missing_columns:
+                raise SystemExit(
+                    "The local database schema is out of date and is missing track_features_abs column(s): "
+                    f"{', '.join(missing_columns)}. Apply migrations first with "
+                    "powershell -ExecutionPolicy Bypass -File .\\scripts\\docker-compose.ps1 --profile ops run --rm migrate"
+                )
         rows = database.get_playlist_tracks(playlist_name)
         if not rows:
             raise SystemExit(f"Playlist '{playlist_name}' was not found. Import it first.")
 
         total = len(rows)
         processed = 0
+        dsp_diagnostics: list[DspLaneResult] = []
         tempo_diagnostics: list[TempoEstimate] = []
         key_diagnostics: list[KeyEstimate] = []
         essentia_diagnostics: list[EssentiaSemanticEstimate] = []
-        for chunk in chunk_items(rows):
-            prepared_tracks = []
-            for row in chunk:
+        for chunk in chunk_items(rows, settings.analysis.full_chunk_size):
+            prepared_tracks, prepare_failures = prepare_analysis_chunk(chunk)
+            for row, error_message in prepare_failures:
                 index = int(row["position"])
-                try:
-                    track = track_from_playlist_row(row)
-                except Exception as exc:
-                    print(f"[{index}/{total}] failed {row['track_id']}: {exc}", file=sys.stderr)
-                    continue
-                prepared_tracks.append({"row": row, "track": track})
+                print(f"[{index}/{total}] failed {row['track_id']}: {error_message}", file=sys.stderr)
 
-            pending_paths = [
-                item["track"].file_path
-                for item in prepared_tracks
-                if not should_skip_analysis(
-                    item["row"],
-                    item["track"],
+            pending_items: list[dict[str, object]] = []
+            for prepared in prepared_tracks:
+                row = prepared.row
+                track = prepared.track
+                index = prepared.position
+                start_time = time.perf_counter()
+                created_at = utc_now()
+                job_id = database.create_analysis_job(
+                    playlist_id=row["playlist_id"],
+                    track_id=row["track_id"],
+                    track_path=row["file_path"],
+                    analysis_mode=args.analysis_mode,
+                    analysis_signature=effective_analysis_signature,
+                    config_signature=settings.config_signature,
+                    source_file_hash=track.file_hash,
+                    priority=total - index,
+                    created_at=created_at,
+                )
+                database.mark_analysis_job_started(job_id, created_at)
+                database.upsert_track(track, utc_now())
+                if should_skip_analysis(
+                    row,
+                    track,
                     effective_analysis_signature=effective_analysis_signature,
                     config_signature=settings.config_signature,
                     analysis_mode=args.analysis_mode,
                     force=args.force,
                     expected_essentia_semantic_signature=expected_essentia_semantic_signature,
-                )
-            ]
-            prefetched_tempocnn_estimates: dict[Path, TempoEstimate] = {}
-            prefetched_musicalkeycnn_estimates: dict[Path, KeyEstimate] = {}
-            prefetched_essentia_semantic_estimates: dict[Path, EssentiaSemanticEstimate] = {}
-            if pending_paths:
-                prefetched_tempocnn_estimates, prefetched_musicalkeycnn_estimates = prefetch_bpm_and_key_estimates(
-                    pending_paths,
-                    settings,
-                )
-                if args.analysis_mode == "full":
-                    prefetched_essentia_semantic_estimates = prefetch_essentia_semantic_estimates(chunk, settings)
-
-            for item in prepared_tracks:
-                index = int(item["row"]["position"])
-                row = item["row"]
-                track = item["track"]
-                start_time = time.perf_counter()
-                job_id: int | None = None
-                try:
-                    created_at = utc_now()
-                    job_id = database.create_analysis_job(
-                        playlist_id=row["playlist_id"],
-                        track_id=row["track_id"],
-                        track_path=row["file_path"],
-                        analysis_mode=args.analysis_mode,
-                        analysis_signature=effective_analysis_signature,
-                        config_signature=settings.config_signature,
-                        source_file_hash=track.file_hash,
-                        priority=total - index,
-                        created_at=created_at,
+                ):
+                    duration_seconds = round(time.perf_counter() - start_time, 3)
+                    database.mark_analysis_job_completed(
+                        job_id,
+                        duration_seconds,
+                        build_job_timing_breakdown(
+                            args=args,
+                            settings=settings,
+                            effective_analysis_signature=effective_analysis_signature,
+                            expected_essentia_semantic_signature=expected_essentia_semantic_signature,
+                            skipped=True,
+                        ),
+                        utc_now(),
                     )
-                    database.mark_analysis_job_started(job_id, created_at)
-                    database.upsert_track(track, utc_now())
-                    if should_skip_analysis(
-                        row,
-                        track,
-                        effective_analysis_signature=effective_analysis_signature,
-                        config_signature=settings.config_signature,
-                        analysis_mode=args.analysis_mode,
-                        force=args.force,
-                        expected_essentia_semantic_signature=expected_essentia_semantic_signature,
-                    ):
-                        duration_seconds = round(time.perf_counter() - start_time, 3)
-                        database.mark_analysis_job_completed(
-                            job_id,
-                            duration_seconds,
-                            {
-                                "analysis_mode": args.analysis_mode,
-                                "analysis_signature": effective_analysis_signature,
-                                "config_signature": settings.config_signature,
-                                "tempo_backend": "tempocnn",
-                                "tempocnn_accelerator": "auto",
-                                "key_backend": "musicalkeycnn",
-                                "musicalkeycnn_model": settings.analysis.key_model_path,
-                                "musicalkeycnn_device": settings.analysis.key_device,
-                                "musicalkeycnn_policy": settings.analysis.key_policy,
-                                "essentia_semantics_enabled": settings.analysis.essentia_semantics_enabled,
-                                "essentia_semantic_signature": expected_essentia_semantic_signature,
-                                "skipped": True,
-                            },
-                            utc_now(),
-                        )
-                        print(
-                            f"[{index}/{total}] skipped {track.id} ({track.title}) - analysis is already current"
-                        )
-                        continue
+                    print(f"[{index}/{total}] skipped {track.id} ({track.title}) - analysis is already current")
+                    continue
+                pending_items.append(
+                    {
+                        "prepared": prepared,
+                        "job_id": job_id,
+                        "start_time": start_time,
+                    }
+                )
 
-                    result = analyze_track(
+            if not pending_items:
+                continue
+
+            pending_prepared = [item["prepared"] for item in pending_items]
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                dsp_future = executor.submit(run_dsp_lane, pending_prepared, settings, args.analysis_mode)
+                tempo_future = executor.submit(run_tempo_lane, pending_prepared, settings)
+                key_future = executor.submit(run_key_lane, pending_prepared, settings)
+                essentia_future = executor.submit(run_essentia_lane, pending_prepared, settings, args.analysis_mode)
+                prefetched_dsp_results = dsp_future.result()
+                prefetched_tempocnn_estimates = tempo_future.result()
+                prefetched_musicalkeycnn_estimates = key_future.result()
+                prefetched_essentia_semantic_estimates = essentia_future.result()
+
+            for item in pending_items:
+                prepared = item["prepared"]
+                row = prepared.row
+                track = prepared.track
+                index = prepared.position
+                start_time = float(item["start_time"])
+                job_id = int(item["job_id"])
+                resolved_path = prepared.resolved_path
+
+                dsp_result = prefetched_dsp_results.get(resolved_path)
+                tempo_estimate = prefetched_tempocnn_estimates.get(resolved_path)
+                key_estimate = prefetched_musicalkeycnn_estimates.get(resolved_path)
+                essentia_estimate = prefetched_essentia_semantic_estimates.get(resolved_path)
+
+                if dsp_result is not None:
+                    dsp_diagnostics.append(dsp_result)
+                if tempo_estimate is not None:
+                    tempo_diagnostics.append(tempo_estimate)
+                if key_estimate is not None:
+                    key_diagnostics.append(key_estimate)
+                if essentia_estimate is not None:
+                    essentia_diagnostics.append(essentia_estimate)
+
+                try:
+                    if dsp_result is None or not dsp_result.available:
+                        raise ValueError(
+                            dsp_result.error if dsp_result is not None and dsp_result.error else "DSP lane failed."
+                        )
+
+                    result = build_analysis_result(
                         track,
                         settings,
                         args.analysis_mode,
+                        dsp_result=dsp_result,
                         tempo_backend="tempocnn",
                         tempocnn_accelerator="auto",
-                        prefetched_tempocnn_estimate=prefetched_tempocnn_estimates.get(track.file_path.resolve()),
+                        prefetched_tempocnn_estimate=tempo_estimate,
                         key_backend="musicalkeycnn",
                         musicalkeycnn_model=settings.analysis.key_model_path,
                         musicalkeycnn_device=settings.analysis.key_device,
                         musicalkeycnn_policy=settings.analysis.key_policy,
-                        prefetched_musicalkeycnn_estimate=prefetched_musicalkeycnn_estimates.get(track.file_path.resolve()),
-                        prefetched_essentia_semantic_estimate=prefetched_essentia_semantic_estimates.get(track.file_path.resolve()),
+                        prefetched_musicalkeycnn_estimate=key_estimate,
+                        prefetched_essentia_semantic_estimate=essentia_estimate,
                         analysis_signature=effective_analysis_signature,
                     )
-                    tempo_estimate = prefetched_tempocnn_estimates.get(track.file_path.resolve())
-                    if tempo_estimate is not None:
-                        tempo_diagnostics.append(tempo_estimate)
-                    key_estimate = prefetched_musicalkeycnn_estimates.get(track.file_path.resolve())
-                    if key_estimate is not None:
-                        key_diagnostics.append(key_estimate)
-                    essentia_estimate = prefetched_essentia_semantic_estimates.get(track.file_path.resolve())
-                    if essentia_estimate is not None:
-                        essentia_diagnostics.append(essentia_estimate)
+                    lane_status = {
+                        "dsp": estimate_lane_status(dsp_result),
+                        "tempocnn": estimate_lane_status(tempo_estimate),
+                        "musicalkeycnn": estimate_lane_status(key_estimate),
+                        "essentia_semantics": estimate_lane_status(
+                            essentia_estimate,
+                            disabled=(args.analysis_mode != "full" or not settings.analysis.essentia_semantics_enabled),
+                        ),
+                    }
+                    missing_lanes = [lane for lane, status in lane_status.items() if status == "failed"]
+                    degraded = bool(missing_lanes)
                     database.upsert_track_features(result)
                     duration_seconds = round(time.perf_counter() - start_time, 3)
                     database.mark_analysis_job_completed(
                         job_id,
                         duration_seconds,
-                        {
-                            "analysis_mode": args.analysis_mode,
-                            "analysis_signature": effective_analysis_signature,
-                            "config_signature": settings.config_signature,
-                            "tempo_backend": "tempocnn",
-                            "tempocnn_accelerator": "auto",
-                            "key_backend": "musicalkeycnn",
-                            "musicalkeycnn_model": settings.analysis.key_model_path,
-                            "musicalkeycnn_device": settings.analysis.key_device,
-                            "musicalkeycnn_policy": settings.analysis.key_policy,
-                            "essentia_semantics_enabled": settings.analysis.essentia_semantics_enabled,
-                            "essentia_semantic_signature": expected_essentia_semantic_signature,
-                        },
+                        build_job_timing_breakdown(
+                            args=args,
+                            settings=settings,
+                            effective_analysis_signature=effective_analysis_signature,
+                            expected_essentia_semantic_signature=expected_essentia_semantic_signature,
+                            lane_status=lane_status,
+                            degraded=degraded,
+                            missing_lanes=missing_lanes,
+                        ),
                         utc_now(),
                     )
                     processed += 1
+                    degraded_suffix = ""
+                    if degraded:
+                        degraded_suffix = f" (degraded: missing {', '.join(missing_lanes)})"
                     print(
-                        f"[{index}/{total}] analyzed {track.id} ({track.title}) -> "
+                        f"[{index}/{total}] analyzed {track.id} ({track.title}){degraded_suffix} -> "
                         f"{result.bpm:.1f} BPM ({result.bpm_source}), {result.key} ({result.key_source})"
                     )
                 except Exception as exc:
                     duration_seconds = round(time.perf_counter() - start_time, 3)
-                    if job_id is not None:
-                        database.mark_analysis_job_failed(job_id, str(exc), duration_seconds, utc_now())
+                    database.mark_analysis_job_failed(job_id, str(exc), duration_seconds, utc_now())
                     print(f"[{index}/{total}] failed {track.id}: {exc}", file=sys.stderr)
 
     print(f"Completed playlist analysis for '{playlist_name}'. Updated {processed} track(s).")
+    print_backend_diagnostics("DSP local lane", dsp_diagnostics, requested_device="cpu")
     print_backend_diagnostics("TempoCNN", tempo_diagnostics, requested_device="auto")
     print_backend_diagnostics("MusicalKeyCNN", key_diagnostics, requested_device=settings.analysis.key_device)
     if args.analysis_mode == "full":
@@ -972,7 +1238,7 @@ def handle_analyze_bpm_playlist(args: argparse.Namespace) -> int:
     if not args.json:
         print(f"Playlist '{args.playlist}' BPM pass with backend tempocnn")
 
-    for chunk in chunk_items(rows):
+    for chunk in chunk_items(rows, settings.analysis.tempo_chunk_size):
         prefetched_tempocnn_estimates = estimate_tempocnn_bpms([Path(row["file_path"]) for row in chunk])
 
         for row in chunk:
@@ -1057,7 +1323,8 @@ def handle_analyze_bpm_key_playlist(args: argparse.Namespace) -> int:
     if not args.json:
         print(f"Playlist '{args.playlist}' BPM+key pass with TempoCNN + MusicalKeyCNN")
 
-    for chunk in chunk_items(rows):
+    bpm_key_chunk_size = min(settings.analysis.tempo_chunk_size, settings.analysis.key_chunk_size)
+    for chunk in chunk_items(rows, bpm_key_chunk_size):
         chunk_paths = [Path(row["file_path"]) for row in chunk]
         prefetched_tempocnn_estimates, prefetched_musicalkeycnn_estimates = prefetch_bpm_and_key_estimates(
             chunk_paths,
@@ -1142,6 +1409,12 @@ def handle_analyze_relative_playlist(args: argparse.Namespace) -> int:
         rows = rows[: args.limit]
 
     energy_source = args.energy_source or settings.analysis.energy_source_default
+    # Normalize deprecated alias
+    if energy_source == "essentia_fused":
+        energy_source = "canonical"
+    # Map old config value for backward compat
+    if energy_source == "heuristic":
+        energy_source = "heuristic_legacy"
 
     preview = compute_relative_playlist_preview(
         [row_to_relative_track_input(row) for row in rows],
@@ -1169,16 +1442,13 @@ def handle_analyze_relative_playlist(args: argparse.Namespace) -> int:
             print("Adapted weights skipped")
         for note in stats.weight_adaptation_notes:
             print(f"- {note}")
-        if energy_source == "essentia_fused":
-            fallback_count = sum(1 for track in preview.tracks if track.energy_source_used != energy_source)
-            if fallback_count:
-                print(f"- {energy_source} unavailable for {fallback_count} track(s); heuristic fallback was used per-track")
+        if energy_source == "canonical":
             essentia_rows = [row for row in rows if row["energy_essentia_fused"] is not None]
             if essentia_rows:
                 signatures = sorted({str(row["essentia_semantic_signature"]) for row in essentia_rows if row["essentia_semantic_signature"]})
                 sources = sorted({str(row["essentia_semantic_source"]) for row in essentia_rows if row["essentia_semantic_source"]})
-                print("Essentia fused diagnostics:")
-                print(f"- persisted_rows: {len(essentia_rows)}/{len(rows)}")
+                print("Canonical energy diagnostics:")
+                print(f"- essentia_fused_rows: {len(essentia_rows)}/{len(rows)}")
                 if signatures:
                     print(f"- semantic_signature(s): {', '.join(signatures)}")
                 if sources:
@@ -1381,49 +1651,50 @@ def handle_analyze_essentia_playlist(args: argparse.Namespace) -> int:
     if args.limit and args.limit > 0:
         rows = rows[: args.limit]
 
-    estimates = prefetch_essentia_semantic_estimates(rows, settings)
     payload_rows: list[dict[str, object]] = []
     diagnostics_estimates: list[EssentiaSemanticEstimate] = []
     total = len(rows)
     if not args.json:
         print(f"Playlist '{args.playlist}' Essentia semantic preview")
 
-    for row in rows:
-        index = int(row["position"])
-        path = Path(row["file_path"]).resolve()
-        estimate = estimates.get(path)
-        if estimate is not None:
-            diagnostics_estimates.append(estimate)
-        payload = {
-            "position": index,
-            "track_id": row["track_id"],
-            "title": row["title"],
-            "artist": row["artist"],
-            "file_path": path.as_posix(),
-            "available": estimate.available if estimate is not None else False,
-            "danceability_abs": estimate.danceability_abs if estimate is not None else None,
-            "arousal_abs": estimate.arousal_abs if estimate is not None else None,
-            "valence_abs": estimate.valence_abs if estimate is not None else None,
-            "mood_aggressive_abs": estimate.mood_aggressive_abs if estimate is not None else None,
-            "mood_party_abs": estimate.mood_party_abs if estimate is not None else None,
-            "mood_relaxed_abs": estimate.mood_relaxed_abs if estimate is not None else None,
-            "energy_essentia_fused": estimate.energy_essentia_fused if estimate is not None else None,
-            "energy_essentia_bucket": estimate.energy_essentia_bucket if estimate is not None else None,
-            "notes": [] if estimate is None else estimate.notes,
-        }
-        payload_rows.append(payload)
-        if not args.json:
-            title = row["title"] or path.stem
-            fused_label = "none" if payload["energy_essentia_fused"] is None else f"{float(payload['energy_essentia_fused']):.3f}"
-            print(
-                f"[{index}/{total}] {title} :: "
-                f"danceability={payload['danceability_abs'] if payload['danceability_abs'] is not None else 'none'} :: "
-                f"arousal={payload['arousal_abs'] if payload['arousal_abs'] is not None else 'none'} :: "
-                f"party={payload['mood_party_abs'] if payload['mood_party_abs'] is not None else 'none'} :: "
-                f"relaxed={payload['mood_relaxed_abs'] if payload['mood_relaxed_abs'] is not None else 'none'} :: "
-                f"fused={fused_label} :: "
-                f"bucket={payload['energy_essentia_bucket'] or 'none'}"
-            )
+    for chunk in chunk_items(rows, settings.analysis.essentia_chunk_size):
+        estimates = prefetch_essentia_semantic_estimates(chunk, settings)
+        for row in chunk:
+            index = int(row["position"])
+            path = Path(row["file_path"]).resolve()
+            estimate = estimates.get(path)
+            if estimate is not None:
+                diagnostics_estimates.append(estimate)
+            payload = {
+                "position": index,
+                "track_id": row["track_id"],
+                "title": row["title"],
+                "artist": row["artist"],
+                "file_path": path.as_posix(),
+                "available": estimate.available if estimate is not None else False,
+                "danceability_abs": estimate.danceability_abs if estimate is not None else None,
+                "arousal_abs": estimate.arousal_abs if estimate is not None else None,
+                "valence_abs": estimate.valence_abs if estimate is not None else None,
+                "mood_aggressive_abs": estimate.mood_aggressive_abs if estimate is not None else None,
+                "mood_party_abs": estimate.mood_party_abs if estimate is not None else None,
+                "mood_relaxed_abs": estimate.mood_relaxed_abs if estimate is not None else None,
+                "energy_essentia_fused": estimate.energy_essentia_fused if estimate is not None else None,
+                "energy_essentia_bucket": estimate.energy_essentia_bucket if estimate is not None else None,
+                "notes": [] if estimate is None else estimate.notes,
+            }
+            payload_rows.append(payload)
+            if not args.json:
+                title = row["title"] or path.stem
+                fused_label = "none" if payload["energy_essentia_fused"] is None else f"{float(payload['energy_essentia_fused']):.3f}"
+                print(
+                    f"[{index}/{total}] {title} :: "
+                    f"danceability={payload['danceability_abs'] if payload['danceability_abs'] is not None else 'none'} :: "
+                    f"arousal={payload['arousal_abs'] if payload['arousal_abs'] is not None else 'none'} :: "
+                    f"party={payload['mood_party_abs'] if payload['mood_party_abs'] is not None else 'none'} :: "
+                    f"relaxed={payload['mood_relaxed_abs'] if payload['mood_relaxed_abs'] is not None else 'none'} :: "
+                    f"fused={fused_label} :: "
+                    f"bucket={payload['energy_essentia_bucket'] or 'none'}"
+                )
 
     if args.json:
         print(json.dumps({"playlist": args.playlist, "tracks": payload_rows}, indent=2, sort_keys=True))
@@ -1496,6 +1767,56 @@ def handle_purge_model_cache(args: argparse.Namespace) -> int:
     return 0
 
 
+def handle_benchmark_dsp(args: argparse.Namespace) -> int:
+    from cuemate_analysis.dsp_benchmark import (
+        benchmark_dsp_paths,
+        summarize_dsp_benchmark,
+        write_benchmark_csv,
+        write_benchmark_json,
+    )
+
+    settings = load_runtime_settings()
+    paths: list[Path] = []
+
+    if args.playlist:
+        with Database(settings.database_path) as database:
+            rows = database.get_playlist_relative_inputs(args.playlist)
+            if not rows:
+                raise SystemExit(f"Playlist '{args.playlist}' was not found.")
+            paths.extend(Path(row["file_path"]) for row in rows)
+
+    if args.path:
+        paths.extend(Path(p).expanduser().resolve() for p in args.path)
+
+    if not paths:
+        raise SystemExit("Provide --playlist or --path to specify files to benchmark.")
+
+    if args.limit and args.limit > 0:
+        paths = paths[: args.limit]
+
+    print(f"Benchmarking DSP pipeline for {len(paths)} track(s)...")
+    samples = benchmark_dsp_paths(paths, settings)
+    summary = summarize_dsp_benchmark(samples)
+
+    if args.json:
+        print(json.dumps({"track_count": len(samples), "summary": summary}, indent=2, sort_keys=True))
+    else:
+        print(f"\nDSP Benchmark Summary ({len(samples)} tracks):")
+        for key, value in sorted(summary.items()):
+            print(f"  {key}: {value:.4f}s")
+
+    if args.output:
+        output_path = Path(args.output).expanduser().resolve()
+        if output_path.suffix == ".json":
+            write_benchmark_json(samples, summary, output_path)
+        else:
+            write_benchmark_csv(samples, output_path)
+        if not args.json:
+            print(f"\nReport written to {output_path}")
+
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -1531,6 +1852,8 @@ def main(argv: list[str] | None = None) -> int:
             return handle_analyze_essentia_playlist(args)
         if args.command == "purge-model-cache":
             return handle_purge_model_cache(args)
+        if args.command == "benchmark-dsp":
+            return handle_benchmark_dsp(args)
     except sqlite3.OperationalError as exc:
         message = str(exc)
         if "no such table" in message.lower():

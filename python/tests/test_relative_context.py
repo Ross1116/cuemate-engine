@@ -60,11 +60,11 @@ def _insert_absolute_track(
         INSERT INTO track_features_abs (
           track_id, source_file_hash, bpm, bpm_confidence, bpm_source, time_signature,
           time_signature_confidence, key, key_number, key_letter, key_confidence, key_source,
-          key_imported, key_tagged, key_agreement, energy_abs, energy_sustained, energy_peak,
+          key_imported, key_tagged, key_agreement, energy_abs, energy_heuristic_abs, energy_sustained, energy_peak,
           loudness_lufs, loudness_norm, bass_abs, drums_abs, harmonic_abs, groove_abs,
           vocals_abs, vocals_confidence, analysis_mode, analyzed_at, analysis_signature,
           config_signature, scoring_contract_id_at_analysis
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             track_id,
@@ -82,6 +82,7 @@ def _insert_absolute_track(
             None,
             key,
             1,
+            energy,
             energy,
             energy,
             energy,
@@ -153,6 +154,9 @@ def _load_relative_rows(database_path: Path, playlist_name: str):
           f.bpm,
           f.key,
           f.energy_abs,
+          f.energy_heuristic_abs,
+          f.energy_essentia_fused,
+          f.energy_essentia_bucket,
           f.bass_abs,
           f.drums_abs,
           f.harmonic_abs,
@@ -281,6 +285,7 @@ def test_relative_preview_can_use_essentia_fused_with_heuristic_fallback() -> No
             bpm=120.0 + index,
             key="8A",
             energy_abs=0.20 + (index * 0.05),
+            energy_heuristic_abs=0.20 + (index * 0.05),
             energy_essentia_fused=None if index == 1 else 0.15 + (index * 0.07),
             energy_essentia_bucket=None,
             bass_abs=0.20 + (index * 0.05),
@@ -300,10 +305,10 @@ def test_relative_preview_can_use_essentia_fused_with_heuristic_fallback() -> No
         settings,
         playlist_name="Essentia",
         is_limited=False,
-        energy_source="essentia_fused",
+        energy_source="canonical",
     )
-    assert preview.tracks[0].energy_source_used == "heuristic"
-    assert any(track.energy_source_used == "essentia_fused" for track in preview.tracks[1:])
+    assert preview.tracks[0].energy_source_used == "canonical"
+    assert all(track.energy_source_used == "canonical" for track in preview.tracks)
 
 
 def test_cli_analyze_relative_playlist_json_and_csv(tmp_path: Path, monkeypatch, capsys) -> None:
@@ -323,6 +328,7 @@ def test_cli_analyze_relative_playlist_json_and_csv(tmp_path: Path, monkeypatch,
             thresholds=settings.thresholds,
             scoring=settings.scoring,
             weight_adaptation=settings.weight_adaptation,
+            semantic_calibration=settings.semantic_calibration,
         ),
     )
     output_path = tmp_path / "relative.csv"

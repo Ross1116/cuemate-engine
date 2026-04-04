@@ -44,6 +44,7 @@ class RelativeTrackInput:
     bpm: float | None
     key: str | None
     energy_abs: float | None
+    energy_heuristic_abs: float | None
     energy_essentia_fused: float | None
     energy_essentia_bucket: str | None
     bass_abs: float | None
@@ -153,6 +154,7 @@ def row_to_relative_track_input(row) -> RelativeTrackInput:
         bpm=float(read_optional("bpm")) if read_optional("bpm") is not None else None,
         key=str(read_optional("key")) if read_optional("key") is not None else None,
         energy_abs=float(read_optional("energy_abs")) if read_optional("energy_abs") is not None else None,
+        energy_heuristic_abs=float(read_optional("energy_heuristic_abs")) if read_optional("energy_heuristic_abs") is not None else None,
         energy_essentia_fused=float(read_optional("energy_essentia_fused")) if read_optional("energy_essentia_fused") is not None else None,
         energy_essentia_bucket=str(read_optional("energy_essentia_bucket")) if read_optional("energy_essentia_bucket") is not None else None,
         bass_abs=float(read_optional("bass_abs")) if read_optional("bass_abs") is not None else None,
@@ -378,10 +380,16 @@ def compute_relative_playlist_preview(
     track_count_total = len(rows)
     analyzed_tracks = [row for row in rows if row.has_absolute_analysis]
     def resolve_effective_energy(track: RelativeTrackInput) -> tuple[float | None, str]:
-        if energy_source == "essentia_fused" and track.energy_essentia_fused is not None:
-            return float(track.energy_essentia_fused), "essentia_fused"
+        if energy_source == "heuristic_legacy":
+            if track.energy_heuristic_abs is not None:
+                return float(track.energy_heuristic_abs), "heuristic_legacy"
+            # Fallback: pre-contract-change rows may not have energy_heuristic_abs
+            if track.energy_abs is not None:
+                return float(track.energy_abs), "heuristic_legacy_fallback"
+            return None, "missing"
+        # canonical (default): use energy_abs which is now the fused canonical score
         if track.energy_abs is not None:
-            return float(track.energy_abs), "heuristic"
+            return float(track.energy_abs), "canonical"
         return None, "missing"
 
     eligible_tracks = [

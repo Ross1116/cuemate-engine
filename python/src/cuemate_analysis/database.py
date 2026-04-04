@@ -141,6 +141,10 @@ class Database:
             (playlist_name,),
         ).fetchall()
 
+    def get_table_columns(self, table_name: str) -> set[str]:
+        rows = self.connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+        return {str(row[1]) for row in rows}
+
     def get_playlist_relative_inputs(self, playlist_name: str) -> list[sqlite3.Row]:
         return self.connection.execute(
             """
@@ -156,6 +160,7 @@ class Database:
               f.bpm,
               f.key,
               f.energy_abs,
+              f.energy_heuristic_abs,
               f.energy_essentia_fused,
               f.energy_essentia_bucket,
               f.danceability_abs,
@@ -170,6 +175,8 @@ class Database:
               f.groove_abs,
               f.vocals_abs,
               f.vocals_confidence,
+              f.essentia_semantic_signature,
+              f.essentia_semantic_source,
               f.analyzed_at,
               f.analysis_signature,
               f.config_signature
@@ -280,7 +287,7 @@ class Database:
                   track_id, user_id, source_file_hash, bpm, bpm_confidence, bpm_source,
                   time_signature, time_signature_confidence, key, key_number, key_letter,
                   key_confidence, key_source, key_imported, key_tagged, key_agreement,
-                  energy_abs, energy_sustained, energy_peak, danceability_abs, arousal_abs, valence_abs,
+                  energy_abs, energy_heuristic_abs, energy_sustained, energy_peak, danceability_abs, arousal_abs, valence_abs,
                   mood_aggressive_abs, mood_party_abs, mood_relaxed_abs,
                   energy_essentia_fused, energy_essentia_bucket, essentia_semantic_signature,
                   essentia_semantic_source, essentia_semantic_inferred_at, loudness_lufs, loudness_norm,
@@ -291,7 +298,7 @@ class Database:
                   :track_id, :user_id, :source_file_hash, :bpm, :bpm_confidence, :bpm_source,
                   :time_signature, :time_signature_confidence, :key, :key_number, :key_letter,
                   :key_confidence, :key_source, :key_imported, :key_tagged, :key_agreement,
-                  :energy_abs, :energy_sustained, :energy_peak, :danceability_abs, :arousal_abs, :valence_abs,
+                  :energy_abs, :energy_heuristic_abs, :energy_sustained, :energy_peak, :danceability_abs, :arousal_abs, :valence_abs,
                   :mood_aggressive_abs, :mood_party_abs, :mood_relaxed_abs,
                   :energy_essentia_fused, :energy_essentia_bucket, :essentia_semantic_signature,
                   :essentia_semantic_source, :essentia_semantic_inferred_at, :loudness_lufs, :loudness_norm,
@@ -315,6 +322,7 @@ class Database:
                   key_tagged = excluded.key_tagged,
                   key_agreement = excluded.key_agreement,
                   energy_abs = excluded.energy_abs,
+                  energy_heuristic_abs = excluded.energy_heuristic_abs,
                   energy_sustained = excluded.energy_sustained,
                   energy_peak = excluded.energy_peak,
                   danceability_abs = excluded.danceability_abs,

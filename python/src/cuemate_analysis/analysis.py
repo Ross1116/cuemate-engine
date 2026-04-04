@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import math
 import re
+import time
 
 import librosa
 import numpy as np
@@ -92,10 +93,10 @@ class TrackDspArtifacts:
     rms: np.ndarray
     spectral_centroid: np.ndarray
     onset_env: np.ndarray
-    beat_frames: np.ndarray
-    beat_times: np.ndarray
     n_fft: int = DEFAULT_N_FFT
     hop_length: int = DEFAULT_HOP_LENGTH
+    _beat_frames: np.ndarray | None = None
+    _beat_times: np.ndarray | None = None
     _hpss: tuple[np.ndarray, np.ndarray] | None = None
     _percussive_onset_env: np.ndarray | None = None
     _pulse: np.ndarray | None = None
@@ -115,12 +116,10 @@ class TrackDspArtifacts:
         stft = librosa.stft(y=y, n_fft=n_fft, hop_length=hop_length)
         magnitude = np.abs(stft)
         frequencies = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
-        rms = librosa.feature.rms(y=y, hop_length=hop_length)[0]
-        spectral_centroid = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
-        onset_env = librosa.onset.onset_strength(y=y, sr=sr)
-        _, beat_frames = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr)
-        beat_frames = np.asarray(beat_frames, dtype=int)
-        beat_times = librosa.frames_to_time(beat_frames, sr=sr, hop_length=hop_length)
+        # Reuse magnitude spectrogram instead of recomputing from waveform.
+        rms = librosa.feature.rms(S=magnitude, hop_length=hop_length)[0]
+        spectral_centroid = librosa.feature.spectral_centroid(S=magnitude, sr=sr)[0]
+        onset_env = librosa.onset.onset_strength(S=librosa.feature.melspectrogram(S=magnitude**2, sr=sr), sr=sr)
         return cls(
             y=y,
             sr=sr,
@@ -131,11 +130,24 @@ class TrackDspArtifacts:
             rms=rms,
             spectral_centroid=spectral_centroid,
             onset_env=onset_env,
-            beat_frames=beat_frames,
-            beat_times=beat_times,
             n_fft=n_fft,
             hop_length=hop_length,
         )
+
+    @property
+    def beat_frames(self) -> np.ndarray:
+        if self._beat_frames is None:
+            _, frames = librosa.beat.beat_track(onset_envelope=self.onset_env, sr=self.sr)
+            self._beat_frames = np.asarray(frames, dtype=int)
+        return self._beat_frames
+
+    @property
+    def beat_times(self) -> np.ndarray:
+        if self._beat_times is None:
+            self._beat_times = librosa.frames_to_time(
+                self.beat_frames, sr=self.sr, hop_length=self.hop_length,
+            )
+        return self._beat_times
 
     @property
     def hpss(self) -> tuple[np.ndarray, np.ndarray]:
@@ -194,6 +206,76 @@ class TrackDspArtifacts:
                 except Exception:
                     self._harmonic_chroma = librosa.feature.chroma_cqt(y=self.y, sr=self.sr)
         return self._harmonic_chroma
+
+
+@dataclass
+class DspLaneResult:
+    track_id: str
+    y: np.ndarray | None
+    sr: int | None
+    artifacts: TrackDspArtifacts | None
+    energy: dict[str, float] | None
+    loudness: dict[str, float] | None
+    bass_abs: float | None
+    time_signature: dict[str, str | float] | None
+    full_features: dict[str, float | None]
+    elapsed_ms: float | None
+    details: dict[str, object] = field(default_factory=dict)
+    notes: list[str] = field(default_factory=list)
+    available: bool = True
+    error: str | None = None
+
+    @classmethod
+    def success(
+        cls,
+        *,
+        track_id: str,
+        y: np.ndarray,
+        sr: int,
+        artifacts: TrackDspArtifacts,
+        energy: dict[str, float],
+        loudness: dict[str, float],
+        bass_abs: float,
+        time_signature: dict[str, str | float],
+        full_features: dict[str, float | None],
+        elapsed_ms: float,
+    ) -> "DspLaneResult":
+        return cls(
+            track_id=track_id,
+            y=y,
+            sr=sr,
+            artifacts=artifacts,
+            energy=energy,
+            loudness=loudness,
+            bass_abs=bass_abs,
+            time_signature=time_signature,
+            full_features=full_features,
+            elapsed_ms=elapsed_ms,
+            details={"runner_device": "cpu"},
+            notes=["Shared local DSP lane."],
+            available=True,
+            error=None,
+        )
+
+    @classmethod
+    def failure(cls, *, track_id: str, error: Exception | str, elapsed_ms: float | None = None) -> "DspLaneResult":
+        message = str(error)
+        return cls(
+            track_id=track_id,
+            y=None,
+            sr=None,
+            artifacts=None,
+            energy=None,
+            loudness=None,
+            bass_abs=None,
+            time_signature=None,
+            full_features={"drums_abs": None, "harmonic_abs": None, "groove_abs": None},
+            elapsed_ms=elapsed_ms,
+            details={"runner_device": "cpu"},
+            notes=[message],
+            available=False,
+            error=message,
+        )
 
 
 def build_track_dsp_artifacts(
@@ -762,11 +844,57 @@ def extract_full_features(
     }
 
 
-def analyze_track(
+def load_track_audio(track: ImportedTrack, settings: RuntimeSettings) -> tuple[np.ndarray, int, TrackDspArtifacts]:
+    y, sr = librosa.load(
+        track.file_path.as_posix(),
+        sr=settings.analysis.sample_rate,
+        mono=settings.analysis.mono,
+    )
+    if y.size == 0:
+        raise ValueError(f"No audio samples decoded for {track.file_path}")
+    return y, sr, build_track_dsp_artifacts(y, sr)
+
+
+def compute_dsp_lane_result(
+    track: ImportedTrack,
+    settings: RuntimeSettings,
+    analysis_mode: str,
+) -> DspLaneResult:
+    started = time.perf_counter()
+    try:
+        y, sr, artifacts = load_track_audio(track, settings)
+        energy = extract_energy(artifacts=artifacts)
+        loudness = extract_loudness(artifacts=artifacts)
+        bass_abs = extract_bass_ratio(artifacts=artifacts)
+        time_signature = detect_time_signature(artifacts=artifacts)
+        if analysis_mode == "full":
+            full_features = extract_full_features(artifacts=artifacts)
+        else:
+            full_features = {"drums_abs": None, "harmonic_abs": None, "groove_abs": None}
+        elapsed_ms = round((time.perf_counter() - started) * 1000.0, 1)
+        return DspLaneResult.success(
+            track_id=track.id,
+            y=y,
+            sr=sr,
+            artifacts=artifacts,
+            energy=energy,
+            loudness=loudness,
+            bass_abs=bass_abs,
+            time_signature=time_signature,
+            full_features=full_features,
+            elapsed_ms=elapsed_ms,
+        )
+    except Exception as exc:
+        elapsed_ms = round((time.perf_counter() - started) * 1000.0, 1)
+        return DspLaneResult.failure(track_id=track.id, error=exc, elapsed_ms=elapsed_ms)
+
+
+def build_analysis_result(
     track: ImportedTrack,
     settings: RuntimeSettings,
     analysis_mode: str,
     *,
+    dsp_result: DspLaneResult,
     tempo_backend: str = "tempocnn",
     tempocnn_model: str | None = None,
     tempocnn_accelerator: str = "auto",
@@ -780,30 +908,24 @@ def analyze_track(
     prefetched_essentia_semantic_estimate: EssentiaSemanticEstimate | None = None,
     analysis_signature: str | None = None,
 ) -> AnalysisResult:
-    y, sr = librosa.load(
-        track.file_path.as_posix(),
-        sr=settings.analysis.sample_rate,
-        mono=settings.analysis.mono,
-    )
-    if y.size == 0:
-        raise ValueError(f"No audio samples decoded for {track.file_path}")
-    artifacts = build_track_dsp_artifacts(y, sr)
+    if not dsp_result.available or dsp_result.y is None or dsp_result.sr is None or dsp_result.artifacts is None:
+        raise ValueError(dsp_result.error or f"DSP lane was unavailable for {track.file_path}")
 
     bpm = resolve_bpm_with_backend(
         track,
-        y,
-        sr,
+        dsp_result.y,
+        dsp_result.sr,
         tempo_backend=tempo_backend,
         tempocnn_model=tempocnn_model,
         tempocnn_accelerator=tempocnn_accelerator,
         prefetched_tempocnn_estimate=prefetched_tempocnn_estimate,
-        artifacts=artifacts,
+        artifacts=dsp_result.artifacts,
     )
     effective_key_backend = key_backend or settings.analysis.key_backend
     key = resolve_key_with_backend(
         track,
-        y,
-        sr,
+        dsp_result.y,
+        dsp_result.sr,
         key_backend=effective_key_backend,
         musicalkeycnn_model=musicalkeycnn_model or settings.analysis.key_model_path,
         musicalkeycnn_image=musicalkeycnn_image,
@@ -811,19 +933,6 @@ def analyze_track(
         musicalkeycnn_policy=musicalkeycnn_policy or settings.analysis.key_policy,
         prefetched_musicalkeycnn_estimate=prefetched_musicalkeycnn_estimate,
     )
-    energy = extract_energy(artifacts=artifacts)
-    loudness = extract_loudness(artifacts=artifacts)
-    bass_abs = extract_bass_ratio(artifacts=artifacts)
-    time_signature = detect_time_signature(artifacts=artifacts)
-
-    if analysis_mode == "full":
-        full_features = extract_full_features(artifacts=artifacts)
-    else:
-        full_features = {
-            "drums_abs": None,
-            "harmonic_abs": None,
-            "groove_abs": None,
-        }
 
     danceability_abs: float | None = None
     arousal_abs: float | None = None
@@ -843,8 +952,39 @@ def analyze_track(
         mood_aggressive_abs = prefetched_essentia_semantic_estimate.mood_aggressive_abs
         mood_party_abs = prefetched_essentia_semantic_estimate.mood_party_abs
         mood_relaxed_abs = prefetched_essentia_semantic_estimate.mood_relaxed_abs
-        energy_essentia_fused = prefetched_essentia_semantic_estimate.energy_essentia_fused
-        energy_essentia_bucket = prefetched_essentia_semantic_estimate.energy_essentia_bucket
+        if None not in (
+            danceability_abs,
+            arousal_abs,
+            valence_abs,
+            mood_aggressive_abs,
+            mood_party_abs,
+            mood_relaxed_abs,
+        ):
+            cal = settings.semantic_calibration
+            cal_arousal = cal.calibrate("arousal_abs", float(arousal_abs))
+            cal_danceability = cal.calibrate("danceability_abs", float(danceability_abs))
+            cal_party = cal.calibrate("mood_party_abs", float(mood_party_abs))
+            cal_relaxed = cal.calibrate("mood_relaxed_abs", float(mood_relaxed_abs))
+            cal_aggressive = cal.calibrate("mood_aggressive_abs", float(mood_aggressive_abs))
+            energy_essentia_fused = clamp(
+                (0.34 * cal_arousal)
+                + (0.18 * cal_danceability)
+                + (0.16 * cal_party)
+                + (0.14 * (1.0 - cal_relaxed))
+                + (0.08 * cal_aggressive)
+                + (0.04 * float(dsp_result.loudness["loudness_norm"]))
+                + (0.03 * float(dsp_result.full_features["drums_abs"] or 0.0))
+                + (0.02 * float(dsp_result.full_features["groove_abs"] or 0.0))
+                + (0.01 * float(dsp_result.bass_abs or 0.0))
+            )
+            if energy_essentia_fused < 0.30:
+                energy_essentia_bucket = "low"
+            elif energy_essentia_fused < 0.55:
+                energy_essentia_bucket = "groove"
+            elif energy_essentia_fused < 0.78:
+                energy_essentia_bucket = "drive"
+            else:
+                energy_essentia_bucket = "peak"
         essentia_semantic_signature = str(
             prefetched_essentia_semantic_estimate.details.get("model_signature") or ""
         ) or None
@@ -859,8 +999,8 @@ def analyze_track(
         bpm=float(bpm["bpm"]),
         bpm_confidence=float(bpm["bpm_confidence"]),
         bpm_source=str(bpm["bpm_source"]),
-        time_signature=str(time_signature["time_signature"]),
-        time_signature_confidence=float(time_signature["time_signature_confidence"]),
+        time_signature=str(dsp_result.time_signature["time_signature"]),
+        time_signature_confidence=float(dsp_result.time_signature["time_signature_confidence"]),
         key=str(key["key"]),
         key_number=int(key["key_number"]),
         key_letter=str(key["key_letter"]),
@@ -869,9 +1009,10 @@ def analyze_track(
         key_imported=key["key_imported"],
         key_tagged=key["key_tagged"],
         key_agreement=key["key_agreement"],
-        energy_abs=float(energy["energy_abs"]),
-        energy_sustained=energy["energy_sustained"],
-        energy_peak=energy["energy_peak"],
+        energy_abs=float(energy_essentia_fused) if energy_essentia_fused is not None else float(dsp_result.energy["energy_abs"]),
+        energy_heuristic_abs=float(dsp_result.energy["energy_abs"]),
+        energy_sustained=dsp_result.energy["energy_sustained"],
+        energy_peak=dsp_result.energy["energy_peak"],
         danceability_abs=danceability_abs,
         arousal_abs=arousal_abs,
         valence_abs=valence_abs,
@@ -883,16 +1024,55 @@ def analyze_track(
         essentia_semantic_signature=essentia_semantic_signature,
         essentia_semantic_source=essentia_semantic_source,
         essentia_semantic_inferred_at=essentia_semantic_inferred_at,
-        loudness_lufs=loudness["loudness_lufs"],
-        loudness_norm=loudness["loudness_norm"],
-        bass_abs=bass_abs,
-        drums_abs=full_features["drums_abs"],
-        harmonic_abs=full_features["harmonic_abs"],
-        groove_abs=full_features["groove_abs"],
+        loudness_lufs=dsp_result.loudness["loudness_lufs"],
+        loudness_norm=dsp_result.loudness["loudness_norm"],
+        bass_abs=float(dsp_result.bass_abs),
+        drums_abs=dsp_result.full_features["drums_abs"],
+        harmonic_abs=dsp_result.full_features["harmonic_abs"],
+        groove_abs=dsp_result.full_features["groove_abs"],
         vocals_abs=None,
         vocals_confidence=None,
         analysis_mode=analysis_mode,
         analyzed_at=utc_now(),
         analysis_signature=analysis_signature or settings.analysis_signature,
         config_signature=settings.config_signature,
+    )
+
+
+def analyze_track(
+    track: ImportedTrack,
+    settings: RuntimeSettings,
+    analysis_mode: str,
+    *,
+    tempo_backend: str = "tempocnn",
+    tempocnn_model: str | None = None,
+    tempocnn_accelerator: str = "auto",
+    prefetched_tempocnn_estimate=None,
+    key_backend: str | None = None,
+    musicalkeycnn_model: str | None = None,
+    musicalkeycnn_image: str | None = None,
+    musicalkeycnn_device: str | None = None,
+    musicalkeycnn_policy: str | None = None,
+    prefetched_musicalkeycnn_estimate=None,
+    prefetched_essentia_semantic_estimate: EssentiaSemanticEstimate | None = None,
+    analysis_signature: str | None = None,
+) -> AnalysisResult:
+    dsp_result = compute_dsp_lane_result(track, settings, analysis_mode)
+    return build_analysis_result(
+        track,
+        settings,
+        analysis_mode,
+        dsp_result=dsp_result,
+        tempo_backend=tempo_backend,
+        tempocnn_model=tempocnn_model,
+        tempocnn_accelerator=tempocnn_accelerator,
+        prefetched_tempocnn_estimate=prefetched_tempocnn_estimate,
+        key_backend=key_backend,
+        musicalkeycnn_model=musicalkeycnn_model,
+        musicalkeycnn_image=musicalkeycnn_image,
+        musicalkeycnn_device=musicalkeycnn_device,
+        musicalkeycnn_policy=musicalkeycnn_policy,
+        prefetched_musicalkeycnn_estimate=prefetched_musicalkeycnn_estimate,
+        prefetched_essentia_semantic_estimate=prefetched_essentia_semantic_estimate,
+        analysis_signature=analysis_signature,
     )

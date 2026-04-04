@@ -55,6 +55,7 @@ class AnalysisResult:
     key_tagged: str | None
     key_agreement: int | None
     energy_abs: float
+    energy_heuristic_abs: float | None
     energy_sustained: float | None
     energy_peak: float | None
     danceability_abs: float | None

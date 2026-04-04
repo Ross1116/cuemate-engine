@@ -51,6 +51,11 @@ class AnalysisSettings:
     essentia_semantic_device: str
     essentia_semantic_model_family_policy: str
     essentia_semantic_model_root: str
+    full_chunk_size: int
+    tempo_chunk_size: int
+    key_chunk_size: int
+    essentia_chunk_size: int
+    dsp_workers: int
 
 
 @dataclass(frozen=True)
@@ -72,6 +77,30 @@ class WeightAdaptationSettings:
 
 
 @dataclass(frozen=True)
+class SemanticHeadCalibration:
+    offset: float
+    scale: float
+
+
+@dataclass(frozen=True)
+class SemanticCalibrationSettings:
+    calibration_version: str
+    heads: dict[str, SemanticHeadCalibration]
+
+    def calibrate(self, head_name: str, raw_value: float) -> float:
+        entry = self.heads.get(head_name)
+        if entry is None:
+            return max(0.0, min(1.0, raw_value))
+        return max(0.0, min(1.0, (raw_value - entry.offset) * entry.scale))
+
+
+DEFAULT_SEMANTIC_CALIBRATION = SemanticCalibrationSettings(
+    calibration_version="identity",
+    heads={},
+)
+
+
+@dataclass(frozen=True)
 class RuntimeSettings:
     repo_root: Path
     env_path: Path
@@ -84,6 +113,7 @@ class RuntimeSettings:
     thresholds: ThresholdSettings
     scoring: ScoringSettings
     weight_adaptation: WeightAdaptationSettings
+    semantic_calibration: SemanticCalibrationSettings
 
 
 def find_repo_root(start: Path | None = None) -> Path:
@@ -139,6 +169,23 @@ def resolve_database_path(database_url: str, repo_root: Path) -> Path:
 
 def _load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _load_semantic_calibration(repo_root: Path) -> SemanticCalibrationSettings:
+    calibration_path = repo_root / "config" / "essentia_semantic_calibration.json"
+    if not calibration_path.is_file():
+        return DEFAULT_SEMANTIC_CALIBRATION
+    payload = _load_json(calibration_path)
+    heads: dict[str, SemanticHeadCalibration] = {}
+    for head_name, entry in payload.get("heads", {}).items():
+        heads[head_name] = SemanticHeadCalibration(
+            offset=float(entry.get("offset", 0.0)),
+            scale=float(entry.get("scale", 1.0)),
+        )
+    return SemanticCalibrationSettings(
+        calibration_version=str(payload.get("calibration_version", "unknown")),
+        heads=heads,
+    )
 
 
 def _analysis_signature(config_signature: str, analysis_config: AnalysisSettings) -> str:
@@ -204,6 +251,13 @@ def load_runtime_settings(repo_root: Path | None = None) -> RuntimeSettings:
     scoring_payload = config_payload.get("scoring", {})
     weight_adaptation_payload = config_payload.get("weight_adaptation", {})
 
+    parallel_workers = int(analysis_payload.get("parallel_workers", 4))
+    max_workers_auto = bool(analysis_payload.get("max_workers_auto", True))
+    auto_dsp_workers = parallel_workers
+    if max_workers_auto:
+        cpu_count = os.cpu_count() or parallel_workers
+        auto_dsp_workers = max(1, min(cpu_count, 8))
+
     analysis_settings = AnalysisSettings(
         sample_rate=int(analysis_payload.get("sample_rate", 22050)),
         mono=bool(analysis_payload.get("mono", True)),
@@ -211,8 +265,8 @@ def load_runtime_settings(repo_root: Path | None = None) -> RuntimeSettings:
         key_model_path=analysis_payload.get("musicalkeycnn_model"),
         key_device=str(analysis_payload.get("musicalkeycnn_device", "auto")),
         key_policy=str(analysis_payload.get("musicalkeycnn_policy", "full_track")),
-        parallel_workers=int(analysis_payload.get("parallel_workers", 4)),
-        max_workers_auto=bool(analysis_payload.get("max_workers_auto", True)),
+        parallel_workers=parallel_workers,
+        max_workers_auto=max_workers_auto,
         per_track_timeout_seconds=int(analysis_payload.get("per_track_timeout_seconds", 120)),
         model_preload=bool(analysis_payload.get("model_preload", True)),
         fast_pass_enabled=bool(analysis_payload.get("fast_pass_enabled", True)),
@@ -223,6 +277,11 @@ def load_runtime_settings(repo_root: Path | None = None) -> RuntimeSettings:
         essentia_semantic_device=str(analysis_payload.get("essentia_semantic_device", "auto")),
         essentia_semantic_model_family_policy=str(analysis_payload.get("essentia_semantic_model_family_policy", "best_per_task")),
         essentia_semantic_model_root=str(analysis_payload.get("essentia_semantic_model_root", "python/models/essentia_semantics")),
+        full_chunk_size=int(analysis_payload.get("full_chunk_size", 4)),
+        tempo_chunk_size=int(analysis_payload.get("tempo_chunk_size", 8)),
+        key_chunk_size=int(analysis_payload.get("key_chunk_size", 8)),
+        essentia_chunk_size=int(analysis_payload.get("essentia_chunk_size", 4)),
+        dsp_workers=int(analysis_payload.get("dsp_workers", auto_dsp_workers)),
     )
     thresholds = ThresholdSettings(
         small_playlist_limit=int(thresholds_payload.get("small_playlist_limit", 12)),
@@ -248,6 +307,8 @@ def load_runtime_settings(repo_root: Path | None = None) -> RuntimeSettings:
     database_path = resolve_database_path(database_url, root)
     database_path.parent.mkdir(parents=True, exist_ok=True)
 
+    semantic_calibration = _load_semantic_calibration(root)
+
     return RuntimeSettings(
         repo_root=root,
         env_path=env_path if env_path.is_file() else env_example_path,
@@ -260,6 +321,7 @@ def load_runtime_settings(repo_root: Path | None = None) -> RuntimeSettings:
         thresholds=thresholds,
         scoring=scoring,
         weight_adaptation=weight_adaptation,
+        semantic_calibration=semantic_calibration,
     )
 
 

@@ -7,7 +7,13 @@ from typing import Any
 import librosa
 import numpy as np
 
-from cuemate_analysis.analysis import extract_bass_ratio, extract_energy, extract_full_features, extract_loudness
+from cuemate_analysis.analysis import (
+    build_track_dsp_artifacts,
+    extract_bass_ratio,
+    extract_energy,
+    extract_full_features,
+    extract_loudness,
+)
 from cuemate_analysis.energy_model import EnergyFeatureVector, build_energy_feature_vector, energy_consensus
 
 
@@ -59,10 +65,11 @@ def build_energy_candidate_set_from_vector(
 
 
 def build_energy_candidate_set(y: np.ndarray, sr: int) -> EnergyCandidateSet:
-    energy = extract_energy(y, sr)
-    loudness = extract_loudness(y, sr)
-    bass_abs = extract_bass_ratio(y, sr)
-    full = extract_full_features(y, sr)
+    artifacts = build_track_dsp_artifacts(y, sr)
+    energy = extract_energy(artifacts=artifacts)
+    loudness = extract_loudness(artifacts=artifacts)
+    bass_abs = extract_bass_ratio(artifacts=artifacts)
+    full = extract_full_features(artifacts=artifacts)
     features = build_energy_feature_vector(
         energy_abs=float(energy["energy_abs"]),
         energy_sustained=energy["energy_sustained"],

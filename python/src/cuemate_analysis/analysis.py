@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import math
 import re
@@ -58,6 +59,8 @@ ENHARMONIC_NOTES = {
     "E#": "F",
 }
 MUSICALKEYCNN_OVERRIDE_CONFIDENCE = 0.5
+DEFAULT_N_FFT = 2048
+DEFAULT_HOP_LENGTH = 512
 
 
 def utc_now() -> str:
@@ -76,6 +79,131 @@ def log_normalize(value: float, scale: float) -> float:
     if scale <= 0.0:
         return clamp(value)
     return clamp(math.log1p(max(value, 0.0) * scale) / math.log1p(scale))
+
+
+@dataclass
+class TrackDspArtifacts:
+    y: np.ndarray
+    sr: int
+    duration_seconds: float
+    stft: np.ndarray
+    magnitude: np.ndarray
+    frequencies: np.ndarray
+    rms: np.ndarray
+    spectral_centroid: np.ndarray
+    onset_env: np.ndarray
+    beat_frames: np.ndarray
+    beat_times: np.ndarray
+    n_fft: int = DEFAULT_N_FFT
+    hop_length: int = DEFAULT_HOP_LENGTH
+    _hpss: tuple[np.ndarray, np.ndarray] | None = None
+    _percussive_onset_env: np.ndarray | None = None
+    _pulse: np.ndarray | None = None
+    _harmonic_chroma: np.ndarray | None = None
+    _harmonic_waveform: np.ndarray | None = None
+    _percussive_waveform: np.ndarray | None = None
+
+    @classmethod
+    def from_audio(
+        cls,
+        y: np.ndarray,
+        sr: int,
+        *,
+        n_fft: int = DEFAULT_N_FFT,
+        hop_length: int = DEFAULT_HOP_LENGTH,
+    ) -> "TrackDspArtifacts":
+        stft = librosa.stft(y=y, n_fft=n_fft, hop_length=hop_length)
+        magnitude = np.abs(stft)
+        frequencies = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
+        rms = librosa.feature.rms(y=y, hop_length=hop_length)[0]
+        spectral_centroid = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
+        onset_env = librosa.onset.onset_strength(y=y, sr=sr)
+        _, beat_frames = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr)
+        beat_frames = np.asarray(beat_frames, dtype=int)
+        beat_times = librosa.frames_to_time(beat_frames, sr=sr, hop_length=hop_length)
+        return cls(
+            y=y,
+            sr=sr,
+            duration_seconds=max(len(y) / float(sr), 1e-6),
+            stft=stft,
+            magnitude=magnitude,
+            frequencies=frequencies,
+            rms=rms,
+            spectral_centroid=spectral_centroid,
+            onset_env=onset_env,
+            beat_frames=beat_frames,
+            beat_times=beat_times,
+            n_fft=n_fft,
+            hop_length=hop_length,
+        )
+
+    @property
+    def hpss(self) -> tuple[np.ndarray, np.ndarray]:
+        if self._hpss is None:
+            self._hpss = librosa.decompose.hpss(self.magnitude)
+        return self._hpss
+
+    @property
+    def harmonic_magnitude(self) -> np.ndarray:
+        return self.hpss[0]
+
+    @property
+    def percussive_magnitude(self) -> np.ndarray:
+        return self.hpss[1]
+
+    @property
+    def harmonic_waveform(self) -> np.ndarray:
+        if self._harmonic_waveform is None:
+            self._harmonic_waveform = librosa.istft(
+                self.harmonic_magnitude * np.exp(1j * np.angle(self.stft)),
+                hop_length=self.hop_length,
+                length=len(self.y),
+            )
+        return self._harmonic_waveform
+
+    @property
+    def percussive_waveform(self) -> np.ndarray:
+        if self._percussive_waveform is None:
+            self._percussive_waveform = librosa.istft(
+                self.percussive_magnitude * np.exp(1j * np.angle(self.stft)),
+                hop_length=self.hop_length,
+                length=len(self.y),
+            )
+        return self._percussive_waveform
+
+    @property
+    def percussive_onset_env(self) -> np.ndarray:
+        if self._percussive_onset_env is None:
+            self._percussive_onset_env = librosa.onset.onset_strength(y=self.percussive_waveform, sr=self.sr)
+        return self._percussive_onset_env
+
+    @property
+    def pulse(self) -> np.ndarray:
+        if self._pulse is None:
+            self._pulse = librosa.beat.plp(onset_envelope=self.onset_env, sr=self.sr)
+        return self._pulse
+
+    @property
+    def harmonic_chroma(self) -> np.ndarray:
+        if self._harmonic_chroma is None:
+            try:
+                self._harmonic_chroma = librosa.feature.chroma_stft(S=self.magnitude, sr=self.sr)
+            except Exception:
+                try:
+                    self._harmonic_chroma = librosa.feature.chroma_stft(y=self.y, sr=self.sr)
+                except Exception:
+                    self._harmonic_chroma = librosa.feature.chroma_cqt(y=self.y, sr=self.sr)
+        return self._harmonic_chroma
+
+
+def build_track_dsp_artifacts(
+    y: np.ndarray,
+    sr: int,
+    *,
+    n_fft: int = DEFAULT_N_FFT,
+    hop_length: int = DEFAULT_HOP_LENGTH,
+) -> TrackDspArtifacts:
+    return TrackDspArtifacts.from_audio(y, sr, n_fft=n_fft, hop_length=hop_length)
 
 
 def parse_key_label(raw_value: str | None) -> dict[str, str | int] | None:
@@ -147,11 +275,20 @@ def bayesian_key_confidence(
     return clamp(stronger + correlation_lift, maximum=0.95)
 
 
-def detect_bpm(y: np.ndarray, sr: int) -> dict[str, float]:
-    onset_env = librosa.onset.onset_strength(y=y, sr=sr)
-    tempo_value, beat_frames = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr)
+def detect_bpm(
+    y: np.ndarray | None = None,
+    sr: int | None = None,
+    *,
+    artifacts: TrackDspArtifacts | None = None,
+) -> dict[str, float]:
+    if artifacts is None:
+        if y is None or sr is None:
+            raise ValueError("detect_bpm requires either raw audio or TrackDspArtifacts.")
+        artifacts = build_track_dsp_artifacts(y, sr)
+    onset_env = artifacts.onset_env
+    tempo_value, beat_frames = librosa.beat.beat_track(onset_envelope=onset_env, sr=artifacts.sr)
     tempo = float(np.atleast_1d(tempo_value)[0])
-    beat_times = librosa.frames_to_time(beat_frames, sr=sr)
+    beat_times = librosa.frames_to_time(beat_frames, sr=artifacts.sr, hop_length=artifacts.hop_length)
 
     if len(beat_times) >= 2:
         ibis = np.diff(beat_times)
@@ -161,7 +298,7 @@ def detect_bpm(y: np.ndarray, sr: int) -> dict[str, float]:
     else:
         bpm_confidence = 0.3
 
-    tempogram = librosa.feature.tempogram(onset_envelope=onset_env, sr=sr)
+    tempogram = librosa.feature.tempogram(onset_envelope=onset_env, sr=artifacts.sr)
     peak_sharpness = float(np.max(tempogram) / (np.mean(tempogram) + 1e-10)) if tempogram.size else 0.0
     tempogram_confidence = clamp(peak_sharpness / 20.0)
     combined_confidence = clamp((0.5 * bpm_confidence) + (0.5 * tempogram_confidence))
@@ -224,9 +361,15 @@ def resolve_bpm_with_backend(
     tempocnn_model: str | None = None,
     tempocnn_accelerator: str = "auto",
     prefetched_tempocnn_estimate=None,
+    artifacts: TrackDspArtifacts | None = None,
 ) -> dict[str, float | str]:
     if tempo_backend == "baseline":
-        return resolve_bpm(track.bpm_imported, track.bpm_tag, detect_bpm(y, sr), detected_source="detected")
+        return resolve_bpm(
+            track.bpm_imported,
+            track.bpm_tag,
+            detect_bpm(artifacts=artifacts or build_track_dsp_artifacts(y, sr)),
+            detected_source="detected",
+        )
 
     from cuemate_analysis.tempo_backend import (
         TEMPO_BACKEND_TEMPOCNN,
@@ -251,7 +394,7 @@ def resolve_bpm_with_backend(
             detected_source="tempocnn",
         )
 
-    baseline = detect_bpm(y, sr)
+    baseline = detect_bpm(y, sr) if artifacts is None else detect_bpm(artifacts=artifacts)
     return resolve_bpm(
         track.bpm_imported,
         track.bpm_tag,
@@ -477,13 +620,21 @@ def resolve_key_with_backend(
     return resolve_tag_only_key(track.key_tag, track.key_imported)
 
 
-def extract_energy(y: np.ndarray, sr: int) -> dict[str, float]:
-    rms = librosa.feature.rms(y=y, hop_length=512)[0]
+def extract_energy(
+    y: np.ndarray | None = None,
+    sr: int | None = None,
+    *,
+    artifacts: TrackDspArtifacts | None = None,
+) -> dict[str, float]:
+    if artifacts is None:
+        if y is None or sr is None:
+            raise ValueError("extract_energy requires either raw audio or TrackDspArtifacts.")
+        artifacts = build_track_dsp_artifacts(y, sr)
+    rms = artifacts.rms
     sustained = float(np.percentile(rms, 75))
     peak = float(np.percentile(rms, 95))
-    centroid = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
-    brightness = clamp(float(np.mean(centroid)) / max(sr / 2.0, 1.0))
-    onset_env = librosa.onset.onset_strength(y=y, sr=sr)
+    brightness = clamp(float(np.mean(artifacts.spectral_centroid)) / max(artifacts.sr / 2.0, 1.0))
+    onset_env = artifacts.onset_env
     onset_peak = float(np.percentile(onset_env, 85)) if onset_env.size else 0.0
 
     # Use log compression so modern mastered tracks still separate meaningfully
@@ -504,9 +655,18 @@ def extract_energy(y: np.ndarray, sr: int) -> dict[str, float]:
     }
 
 
-def detect_time_signature(y: np.ndarray, sr: int) -> dict[str, str | float]:
-    onset_env = librosa.onset.onset_strength(y=y, sr=sr)
-    _, beat_frames = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr)
+def detect_time_signature(
+    y: np.ndarray | None = None,
+    sr: int | None = None,
+    *,
+    artifacts: TrackDspArtifacts | None = None,
+) -> dict[str, str | float]:
+    if artifacts is None:
+        if y is None or sr is None:
+            raise ValueError("detect_time_signature requires either raw audio or TrackDspArtifacts.")
+        artifacts = build_track_dsp_artifacts(y, sr)
+    onset_env = artifacts.onset_env
+    beat_frames = artifacts.beat_frames
     if len(beat_frames) < 8:
         return {"time_signature": "4/4", "time_signature_confidence": 0.35}
 
@@ -535,43 +695,65 @@ def detect_time_signature(y: np.ndarray, sr: int) -> dict[str, str | float]:
     return {"time_signature": best_signature, "time_signature_confidence": confidence}
 
 
-def extract_loudness(y: np.ndarray, sr: int) -> dict[str, float]:
-    meter = pyln.Meter(sr)
-    loudness_lufs = float(meter.integrated_loudness(y.astype(np.float64)))
+def extract_loudness(
+    y: np.ndarray | None = None,
+    sr: int | None = None,
+    *,
+    artifacts: TrackDspArtifacts | None = None,
+) -> dict[str, float]:
+    if artifacts is None:
+        if y is None or sr is None:
+            raise ValueError("extract_loudness requires either raw audio or TrackDspArtifacts.")
+        artifacts = build_track_dsp_artifacts(y, sr)
+    meter = pyln.Meter(artifacts.sr)
+    loudness_lufs = float(meter.integrated_loudness(artifacts.y.astype(np.float64)))
     return {
         "loudness_lufs": loudness_lufs,
         "loudness_norm": normalize_loudness(loudness_lufs),
     }
 
 
-def extract_bass_ratio(y: np.ndarray, sr: int) -> float:
-    spectrum = np.abs(librosa.stft(y=y, n_fft=2048, hop_length=512))
-    frequencies = librosa.fft_frequencies(sr=sr, n_fft=2048)
-    bass_mask = (frequencies >= 30.0) & (frequencies <= 150.0)
-    total_mask = (frequencies >= 30.0) & (frequencies <= 8000.0)
-    bass_energy = float(np.sum(spectrum[bass_mask]))
-    total_energy = float(np.sum(spectrum[total_mask])) or 1e-6
+def extract_bass_ratio(
+    y: np.ndarray | None = None,
+    sr: int | None = None,
+    *,
+    artifacts: TrackDspArtifacts | None = None,
+) -> float:
+    if artifacts is None:
+        if y is None or sr is None:
+            raise ValueError("extract_bass_ratio requires either raw audio or TrackDspArtifacts.")
+        artifacts = build_track_dsp_artifacts(y, sr)
+    bass_mask = (artifacts.frequencies >= 30.0) & (artifacts.frequencies <= 150.0)
+    total_mask = (artifacts.frequencies >= 30.0) & (artifacts.frequencies <= 8000.0)
+    bass_energy = float(np.sum(artifacts.magnitude[bass_mask]))
+    total_energy = float(np.sum(artifacts.magnitude[total_mask])) or 1e-6
     return clamp(bass_energy / total_energy)
 
 
-def extract_full_features(y: np.ndarray, sr: int) -> dict[str, float]:
-    harmonic, percussive = librosa.effects.hpss(y)
-    total_rms = float(np.sqrt(np.mean(np.square(y)))) or 1e-6
-    percussive_rms = float(np.sqrt(np.mean(np.square(percussive))))
-    harmonic_rms = float(np.sqrt(np.mean(np.square(harmonic))))
-    onset_env = librosa.onset.onset_strength(y=percussive, sr=sr)
-    duration_seconds = max(len(y) / float(sr), 1e-6)
-    onset_frames = librosa.onset.onset_detect(onset_envelope=onset_env, sr=sr)
-    onset_rate = len(onset_frames) / duration_seconds
-    pulse = librosa.beat.plp(onset_envelope=onset_env, sr=sr)
-    try:
-        chroma = librosa.feature.chroma_cqt(y=harmonic, sr=sr)
-    except Exception:
-        chroma = librosa.feature.chroma_stft(y=harmonic, sr=sr)
+def extract_full_features(
+    y: np.ndarray | None = None,
+    sr: int | None = None,
+    *,
+    artifacts: TrackDspArtifacts | None = None,
+) -> dict[str, float]:
+    if artifacts is None:
+        if y is None or sr is None:
+            raise ValueError("extract_full_features requires either raw audio or TrackDspArtifacts.")
+        artifacts = build_track_dsp_artifacts(y, sr)
+    onset_env = artifacts.onset_env
+    onset_frames = librosa.onset.onset_detect(onset_envelope=onset_env, sr=artifacts.sr)
+    onset_rate = len(onset_frames) / artifacts.duration_seconds
+    pulse = artifacts.pulse
+    chroma = artifacts.harmonic_chroma
     chroma_focus = float(np.mean(np.max(chroma, axis=0))) if chroma.size else 0.0
+    flatness = librosa.feature.spectral_flatness(S=artifacts.magnitude)[0]
+    flatness_mean = clamp(float(np.mean(flatness)) / 0.5 if flatness.size else 0.0)
+    onset_norm = log_normalize(float(np.percentile(onset_env, 85)) if onset_env.size else 0.0, scale=40.0)
+    spectral_contrast = librosa.feature.spectral_contrast(S=artifacts.magnitude, sr=artifacts.sr)
+    contrast_mean = clamp(float(np.mean(spectral_contrast)) / 30.0 if spectral_contrast.size else 0.0)
 
-    drums_abs = clamp((0.7 * (percussive_rms / total_rms)) + (0.3 * clamp(onset_rate / 6.0)))
-    harmonic_abs = clamp((0.6 * (harmonic_rms / total_rms)) + (0.4 * chroma_focus))
+    drums_abs = clamp((0.55 * onset_norm) + (0.45 * clamp(onset_rate / 6.0)))
+    harmonic_abs = clamp((0.60 * chroma_focus) + (0.25 * (1.0 - flatness_mean)) + (0.15 * contrast_mean))
     groove_abs = clamp(float(np.percentile(pulse, 75)) / 0.9 if pulse.size else 0.0)
     return {
         "drums_abs": drums_abs,
@@ -604,6 +786,7 @@ def analyze_track(
     )
     if y.size == 0:
         raise ValueError(f"No audio samples decoded for {track.file_path}")
+    artifacts = build_track_dsp_artifacts(y, sr)
 
     bpm = resolve_bpm_with_backend(
         track,
@@ -613,6 +796,7 @@ def analyze_track(
         tempocnn_model=tempocnn_model,
         tempocnn_accelerator=tempocnn_accelerator,
         prefetched_tempocnn_estimate=prefetched_tempocnn_estimate,
+        artifacts=artifacts,
     )
     effective_key_backend = key_backend or settings.analysis.key_backend
     key = resolve_key_with_backend(
@@ -626,13 +810,13 @@ def analyze_track(
         musicalkeycnn_policy=musicalkeycnn_policy or settings.analysis.key_policy,
         prefetched_musicalkeycnn_estimate=prefetched_musicalkeycnn_estimate,
     )
-    energy = extract_energy(y, sr)
-    loudness = extract_loudness(y, sr)
-    bass_abs = extract_bass_ratio(y, sr)
-    time_signature = detect_time_signature(y, sr)
+    energy = extract_energy(artifacts=artifacts)
+    loudness = extract_loudness(artifacts=artifacts)
+    bass_abs = extract_bass_ratio(artifacts=artifacts)
+    time_signature = detect_time_signature(artifacts=artifacts)
 
     if analysis_mode == "full":
-        full_features = extract_full_features(y, sr)
+        full_features = extract_full_features(artifacts=artifacts)
     else:
         full_features = {
             "drums_abs": None,

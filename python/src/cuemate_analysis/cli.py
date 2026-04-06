@@ -19,7 +19,7 @@ from cuemate_analysis.analysis import (
     compute_dsp_lane_result,
     utc_now,
 )
-from cuemate_analysis.config import RuntimeSettings, load_runtime_settings
+from cuemate_analysis.config import RuntimeSettings, build_fast_analysis_signature, load_runtime_settings
 from cuemate_analysis.database import Database
 from cuemate_analysis.dj_import import list_dj_playlists, load_dj_playlist
 from cuemate_analysis.essentia_semantic_backend import (
@@ -1321,6 +1321,7 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
         musicalkeycnn_policy=settings.analysis.key_policy,
         essentia_semantic_signature=expected_essentia_semantic_signature,
     )
+    fast_analysis_signature = build_fast_analysis_signature(settings)
 
     with Database(settings.database_path) as database:
         if hasattr(database, "get_table_columns"):
@@ -1376,7 +1377,7 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
                 if not should_skip_fast_analysis(
                     row,
                     track,
-                    effective_analysis_signature=effective_analysis_signature,
+                    effective_analysis_signature=fast_analysis_signature,
                     config_signature=settings.config_signature,
                     force=args.force,
                 ):
@@ -1386,7 +1387,7 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
                         track_path=row["file_path"],
                         job_kind="fast_pass",
                         analysis_mode="fast_pass",
-                        analysis_signature=effective_analysis_signature,
+                        analysis_signature=fast_analysis_signature,
                         config_signature=settings.config_signature,
                         source_file_hash=track.file_hash,
                         priority=total - index,
@@ -1400,7 +1401,7 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
                             settings,
                             prefetched_tempocnn_estimate=prefetched_tempocnn_estimates.get(prepared.resolved_path),
                             prefetched_musicalkeycnn_estimate=prefetched_musicalkeycnn_estimates.get(prepared.resolved_path),
-                            analysis_signature=effective_analysis_signature,
+                            analysis_signature=fast_analysis_signature,
                         )
                         database.upsert_track_fast_features(fast_result)
                         database.mark_analysis_job_completed(
@@ -1408,7 +1409,7 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
                             round(time.perf_counter() - fast_started, 3),
                             build_fast_job_timing_breakdown(
                                 settings=settings,
-                                effective_analysis_signature=effective_analysis_signature,
+                                effective_analysis_signature=fast_analysis_signature,
                             ),
                             utc_now(),
                         )
@@ -2429,7 +2430,7 @@ def handle_run_analysis_worker(args: argparse.Namespace) -> int:
         musicalkeycnn_policy=settings.analysis.key_policy,
         essentia_semantic_signature=expected_essentia_semantic_signature,
     )
-
+    
     with Database(settings.database_path) as database:
         jobs = database.claim_pending_analysis_jobs(
             job_kind="enrichment",

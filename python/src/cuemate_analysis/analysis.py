@@ -121,17 +121,30 @@ class TrackDspArtifacts:
         n_fft: int = DEFAULT_N_FFT,
         hop_length: int = DEFAULT_HOP_LENGTH,
     ) -> "TrackDspArtifacts":
-        stft = librosa.stft(y=y, n_fft=n_fft, hop_length=hop_length)
+        y_array = np.asarray(y, dtype=np.float32)
+
+        if y_array.ndim > 1:
+            y_mono = librosa.to_mono(y_array)
+        else:
+            y_mono = y_array
+
+        y_mono = np.ascontiguousarray(y_mono, dtype=np.float32)
+        duration_seconds = max(y_mono.shape[-1] / float(sr), 1e-6)
+
+        stft = librosa.stft(y=y_mono, n_fft=n_fft, hop_length=hop_length)
         magnitude = np.abs(stft)
         frequencies = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
         # Reuse magnitude spectrogram instead of recomputing from waveform.
         rms = librosa.feature.rms(S=magnitude, hop_length=hop_length)[0]
         spectral_centroid = librosa.feature.spectral_centroid(S=magnitude, sr=sr)[0]
-        onset_env = librosa.onset.onset_strength(S=librosa.feature.melspectrogram(S=magnitude**2, sr=sr), sr=sr)
-        return cls(
-            y=y,
+        onset_env = librosa.onset.onset_strength(
+            S=librosa.feature.melspectrogram(S=magnitude**2, sr=sr),
             sr=sr,
-            duration_seconds=max(len(y) / float(sr), 1e-6),
+        )
+        return cls(
+            y=y_mono,
+            sr=sr,
+            duration_seconds=duration_seconds,
             stft=stft,
             magnitude=magnitude,
             frequencies=frequencies,
@@ -214,7 +227,6 @@ class TrackDspArtifacts:
                 except Exception:
                     self._harmonic_chroma = librosa.feature.chroma_cqt(y=self.harmonic_waveform, sr=self.sr)
         return self._harmonic_chroma
-
 
 @dataclass
 class DspLaneResult:

@@ -293,11 +293,23 @@ class Database:
         created_at: str,
     ) -> int:
         with self.connection:
+            self.connection.execute(
+                """
+                DELETE FROM analysis_jobs
+                WHERE track_id = ?
+                AND job_kind = ?
+                AND status IN ('pending', 'running')
+                AND analysis_signature = ?
+                AND config_signature = ?
+                """,
+                (track_id, job_kind, analysis_signature, config_signature),
+            )
+
             cursor = self.connection.execute(
                 """
                 INSERT INTO analysis_jobs (
-                  playlist_id, track_id, track_path, job_kind, status, priority, analysis_mode,
-                  analysis_signature, config_signature, source_file_hash, created_at
+                playlist_id, track_id, track_path, job_kind, status, priority, analysis_mode,
+                analysis_signature, config_signature, source_file_hash, created_at
                 ) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)
                 """,
                 (

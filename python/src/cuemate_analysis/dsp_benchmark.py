@@ -14,7 +14,6 @@ from cuemate_analysis.analysis import (
     TrackDspArtifacts,
     extract_bass_ratio,
     extract_energy,
-    extract_full_features,
     extract_loudness,
     detect_time_signature,
     DEFAULT_N_FFT,
@@ -97,7 +96,7 @@ def benchmark_dsp_single(
     path: Path,
     settings: RuntimeSettings,
 ) -> DspBenchmarkSample:
-    """Profile the full DSP pipeline for a single file with substep timings."""
+    """Profile the active DSP pipeline for a single file with substep timings."""
     resolved = path.expanduser().resolve()
 
     decode_start = perf_counter()
@@ -128,9 +127,9 @@ def benchmark_dsp_single(
     detect_time_signature(artifacts=artifacts)
     time_signature_end = perf_counter()
 
-    full_start = perf_counter()
-    extract_full_features(artifacts=artifacts)
-    full_end = perf_counter()
+    # Full support descriptors removed from the critical path.
+    full_features_seconds = 0.0
+    pipeline_end = time_signature_end
 
     return DspBenchmarkSample(
         file_path=resolved.as_posix(),
@@ -144,11 +143,10 @@ def benchmark_dsp_single(
         loudness_seconds=loudness_end - loudness_start,
         bass_seconds=bass_end - bass_start,
         time_signature_seconds=time_signature_end - time_signature_start,
-        full_features_seconds=full_end - full_start,
-        total_dsp_seconds=full_end - artifact_start,
-        total_with_decode_seconds=full_end - decode_start,
+        full_features_seconds=full_features_seconds,
+        total_dsp_seconds=pipeline_end - artifact_start,
+        total_with_decode_seconds=pipeline_end - decode_start,
     )
-
 
 def benchmark_dsp_paths(paths: list[Path], settings: RuntimeSettings) -> list[DspBenchmarkSample]:
     """Profile the DSP pipeline for multiple files."""

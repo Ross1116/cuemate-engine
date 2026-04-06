@@ -1,128 +1,331 @@
 # CueMate Engine
 
-CueMate Engine is a monorepo with a hard split between the Python analysis plane and the Go decision plane. The repository now includes the first Milestone 1 slice from the decision engine plan: local playlist import, absolute feature analysis on PC, and SQLite persistence.
+CueMate Engine is the local analysis and recommendation foundation for CueMate.
 
-## Repository layout
+Today, the repository is primarily a **Python-first analysis engine** with:
+
+- DJ-library playlist import
+- staged BPM/key analysis for fast feedback
+- background enrichment for absolute features
+- persisted relative playlist context
+- Docker-backed model workers for BPM, key, and semantic mood/intensity analysis
+
+The Go and protobuf layers are present for the later recommendation/API surfaces, but the current working core lives in the Python analysis plane.
+
+## Current State
+
+Implemented today:
+
+- Milestone 1 absolute analysis
+- Milestone 2 Phase 1 relative-context logic
+- Milestone 2 Phase 2 persisted relative context + refresh/orchestration
+- staged analysis pipeline:
+  - `fast_pass`
+  - `staged` (default)
+  - `full`
+
+Deferred for now:
+
+- windowed intro/outro analysis
+- recommendation/scoring engine implementation
+
+Next major milestone:
+
+- Milestone 3: live recommendation core
+
+## Architecture
+
+The current pipeline is split into 4 main layers:
+
+1. Import/catalog
+- imports local playlists or DJ-library playlists from Rekordbox XML, Traktor NML, and Serato crates
+- stores tracks, playlists, and playlist membership in SQLite
+
+2. Fast analysis
+- computes BPM + key quickly for immediate UI/CLI feedback
+- persists results into `track_features_fast`
+
+3. Enrichment analysis
+- computes canonical absolute features into `track_features_abs`
+- uses local DSP + model-backed semantics
+- runs inline for `full` or queued in `analysis_jobs` for `staged`
+
+4. Relative context
+- computes playlist-relative features and playlist stats
+- persists canonical rows into:
+  - `track_features_rel`
+  - `playlist_stats`
+
+## Repository Layout
 
 ```text
 /
-|- python/   # Analysis Plane: audio ingest, DSP, artifact production, scoring service
-|- go/       # Decision Plane: API, orchestration, sync, session surfaces
-|- proto/    # Shared protobuf scoring contract
-|- db/       # SQL migrations and checked-in schema snapshot
-|- data/     # Local-only SQLite database, descriptors, and scratch artifacts
-|- scripts/  # Utility scripts for validation, migrations, and local ops
+|- config/
+|  |- default.json                         # Runtime defaults
+|  |- essentia_semantic_calibration.json  # Semantic calibration config
+|
+|- data/                                  # Local-only runtime data
+|  |- cuemate.db                          # Main SQLite DB
+|  |- inference-cache.db                  # Persistent model inference cache
+|  |- benchmarks/                         # Local benchmark outputs
+|
+|- db/
+|  |- migrations/                         # SQL migrations
+|  |- schema.sql                          # Checked-in schema snapshot
+|  |- README.md
+|
+|- docker/
+|  |- essentia_semantics/                 # Shared TF/Essentia service
+|  |- musicalkeycnn/                      # PyTorch key service image
+|  |- tempocnn/                           # TempoCNN image + service files
+|
+|- docs/
+|  |- bootstrap-windows.md
+|  |- Decision_Engine_Plan.md
+|  |- stack-decisions.md
+|
+|- go/
+|  |- cmd/                               # Placeholder for future Go entrypoints
+|  |- internal/                          # Placeholder for future Go packages
+|  |- gen/                               # Generated Go artifacts
+|  |- README.md
+|
+|- proto/
+|  |- djengine/scoring/v1/scoring.proto  # Shared scoring contract
+|  |- README.md
+|
+|- python/
+|  |- models/                            # Local model artifacts
+|  |  |- essentia/
+|  |  |- essentia_semantics/
+|  |  |- musicalkeycnn/
+|  |- src/cuemate_analysis/
+|  |  |- cli.py                          # Main CLI entrypoint
+|  |  |- analysis.py                     # Absolute analysis + resolution logic
+|  |  |- relative_context.py             # Relative layer + refresh logic
+|  |  |- database.py                     # SQLite access layer
+|  |  |- dj_import.py                    # Rekordbox/Traktor/Serato importers
+|  |  |- tempo_backend.py                # TempoCNN backend client/runtime helpers
+|  |  |- key_backend.py                  # MusicalKeyCNN backend client/runtime helpers
+|  |  |- essentia_semantic_backend.py    # Essentia semantic backend client/runtime helpers
+|  |  |- models.py                       # Dataclasses / result shapes
+|  |  |- config.py                       # Runtime config loading + signatures
+|  |  |- dsp_benchmark.py                # DSP benchmark harness
+|  |- tests/                             # Python test suite
+|  |- pyproject.toml
+|  |- README.md
+|
+|- scripts/
+|  |- build-*.ps1                        # Docker image build helpers
+|  |- start-*.ps1                        # Service start helpers
+|  |- dbmate.ps1
+|  |- docker-compose.ps1
+|  |- check-prereqs.ps1
+|  |- compile-proto.ps1
+|  |- README.md
+|
+|- compose.yaml
+|- buf.yaml
+|- go.work
+|- .env.example
+|- README.md
 ```
 
-## Current baseline
+## Canonical Data Model
 
-- Shared protobuf contract lives at `proto/djengine/scoring/v1/scoring.proto`
-- `buf.yaml` defines `proto/` as the protobuf module root
-- `go/` is its own Go module and is included from the root `go.work`
-- `python/` now exposes a Milestone 1 CLI for local ingest and absolute analysis
-- `config/default.json` is the checked-in runtime config baseline for analysis settings
-- `dbmate` is the migration tool for forward-only SQL schema changes
-- `db/` now includes Milestone 1 tables for `tracks`, `playlists`, `playlist_tracks`, `track_features_abs`, and `analysis_jobs`
-- `compose.yaml` currently provides an operations-only migration service
-- Generated artifacts and local env files are kept out of git by default
+Current important tables:
 
-## Start here on a fresh machine
+- `tracks`
+  - imported/local track catalog
+- `playlists`
+  - playlist catalog
+- `playlist_tracks`
+  - playlist membership and order
+- `track_features_fast`
+  - fast-stage BPM/key results for immediate feedback
+- `track_features_abs`
+  - canonical absolute analysis rows
+- `track_features_rel`
+  - canonical persisted relative playlist rows
+- `playlist_stats`
+  - persisted playlist-level relative stats/adaptation info
+- `analysis_jobs`
+  - local staged-analysis/enrichment queue
 
-For a clean Windows bootstrap from a fresh clone, follow:
+## Feature Contract
+
+### Fast layer
+
+Persisted in `track_features_fast`:
+
+- resolved BPM
+- resolved key
+- confidence + provenance/source fields
+
+### Canonical absolute layer
+
+Persisted in `track_features_abs`.
+
+Current split:
+
+- DSP-native canonical primitives:
+  - `loudness_lufs`
+  - `loudness_norm`
+  - `bass_abs`
+  - `time_signature`
+  - `time_signature_confidence`
+
+- DSP-native support fields:
+  - `energy_heuristic_abs`
+  - `energy_sustained`
+  - `energy_peak`
+  - optional support descriptors:
+    - `drums_abs`
+    - `harmonic_abs`
+    - `groove_abs`
+
+- model-backed semantic fields:
+  - `danceability_abs`
+  - `arousal_abs`
+  - `valence_abs`
+  - `mood_aggressive_abs`
+  - `mood_party_abs`
+  - `mood_relaxed_abs`
+
+- canonical fused intensity:
+  - `energy_abs`
+
+- explicit Essentia lane outputs:
+  - `energy_essentia_fused`
+  - `energy_essentia_bucket`
+
+### Canonical relative layer
+
+Persisted in:
+
+- `track_features_rel`
+- `playlist_stats`
+
+The canonical relative read path is persisted-first. Relative rows are refreshed after successful enrichment or via `refresh-relative-playlist`.
+
+## Model Runtime Topology
+
+Current runtime split:
+
+- shared **TensorFlow/Essentia** service
+  - TempoCNN BPM
+  - Essentia semantic inference
+- separate **PyTorch** service
+  - MusicalKeyCNN key inference
+
+Why this split:
+
+- TempoCNN and Essentia share a TensorFlow/Essentia stack
+- MusicalKeyCNN is PyTorch and is kept separate for stability and simpler CUDA/runtime management
+
+## Analysis Modes
+
+### `fast_pass`
+
+- computes BPM + key only
+- writes `track_features_fast`
+- intended for immediate feedback
+
+### `staged` (default)
+
+- computes fast BPM + key immediately
+- queues enrichment jobs in `analysis_jobs`
+- returns without waiting for absolute/relative enrichment
+
+### `full`
+
+- uses the same staged pipeline
+- waits for enrichment and relative refresh to finish
+- intended for explicit full analysis/backfill runs
+
+## BPM / Key Resolution Behavior
+
+Important nuance:
+
+- `imported`
+  - metadata imported from a DJ library source such as Rekordbox XML
+- `tag`
+  - metadata embedded directly in the audio file
+- `tempocnn`
+  - BPM model estimate
+- `musicalkeycnn`
+  - key model estimate
+
+Combined source labels such as `imported+tempocnn` or `tag+musicalkeycnn` mean:
+
+- one source won resolution
+- the model agreed closely enough to boost confidence
+- values are **not averaged**
+
+## Setup
+
+### 1. Bootstrap
+
+On Windows, start here:
 
 - [Bootstrap on Windows](./docs/bootstrap-windows.md)
 
-## Environment setup
-
-Before running migrations or services, copy `.env.example` to `.env` and adjust any values needed for your machine:
+### 2. Create `.env`
 
 ```powershell
 Copy-Item .env.example .env
 ```
 
-This is required because [compose.yaml](./compose.yaml) uses `env_file: - .env`. Make sure `.env` exists before running commands like:
+This is required because [compose.yaml](./compose.yaml) uses `.env`.
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\docker-compose.ps1 --profile ops run --rm migrate
-```
-
-## Useful commands
-
-Validate the protobuf contract:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\compile-proto.ps1
-```
-
-Check local prerequisites:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\check-prereqs.ps1
-```
-
-Run dbmate from the repo root with the correct migration paths:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\dbmate.ps1 status
-```
-
-Run the Docker Compose migration profile with an isolated local Docker config:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\docker-compose.ps1 --profile ops run --rm migrate
-```
-
-Install the Python analysis CLI in editable mode:
+### 3. Install the Python package
 
 ```powershell
 python -m pip install --user -e ".\python[dev]"
 ```
 
-Build the shared TensorFlow/Essentia Docker image used by the TempoCNN BPM backend and the Essentia semantic lane:
+### 4. Run prerequisite checks
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\check-prereqs.ps1
+```
+
+### 5. Run migrations
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\dbmate.ps1 status
+powershell -ExecutionPolicy Bypass -File .\scripts\docker-compose.ps1 --profile ops run --rm migrate
+```
+
+## Building Local Model Services
+
+Build images:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\build-tempocnn-image.ps1
-```
-
-Build the local MusicalKeyCNN Docker image used by the primary key backend:
-
-```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\build-musicalkeycnn-image.ps1
-```
-
-Build the local Essentia semantics Docker image used by the semantic absolute-feature lane:
-
-```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\build-essentia-semantics-image.ps1
 ```
 
-Optional: warm-start the shared TensorFlow/Essentia service yourself. The CLI will auto-start it on demand too.
+Warm-start services manually if desired:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\start-tempocnn-service.ps1
-```
-
-Optional: warm-start the persistent MusicalKeyCNN service container yourself. The CLI will auto-start it on demand too.
-
-```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\start-musicalkeycnn-service.ps1
-```
-
-Optional: warm-start the persistent Essentia semantics service container yourself. The CLI will auto-start it on demand too.
-
-```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\start-essentia-semantics-service.ps1
 ```
 
-## Milestone 1 CLI
+The CLI also starts them on demand.
 
-Import a local playlist or crate:
+## Common CLI Workflows
+
+### Import local folders
 
 ```powershell
 python -m cuemate_analysis import-playlist --name "My Playlist" .\path\to\audio
 ```
 
-List playlists available from an exported DJ library:
+### Inspect DJ-library playlists
 
 ```powershell
 python -m cuemate_analysis list-dj-playlists --source rekordbox --library "D:\Exports\rekordbox.xml"
@@ -130,7 +333,7 @@ python -m cuemate_analysis list-dj-playlists --source traktor --library "D:\Expo
 python -m cuemate_analysis list-dj-playlists --source serato --library "D:\Music\_Serato_\Subcrates"
 ```
 
-Import one playlist from Rekordbox, Traktor, or Serato:
+### Import DJ-library playlists
 
 ```powershell
 python -m cuemate_analysis import-dj-playlist --source rekordbox --library "D:\Exports\rekordbox.xml" --playlist "Main Room"
@@ -138,7 +341,13 @@ python -m cuemate_analysis import-dj-playlist --source traktor --library "D:\Exp
 python -m cuemate_analysis import-dj-playlist --source serato --library "D:\Music\_Serato_\Subcrates" --playlist "Club Set"
 ```
 
-Analyze imported tracks through the staged pipeline:
+Notes:
+
+- Rekordbox support expects the **XML library export**
+- Serato import currently gives playlist membership and local paths only; it does not import BPM/key metadata
+- if a playlist name already exists locally, import with `--name` to avoid name collisions
+
+### Analyze playlists
 
 ```powershell
 python -m cuemate_analysis analyze-playlist --playlist "My Playlist"
@@ -147,136 +356,113 @@ python -m cuemate_analysis run-analysis-worker --limit 25
 python -m cuemate_analysis analyze-playlist --playlist "My Playlist" --analysis-mode full --force
 ```
 
-Stage semantics:
-
-- `fast_pass`: persist BPM + key only into `track_features_fast`
-- `staged` (default): persist fast BPM + key immediately and queue full enrichment in `analysis_jobs`
-- `full`: run the same fast stage, then wait for enrichment and canonical relative refresh before returning
-
-Inspect playlist analysis state:
+### Inspect tracks and playlists
 
 ```powershell
 python -m cuemate_analysis list-playlist --name "My Playlist"
-```
-
-Inspect one analyzed track:
-
-```powershell
 python -m cuemate_analysis show-track --track-id trk_example123
 ```
 
-Analyze BPM only for one file or an imported playlist:
+### BPM / key-only workflows
 
 ```powershell
 python -m cuemate_analysis analyze-bpm "D:\path\to\track.wav"
 python -m cuemate_analysis analyze-bpm-playlist --playlist "Fred again"
-python -m cuemate_analysis analyze-bpm-playlist --playlist "Fred again" --limit 5 --output .\data\benchmarks\fred-again-bpm.csv
-```
-
-Analyze just BPM + key with the production TempoCNN and MusicalKeyCNN workers:
-
-```powershell
 python -m cuemate_analysis analyze-bpm-key "D:\path\to\track.wav"
 python -m cuemate_analysis analyze-bpm-key-playlist --playlist "Fred again"
-python -m cuemate_analysis analyze-bpm-key-playlist --playlist "Fred again" --limit 5 --output .\data\benchmarks\fred-again-bpm-key.csv
 ```
 
-Inspect the canonical persisted relative-context layer:
+### Relative context workflows
 
 ```powershell
 python -m cuemate_analysis analyze-relative-playlist --playlist "Fred again"
-python -m cuemate_analysis analyze-relative-playlist --playlist "Fred again" --limit 12 --json
+python -m cuemate_analysis analyze-relative-playlist --playlist "Fred again" --energy-source canonical
 python -m cuemate_analysis analyze-relative-playlist --playlist "Fred again" --energy-source heuristic_legacy
-python -m cuemate_analysis analyze-relative-playlist --playlist "Fred again" --output .\data\benchmarks\fred-again-relative.csv
 python -m cuemate_analysis refresh-relative-playlist --playlist "Fred again"
 ```
 
-Experiment with multiple absolute-energy candidates on a real playlist without changing persisted analysis rows:
-
-```powershell
-python -m cuemate_analysis analyze-energy-playlist --playlist "Fred again" --limit 12
-python -m cuemate_analysis analyze-energy-playlist --playlist "Fred again" --output .\data\benchmarks\fred-again-energy.csv
-```
-
-Download the Essentia semantic model bundle and inspect Essentia semantic outputs for a playlist:
+### Essentia semantic workflows
 
 ```powershell
 python -m cuemate_analysis download-essentia-semantic-models
-python -m cuemate_analysis analyze-essentia-playlist --playlist "Fred again" --limit 12
-python -m cuemate_analysis analyze-relative-playlist --playlist "Fred again" --energy-source canonical
+python -m cuemate_analysis analyze-essentia-playlist --playlist "Fred again"
 python -m cuemate_analysis prewarm-model-services
 ```
 
-Purge persisted TempoCNN and MusicalKeyCNN caches, and clear the warm service state so the next run is fully fresh:
+### Cache and service maintenance
 
 ```powershell
 python -m cuemate_analysis purge-model-cache
 python -m cuemate_analysis purge-model-cache --backend tempocnn
-python -m cuemate_analysis purge-model-cache --playlist "Fred again"
+python -m cuemate_analysis purge-model-cache --backend essentia_semantics
+python -m cuemate_analysis purge-model-cache --backend essentia_semantics --clear-warm-services
 ```
 
-Pipeline notes:
+## Performance Notes
 
-- staged analysis is now the default playlist-analysis mode
-- `track_features_fast` stores fast-stage BPM + key results for immediate visual feedback
-- `analysis_jobs` now acts as the local enrichment queue for staged analysis
-- `run-analysis-worker` processes queued enrichment jobs and then refreshes canonical relative data
-- TempoCNN is now used for BPM only
-- MusicalKeyCNN is the primary key backend for playlist analysis
-- TempoCNN and Essentia semantics now share one warm TensorFlow/Essentia Docker service
-- exported Rekordbox/Traktor BPM and key metadata are now imported into the local track catalog and used during analysis resolution
-- Serato crate import currently contributes playlist membership and local file paths only; it does not provide BPM/key metadata yet
-- `analyze-bpm` and `analyze-bpm-playlist` are the intended BPM-only commands
-- `analyze-bpm-key` and `analyze-bpm-key-playlist` are the intended fast paths when you only want BPM + key
-- `analyze-relative-playlist` now reads the canonical persisted relative layer by default and auto-refreshes it when rows are missing or stale
-- `refresh-relative-playlist` explicitly refreshes canonical `track_features_rel` and `playlist_stats` for one playlist
-- `analyze-energy-playlist` is a read-only experimental workbench for comparing absolute-energy formulas on real playlists before promoting one into the production analyzer
-- `download-essentia-semantic-models` and `analyze-essentia-playlist` are the new model-acquisition and read-only inspection surfaces for Essentia semantic absolute features
-- full playlist analysis now persists:
-  - canonical `energy_abs` from the calibrated Essentia-heavy fused intensity score when available
-  - legacy `energy_heuristic_abs` from the local DSP-only heuristic path
-  - raw Essentia semantic heads (`danceability_abs`, `arousal_abs`, `valence_abs`, `mood_aggressive_abs`, `mood_party_abs`, `mood_relaxed_abs`)
-- `analyze-relative-playlist` now defaults to canonical energy via `--energy-source canonical`
-- `--energy-source heuristic_legacy` uses the preserved DSP-only energy lane
-- `--energy-source essentia_fused` is a deprecated compatibility alias for `canonical`
-- TempoCNN, MusicalKeyCNN, and Essentia semantics all use warm Docker workers so repeated analysis avoids model cold starts
-- both warm workers now cache results for unchanged files, so rerunning the same BPM/key playlist pass is dramatically faster
-- those persistent caches live in `data/inference-cache.db` and can be purged on demand with `purge-model-cache`
-- playlist analysis surfaces BPM/key quickly, then enriches semantics and canonical absolute/relative data in the background or inline depending on analysis mode
-- MusicalKeyCNN runs through its own warm PyTorch Docker worker, separate from the shared TensorFlow/Essentia BPM + semantic worker
-- the host-side analyzer still computes the remaining DSP-native primitives locally with `librosa`
-- current canonical absolute-feature split:
-  - DSP-native primitives: `loudness_lufs`, `loudness_norm`, `bass_abs`, `time_signature`, `time_signature_confidence`
-  - DSP-native support signals: `energy_heuristic_abs`, `energy_sustained`, `energy_peak`
-  - model-backed semantics: `danceability_abs`, `arousal_abs`, `valence_abs`, `mood_aggressive_abs`, `mood_party_abs`, `mood_relaxed_abs`
-  - canonical fused intensity: `energy_abs`
-  - optional support descriptors: `drums_abs`, `harmonic_abs`, `groove_abs`
+- staged analysis is the intended interactive mode
+- `track_features_fast` exists to make BPM/key available quickly
+- enrichment then fills in canonical absolute data and refreshes relative data
+- keeping warm model services alive matters a lot for repeat performance
+- persistent model caches live in `data/inference-cache.db`
+- local DSP remains CPU-bound
+- TempoCNN and Essentia semantics use the shared TensorFlow/Essentia runtime
+- MusicalKeyCNN uses its own warm PyTorch worker
 
-Manual Docker debug for one track:
+Current Essentia behavior:
+
+- default semantic mode is a **middle excerpt**
+- tracks can escalate to **multi-sample** semantic inference when configured triggers fire
+- excerpt-only decode is used in the Essentia service for semantic windows
+
+## Development Commands
+
+Run lint:
 
 ```powershell
-docker run --rm --gpus all `
-  -v "${PWD}:/workspace:ro" `
-  -v "D:\Personal Projects\Music:/audio:ro" `
-  cuemate-tempocnn:local `
-  python /workspace/docker/tempocnn/run_tempocnn.py `
-  "/audio/Fred again/Fred again.. - ..FEISTY.flac" `
-  "/workspace/python/models/essentia/deepsquare-k16-3.pb"
+python -m ruff check python/src python/tests
 ```
 
-GPU notes:
+Run tests:
 
-- if TempoCNN is unavailable for a track, the analyzer falls back to the current librosa baseline automatically and records `baseline_fallback` as the BPM source
-- the primary TempoCNN runtime now uses the shared TensorFlow/Essentia Docker service rather than a standalone worker
-- if Docker cannot expose a usable GPU cleanly, TempoCNN will retry on CPU and the notes will say so
-- the biggest speed gains come from keeping the shared TensorFlow/Essentia service and the MusicalKeyCNN worker warm
-- the librosa baseline remains CPU-bound
-- MusicalKeyCNN now uses `full_track` as the settled production path
-- automatic chroma fallback is disabled; if MusicalKeyCNN is unavailable, analysis falls back to a tagged key only when one exists
+```powershell
+python -m pytest python/tests
+```
 
-## Intent for the next commits
+Compile protobuf contract:
 
-- add the Milestone 3 recommendation/scoring core on top of canonical absolute + relative data
-- add the Python gRPC scoring service on top of the persisted analysis data
-- add the Go API and orchestration packages under `go/cmd/` and `go/internal/`
-- add service Dockerfiles only when real app entrypoints exist
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\compile-proto.ps1
+```
+
+Benchmark local DSP:
+
+```powershell
+python -m cuemate_analysis benchmark-dsp --playlist "Fred again"
+python -m cuemate_analysis benchmark-dsp --path "D:\Music\track.flac"
+```
+
+## Known Boundaries
+
+- the recommendation/scoring engine is not implemented yet
+- Go runtime/API surfaces are still placeholders
+- windowed intro/outro analysis is intentionally deferred
+- some metadata imported from DJ libraries or file tags can still be wrong; the current resolver uses provenance + confidence heuristics rather than treating any source as perfect
+- Essentia semantic calibration infrastructure exists, but semantic validation/tuning is still ongoing
+
+## Roadmap
+
+Done:
+
+- Milestone 1 absolute analysis
+- Milestone 2 persisted relative context
+
+Next:
+
+- Milestone 3 recommendation/scoring core
+
+Later:
+
+- mobile/API integration
+- operational sync surfaces
+- optional advanced enrichments

@@ -25,7 +25,7 @@ DEFAULT_ESSENTIA_SEMANTIC_SERVICE_NAME = "cuemate-essentia-semantics-service"
 DEFAULT_ESSENTIA_SEMANTIC_SERVICE_PORT = 47833
 DEFAULT_ESSENTIA_SEMANTIC_MODEL_ROOT = REPO_ROOT / "python" / "models" / "essentia_semantics"
 ESSENTIA_SEMANTIC_BACKEND = "essentia_semantics"
-ESSENTIA_SEMANTIC_CACHE_VERSION = "essentia-semantics-cache-v3"
+ESSENTIA_SEMANTIC_CACHE_VERSION = "essentia-semantics-cache-v4"
 ESSENTIA_SEMANTIC_DEVICE_CHOICES = {"auto", "cpu", "cuda"}
 ESSENTIA_SEMANTIC_FAMILY_POLICIES = {"best_per_task", "musicnn_only"}
 ESSENTIA_SEMANTIC_URLS = {
@@ -489,28 +489,84 @@ def request_essentia_semantic_service(
         return None, [f"Essentia semantic service request failed: {exc}"]
 
 
-def build_essentia_semantic_unavailable_estimate(
+def build_essentia_semantic_success_estimate(
+    payload: dict[str, Any],
     *,
-    elapsed_ms: float | None,
-    notes: list[str],
+    elapsed_ms: float,
+    model_signature: str,
+    image_name: str,
+    device: str,
+    family_policy: str,
+    notes: list[str] | None = None,
 ) -> EssentiaSemanticEstimate:
+    payload_notes = [
+        "Primary Essentia semantic estimate from warm Docker TensorFlow service.",
+        f"Docker image: {image_name}",
+        f"Essentia semantic requested device: {device}",
+        f"Essentia family policy: {family_policy}",
+    ]
+    if notes:
+        payload_notes = [*notes, *payload_notes]
+
+    semantics = {
+        "danceability_abs": payload.get("danceability_abs"),
+        "arousal_abs": payload.get("arousal_abs"),
+        "valence_abs": payload.get("valence_abs"),
+        "mood_aggressive_abs": payload.get("mood_aggressive_abs"),
+        "mood_party_abs": payload.get("mood_party_abs"),
+        "mood_relaxed_abs": payload.get("mood_relaxed_abs"),
+    }
+
+    fused = None
+    bucket = None
+    if all(semantics.get(key) is not None for key in semantics):
+        loudness = float(payload.get("loudness_norm") or 0.0)
+        bass = float(payload.get("bass_abs") or 0.0)
+
+        if loudness < -1e-3 or loudness > 1.0 + 1e-3:
+            logger.warning("loudness_norm out of unit interval: %s", loudness)
+        if bass < -1e-3 or bass > 1.0 + 1e-3:
+            logger.warning("bass_abs out of unit interval: %s", bass)
+
+        loudness = clamp(loudness)
+        bass = clamp(bass)
+
+        fused = clamp(
+            (0.34 * float(semantics["arousal_abs"]))
+            + (0.24 * float(semantics["danceability_abs"]))
+            + (0.18 * float(semantics["mood_party_abs"]))
+            + (0.14 * (1.0 - float(semantics["mood_relaxed_abs"])))
+            + (0.05 * float(semantics["mood_aggressive_abs"]))
+            + (0.03 * loudness)
+            + (0.02 * bass)
+        )
+        bucket = bucket_from_score(fused)
+
     return EssentiaSemanticEstimate(
         backend=ESSENTIA_SEMANTIC_BACKEND,
-        danceability_abs=None,
-        arousal_abs=None,
-        valence_abs=None,
-        mood_aggressive_abs=None,
-        mood_party_abs=None,
-        mood_relaxed_abs=None,
-        semantic_confidence=None,
-        energy_essentia_fused=None,
-        energy_essentia_bucket=None,
+        danceability_abs=float(semantics["danceability_abs"]) if semantics["danceability_abs"] is not None else None,
+        arousal_abs=float(semantics["arousal_abs"]) if semantics["arousal_abs"] is not None else None,
+        valence_abs=float(semantics["valence_abs"]) if semantics["valence_abs"] is not None else None,
+        mood_aggressive_abs=float(semantics["mood_aggressive_abs"]) if semantics["mood_aggressive_abs"] is not None else None,
+        mood_party_abs=float(semantics["mood_party_abs"]) if semantics["mood_party_abs"] is not None else None,
+        mood_relaxed_abs=float(semantics["mood_relaxed_abs"]) if semantics["mood_relaxed_abs"] is not None else None,
+        semantic_confidence=float(payload.get("semantic_confidence")) if payload.get("semantic_confidence") is not None else None,
+        energy_essentia_fused=fused,
+        energy_essentia_bucket=bucket,
         elapsed_ms=elapsed_ms,
-        details={},
-        notes=notes,
-        available=False,
+        details={
+            "model_signature": model_signature,
+            "semantic_source": payload.get("semantic_source"),
+            "runner_device": payload.get("runner_device"),
+            "tf_physical_gpu_count": payload.get("tf_physical_gpu_count"),
+            "tf_logical_gpu_count": payload.get("tf_logical_gpu_count"),
+            "family_map": payload.get("family_map"),
+            "sampling_mode": payload.get("sampling_mode"),
+            "sampling_triggers": payload.get("sampling_triggers"),
+        },
+        notes=payload_notes,
+        available=True,
     )
-
 
 def build_essentia_semantic_success_estimate(
     payload: dict[str, Any],
@@ -877,3 +933,25 @@ def estimate_essentia_semantic_batch(
         )
     persist_essentia_semantic_estimates(estimates, cache_descriptors)
     return {**cached_estimates, **unavailable_estimates, **estimates}
+
+def build_essentia_semantic_unavailable_estimate(
+    *,
+    elapsed_ms: float | None,
+    notes: list[str],
+) -> EssentiaSemanticEstimate:
+    return EssentiaSemanticEstimate(
+        backend=ESSENTIA_SEMANTIC_BACKEND,
+        danceability_abs=None,
+        arousal_abs=None,
+        valence_abs=None,
+        mood_aggressive_abs=None,
+        mood_party_abs=None,
+        mood_relaxed_abs=None,
+        semantic_confidence=None,
+        energy_essentia_fused=None,
+        energy_essentia_bucket=None,
+        elapsed_ms=elapsed_ms,
+        details={},
+        notes=notes,
+        available=False,
+    )

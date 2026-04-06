@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
+import logging
 import os
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -14,19 +15,34 @@ import essentia.standard as es
 import numpy as np
 
 
+logger = logging.getLogger(__name__)
+
 TEMPO_MODEL_CACHE: dict[str, object] = {}
 SEMANTIC_BUNDLE_STATE_CACHE: dict[str, dict[str, Any]] = {}
 TEMPO_RESULT_CACHE: dict[tuple[str, str, int, int], dict[str, object]] = {}
 SEMANTIC_RESULT_CACHE: dict[tuple[str, str, int, int, str], dict[str, object]] = {}
+
 TEMPO_AUDIO_WORKERS = max(1, min(4, os.cpu_count() or 1))
 SEMANTIC_AUDIO_WORKERS = max(1, min(4, os.cpu_count() or 1))
-SEMANTIC_INFERENCE_WORKERS = max(1, min(3, int(os.getenv("ESSENTIA_SEMANTIC_INFERENCE_WORKERS", "2"))))
+SEMANTIC_INFERENCE_WORKERS = max(
+    1,
+    min(3, int(os.getenv("ESSENTIA_SEMANTIC_INFERENCE_WORKERS", "2"))),
+)
+
 SAMPLE_RATE = 16000
 TEMPO_SAMPLE_RATE = 11025
 MUSICNN_BATCH_SIZE = int(os.getenv("ESSENTIA_SEMANTIC_MUSICNN_BATCH_SIZE", "256"))
+
 THREAD_LOCAL = threading.local()
-AUDIO_LOAD_EXECUTOR = ThreadPoolExecutor(max_workers=SEMANTIC_AUDIO_WORKERS, thread_name_prefix="tf-audio")
-INFERENCE_EXECUTOR = ThreadPoolExecutor(max_workers=SEMANTIC_INFERENCE_WORKERS, thread_name_prefix="tf-infer")
+AUDIO_LOAD_EXECUTOR = ThreadPoolExecutor(
+    max_workers=SEMANTIC_AUDIO_WORKERS,
+    thread_name_prefix="tf-audio",
+)
+INFERENCE_EXECUTOR = ThreadPoolExecutor(
+    max_workers=SEMANTIC_INFERENCE_WORKERS,
+    thread_name_prefix="tf-infer",
+)
+
 MODEL_FILENAMES = {
     "musicnn_embedding_pb": "musicnn/msd-musicnn-1.pb",
     "musicnn_embedding_json": "musicnn/msd-musicnn-1.json",
@@ -42,9 +58,29 @@ MODEL_FILENAMES = {
     "mood_relaxed_json": "musicnn/mood_relaxed-musicnn-msd-1.json",
 }
 
+# Version semantic scoring explicitly so cache invalidates when normalization,
+# class selection, fusion weights, or other interpretation logic changes.
+SEMANTIC_SCORING_VERSION = "2026-04-06-class-index-cache-deam-final-v1"
+
+# Finalized decision:
+# Treat DEAM arousal/valence outputs as [1, 9] and normalize to [0, 1].
+AUXILIARY_CACHE_KEYS = (
+    "duration_seconds",
+    "peak_time_ratio",
+    "dsp_proxy_energy",
+    "structure_rms_cv",
+    "playlist_outlier_score",
+    "loudness_norm",
+    "bass_abs",
+)
+
 
 def clamp(value: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
     return float(max(minimum, min(maximum, value)))
+
+
+def normalize_deam_score(raw: float) -> float:
+    return clamp((float(raw) - 1.0) / 8.0)
 
 
 def detect_gpu_counts() -> tuple[int | None, int | None]:
@@ -81,12 +117,23 @@ def load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def infer_positive_index(metadata: dict[str, Any], *, keyword: str, default_index: int = 0) -> int:
-    classes = metadata.get("classes") or metadata.get("class_names") or []
-    for index, label in enumerate(classes):
-        if keyword in str(label).strip().lower():
-            return index
-    return default_index
+def infer_class_index(
+    metadata: dict[str, Any],
+    *,
+    label: str,
+    aliases: tuple[str, ...] = (),
+) -> int:
+    classes = [
+        str(item).strip().lower()
+        for item in (metadata.get("classes") or metadata.get("class_names") or [])
+    ]
+    candidates = [str(label).strip().lower(), *[str(item).strip().lower() for item in aliases]]
+
+    for candidate in candidates:
+        if candidate in classes:
+            return classes.index(candidate)
+
+    raise ValueError(f"Could not find class {candidates} in metadata classes={classes}")
 
 
 def fingerprint_model_artifacts(model_root: str) -> str:
@@ -142,7 +189,9 @@ def validate_requested_device(state: dict[str, Any], requested_device: str) -> N
     normalized = (requested_device or "auto").strip().lower()
     logical_gpu_count = int(state.get("tf_logical_gpu_count") or 0)
     if normalized == "cuda" and logical_gpu_count <= 0:
-        raise RuntimeError("CUDA was explicitly requested but no TensorFlow logical GPU devices are available.")
+        raise RuntimeError(
+            "CUDA was explicitly requested but no TensorFlow logical GPU devices are available."
+        )
 
 
 def load_bundle_state(model_root: str, family_policy: str) -> dict[str, Any]:
@@ -160,16 +209,34 @@ def create_bundle(model_root: str, family_policy: str) -> dict[str, Any]:
     paths = validate_model_paths(model_root)
     state = load_bundle_state(model_root, family_policy)
     return {
-        "embedding_model": build_musicnn_predictor(paths["musicnn_embedding_pb"], "model/dense/BiasAdd"),
-        "deam_head": es.TensorflowPredict2D(graphFilename=str(paths["deam_head_pb"]), output="model/Identity"),
+        "embedding_model": build_musicnn_predictor(
+            paths["musicnn_embedding_pb"],
+            "model/dense/BiasAdd",
+        ),
+        "deam_head": es.TensorflowPredict2D(
+            graphFilename=str(paths["deam_head_pb"]),
+            output="model/Identity",
+        ),
         "deam_meta": load_json(paths["deam_head_json"]),
-        "danceability_model": build_musicnn_predictor(paths["danceability_pb"], "model/Sigmoid"),
+        "danceability_model": build_musicnn_predictor(
+            paths["danceability_pb"],
+            "model/Sigmoid",
+        ),
         "danceability_meta": load_json(paths["danceability_json"]),
-        "mood_aggressive_model": build_musicnn_predictor(paths["mood_aggressive_pb"], "model/Sigmoid"),
+        "mood_aggressive_model": build_musicnn_predictor(
+            paths["mood_aggressive_pb"],
+            "model/Sigmoid",
+        ),
         "mood_aggressive_meta": load_json(paths["mood_aggressive_json"]),
-        "mood_party_model": build_musicnn_predictor(paths["mood_party_pb"], "model/Sigmoid"),
+        "mood_party_model": build_musicnn_predictor(
+            paths["mood_party_pb"],
+            "model/Sigmoid",
+        ),
         "mood_party_meta": load_json(paths["mood_party_json"]),
-        "mood_relaxed_model": build_musicnn_predictor(paths["mood_relaxed_pb"], "model/Sigmoid"),
+        "mood_relaxed_model": build_musicnn_predictor(
+            paths["mood_relaxed_pb"],
+            "model/Sigmoid",
+        ),
         "mood_relaxed_meta": load_json(paths["mood_relaxed_json"]),
         "family_map": dict(state["family_map"]),
         "tf_physical_gpu_count": state["tf_physical_gpu_count"],
@@ -192,11 +259,19 @@ def load_thread_bundle(model_root: str, family_policy: str):
 
 
 def load_tempo_audio(track_path: str):
-    return es.MonoLoader(filename=track_path, sampleRate=TEMPO_SAMPLE_RATE, resampleQuality=4)()
+    return es.MonoLoader(
+        filename=track_path,
+        sampleRate=TEMPO_SAMPLE_RATE,
+        resampleQuality=4,
+    )()
 
 
 def load_semantic_audio(track_path: str):
-    return es.MonoLoader(filename=track_path, sampleRate=SAMPLE_RATE, resampleQuality=4)()
+    return es.MonoLoader(
+        filename=track_path,
+        sampleRate=SAMPLE_RATE,
+        resampleQuality=4,
+    )()
 
 
 def load_semantic_excerpt(track_path: str, start_time: float, end_time: float):
@@ -221,23 +296,42 @@ def aggregate_prediction(value: Any) -> np.ndarray:
     return np.mean(flattened, axis=0)
 
 
-def select_binary_score(value: Any, metadata: dict[str, Any], keyword: str) -> float:
+def select_binary_score(
+    value: Any,
+    metadata: dict[str, Any],
+    label: str,
+    aliases: tuple[str, ...] = (),
+) -> float:
     aggregated = aggregate_prediction(value)
     if aggregated.size == 1:
-        return float(np.clip(aggregated[0], 0.0, 1.0))
-    positive_index = infer_positive_index(metadata, keyword=keyword, default_index=0)
-    return float(np.clip(aggregated[min(positive_index, aggregated.size - 1)], 0.0, 1.0))
+        raw = float(aggregated[0])
+        if raw < -1e-3 or raw > 1.0 + 1e-3:
+            logger.warning("Raw binary score for %s out of unit interval: %s", label, raw)
+        return float(np.clip(raw, 0.0, 1.0))
+
+    positive_index = infer_class_index(metadata, label=label, aliases=aliases)
+    raw = float(aggregated[min(positive_index, aggregated.size - 1)])
+    if raw < -1e-3 or raw > 1.0 + 1e-3:
+        logger.warning("Raw binary score for %s out of unit interval: %s", label, raw)
+    return float(np.clip(raw, 0.0, 1.0))
 
 
 def select_deam_scores(value: Any, metadata: dict[str, Any]) -> tuple[float, float]:
     aggregated = aggregate_prediction(value)
-    labels = [str(label).strip().lower() for label in (metadata.get("classes") or metadata.get("class_names") or [])]
-    arousal_index = labels.index("arousal") if "arousal" in labels else 0
-    valence_index = labels.index("valence") if "valence" in labels else min(1, aggregated.size - 1)
-    return (
-        float(np.clip(aggregated[min(arousal_index, aggregated.size - 1)], 0.0, 1.0)),
-        float(np.clip(aggregated[min(valence_index, aggregated.size - 1)], 0.0, 1.0)),
-    )
+    labels = [
+        str(label).strip().lower()
+        for label in (metadata.get("classes") or metadata.get("class_names") or [])
+    ]
+
+    valence_index = labels.index("valence") if "valence" in labels else 0
+    arousal_index = labels.index("arousal") if "arousal" in labels else min(1, aggregated.size - 1)
+
+    raw_valence = float(aggregated[min(valence_index, aggregated.size - 1)])
+    raw_arousal = float(aggregated[min(arousal_index, aggregated.size - 1)])
+
+    arousal = normalize_deam_score(raw_arousal)
+    valence = normalize_deam_score(raw_valence)
+    return (arousal, valence)
 
 
 def analyze_tempo_audio(model, track_path: str, tempo_audio) -> dict[str, object]:
@@ -246,7 +340,10 @@ def analyze_tempo_audio(model, track_path: str, tempo_audio) -> dict[str, object
     local_probs_array = np.asarray(local_probs, dtype=float)
     spread = float(np.median(np.abs(local_tempi_array - float(global_tempo)))) if local_tempi_array.size else None
     agreement = float(np.mean(np.abs(local_tempi_array - float(global_tempo)) <= 2.0)) if local_tempi_array.size else 0.0
-    stability = max(0.0, min(1.0, 1.0 - ((spread or 0.0) / max(float(global_tempo) * 0.05, 1.0)))) if local_tempi_array.size else 0.0
+    stability = max(
+        0.0,
+        min(1.0, 1.0 - ((spread or 0.0) / max(float(global_tempo) * 0.05, 1.0))),
+    ) if local_tempi_array.size else 0.0
     confidence = (agreement + stability) / 2.0 if local_tempi_array.size else 0.0
     return {
         "track_path": track_path,
@@ -262,11 +359,31 @@ def analyze_tempo_audio(model, track_path: str, tempo_audio) -> dict[str, object
 def analyze_semantic_segment(bundle, track_path: str, semantic_audio) -> dict[str, float]:
     embeddings = bundle["embedding_model"](semantic_audio)
     deam_prediction = bundle["deam_head"](embeddings)
+
     arousal_abs, valence_abs = select_deam_scores(deam_prediction, bundle["deam_meta"])
-    danceability_abs = select_binary_score(bundle["danceability_model"](semantic_audio), bundle["danceability_meta"], "dance")
-    mood_aggressive_abs = select_binary_score(bundle["mood_aggressive_model"](semantic_audio), bundle["mood_aggressive_meta"], "aggress")
-    mood_party_abs = select_binary_score(bundle["mood_party_model"](semantic_audio), bundle["mood_party_meta"], "party")
-    mood_relaxed_abs = select_binary_score(bundle["mood_relaxed_model"](semantic_audio), bundle["mood_relaxed_meta"], "relax")
+
+    danceability_abs = select_binary_score(
+        bundle["danceability_model"](semantic_audio),
+        bundle["danceability_meta"],
+        "danceable",
+        aliases=("danceability",),
+    )
+    mood_aggressive_abs = select_binary_score(
+        bundle["mood_aggressive_model"](semantic_audio),
+        bundle["mood_aggressive_meta"],
+        "aggressive",
+    )
+    mood_party_abs = select_binary_score(
+        bundle["mood_party_model"](semantic_audio),
+        bundle["mood_party_meta"],
+        "party",
+    )
+    mood_relaxed_abs = select_binary_score(
+        bundle["mood_relaxed_model"](semantic_audio),
+        bundle["mood_relaxed_meta"],
+        "relaxed",
+    )
+
     return {
         "danceability_abs": danceability_abs,
         "arousal_abs": arousal_abs,
@@ -289,14 +406,25 @@ def estimate_semantic_confidence(sample: dict[str, float]) -> float:
 
 
 def compute_fused_proxy(sample: dict[str, float], auxiliary: dict[str, float | None]) -> float:
+    loudness = float(auxiliary.get("loudness_norm") or 0.0)
+    bass = float(auxiliary.get("bass_abs") or 0.0)
+
+    if loudness < -1e-3 or loudness > 1.0 + 1e-3:
+        logger.warning("loudness_norm out of unit interval: %s", loudness)
+    if bass < -1e-3 or bass > 1.0 + 1e-3:
+        logger.warning("bass_abs out of unit interval: %s", bass)
+
+    loudness = clamp(loudness)
+    bass = clamp(bass)
+
     return clamp(
         (0.34 * float(sample["arousal_abs"]))
         + (0.24 * float(sample["danceability_abs"]))
         + (0.18 * float(sample["mood_party_abs"]))
         + (0.14 * (1.0 - float(sample["mood_relaxed_abs"])))
         + (0.05 * float(sample["mood_aggressive_abs"]))
-        + (0.03 * float(auxiliary.get("loudness_norm") or 0.0))
-        + (0.02 * float(auxiliary.get("bass_abs") or 0.0))
+        + (0.03 * loudness)
+        + (0.02 * bass)
     )
 
 
@@ -388,27 +516,45 @@ def weighted_average_samples(samples: list[tuple[float, dict[str, float]]]) -> d
     total_weight = sum(weight for weight, _ in samples) or 1.0
     keys = samples[0][1].keys()
     return {
-        key: sum(weight * float(sample[key]) for weight, sample in samples) / total_weight
+        key: clamp(
+            sum(weight * float(sample[key]) for weight, sample in samples) / total_weight
+        )
         for key in keys
     }
 
 
-def analyze_semantic_audio(bundle, track_path: str, auxiliary: dict[str, float | None], request_cfg: dict[str, float]) -> dict[str, object]:
+def analyze_semantic_audio(
+    bundle,
+    track_path: str,
+    auxiliary: dict[str, float | None],
+    request_cfg: dict[str, float],
+) -> dict[str, object]:
     duration_seconds = auxiliary.get("duration_seconds")
     peak_time_ratio = auxiliary.get("peak_time_ratio")
-    middle_audio = decode_middle_excerpt(track_path, duration_seconds, request_cfg["default_excerpt_seconds"])
+
+    middle_audio = decode_middle_excerpt(
+        track_path,
+        duration_seconds,
+        request_cfg["default_excerpt_seconds"],
+    )
     middle = analyze_semantic_segment(bundle, track_path, middle_audio)
+
     semantic_confidence = estimate_semantic_confidence(middle)
     semantic_fused = compute_fused_proxy(middle, auxiliary)
+
     triggers: list[str] = []
+
     dsp_proxy = auxiliary.get("dsp_proxy_energy")
     if dsp_proxy is not None and abs(float(dsp_proxy) - semantic_fused) >= request_cfg["mismatch_threshold"]:
         triggers.append("semantic_vs_dsp_mismatch")
+
     if semantic_confidence < request_cfg["confidence_threshold"]:
         triggers.append("low_semantic_confidence")
+
     structure_rms_cv = auxiliary.get("structure_rms_cv")
     if structure_rms_cv is not None and float(structure_rms_cv) >= request_cfg["structure_rms_cv_threshold"]:
         triggers.append("track_structure_suspicion")
+
     playlist_outlier_score = auxiliary.get("playlist_outlier_score")
     if playlist_outlier_score is not None and float(playlist_outlier_score) >= request_cfg["outlier_zscore_threshold"]:
         triggers.append("playlist_outlier")
@@ -416,16 +562,66 @@ def analyze_semantic_audio(bundle, track_path: str, auxiliary: dict[str, float |
     if triggers:
         multisample_seconds = request_cfg["multisample_excerpt_seconds"]
         samples = [
-            (0.15, analyze_semantic_segment(bundle, track_path, decode_window_by_ratio(track_path, duration_seconds, start_ratio=0.0, excerpt_seconds=multisample_seconds))),
-            (0.40, analyze_semantic_segment(bundle, track_path, decode_middle_excerpt(track_path, duration_seconds, multisample_seconds))),
-            (0.30, analyze_semantic_segment(bundle, track_path, decode_peak_excerpt(track_path, duration_seconds, peak_time_ratio, multisample_seconds))),
-            (0.15, analyze_semantic_segment(bundle, track_path, decode_window_by_ratio(track_path, duration_seconds, start_ratio=1.0, excerpt_seconds=multisample_seconds))),
+            (
+                0.15,
+                analyze_semantic_segment(
+                    bundle,
+                    track_path,
+                    decode_window_by_ratio(
+                        track_path,
+                        duration_seconds,
+                        start_ratio=0.0,
+                        excerpt_seconds=multisample_seconds,
+                    ),
+                ),
+            ),
+            (
+                0.40,
+                analyze_semantic_segment(
+                    bundle,
+                    track_path,
+                    decode_middle_excerpt(
+                        track_path,
+                        duration_seconds,
+                        multisample_seconds,
+                    ),
+                ),
+            ),
+            (
+                0.30,
+                analyze_semantic_segment(
+                    bundle,
+                    track_path,
+                    decode_peak_excerpt(
+                        track_path,
+                        duration_seconds,
+                        peak_time_ratio,
+                        multisample_seconds,
+                    ),
+                ),
+            ),
+            (
+                0.15,
+                analyze_semantic_segment(
+                    bundle,
+                    track_path,
+                    decode_window_by_ratio(
+                        track_path,
+                        duration_seconds,
+                        start_ratio=1.0,
+                        excerpt_seconds=multisample_seconds,
+                    ),
+                ),
+            ),
         ]
         averaged = weighted_average_samples(samples)
         return {
             "track_path": track_path,
             **averaged,
-            "semantic_confidence": clamp(sum(estimate_semantic_confidence(sample) * weight for weight, sample in samples) / sum(weight for weight, _ in samples)),
+            "semantic_confidence": clamp(
+                sum(estimate_semantic_confidence(sample) * weight for weight, sample in samples)
+                / sum(weight for weight, _ in samples)
+            ),
             "sampling_mode": "multisample",
             "sampling_triggers": triggers,
             "semantic_source": "best_per_task:musicnn_stable",
@@ -443,18 +639,42 @@ def analyze_semantic_audio(bundle, track_path: str, auxiliary: dict[str, float |
 
 def build_tempo_cache_key(model_path: str, track_path: str) -> tuple[str, str, int, int]:
     stat_result = Path(track_path).stat()
-    return (model_path, str(Path(track_path).resolve()), int(stat_result.st_mtime_ns), int(stat_result.st_size))
+    return (
+        model_path,
+        str(Path(track_path).resolve()),
+        int(stat_result.st_mtime_ns),
+        int(stat_result.st_size),
+    )
 
 
 def semantic_request_fingerprint(request_cfg: dict[str, float]) -> str:
     payload = {
+        "semantic_scoring_version": SEMANTIC_SCORING_VERSION,
         "default_excerpt_seconds": float(request_cfg["default_excerpt_seconds"]),
         "multisample_excerpt_seconds": float(request_cfg["multisample_excerpt_seconds"]),
         "mismatch_threshold": float(request_cfg["mismatch_threshold"]),
         "confidence_threshold": float(request_cfg["confidence_threshold"]),
         "structure_rms_cv_threshold": float(request_cfg["structure_rms_cv_threshold"]),
         "outlier_zscore_threshold": float(request_cfg["outlier_zscore_threshold"]),
+        "deam_output_range": "hardcoded_1_9",
     }
+    return hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+
+
+def fingerprint_auxiliary_features(auxiliary_features: dict[str, float | None]) -> str:
+    payload: dict[str, float | str | None] = {}
+    source = auxiliary_features or {}
+
+    for key in AUXILIARY_CACHE_KEYS:
+        value = source.get(key)
+        if value is None:
+            payload[key] = None
+            continue
+        try:
+            payload[key] = round(float(value), 6)
+        except Exception:
+            payload[key] = str(value)
+
     return hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:12]
 
 
@@ -464,16 +684,18 @@ def build_semantic_cache_key(
     track_path: str,
     sampling_mode: str,
     request_cfg: dict[str, float],
+    auxiliary_features: dict[str, float | None],
 ) -> tuple[str, str, int, int, str]:
     stat_result = Path(track_path).stat()
     artifact_fingerprint = fingerprint_model_artifacts(model_root)
     request_fingerprint = semantic_request_fingerprint(request_cfg)
+    auxiliary_fingerprint = fingerprint_auxiliary_features(auxiliary_features)
     return (
         artifact_fingerprint,
         str(Path(track_path).resolve()),
         int(stat_result.st_mtime_ns),
         int(stat_result.st_size),
-        f"{family_policy}:{sampling_mode}:{request_fingerprint}",
+        f"{family_policy}:{sampling_mode}:{request_fingerprint}:{auxiliary_fingerprint}",
     )
 
 
@@ -516,13 +738,16 @@ def analyze_semantic_tracks(
 
     cached_by_track: dict[str, dict[str, object]] = {}
     pending_uncached: list[str] = []
+
     for track_path in pending:
+        auxiliary = dict(auxiliary_features_by_track.get(track_path, {}) or {})
         cache_key = build_semantic_cache_key(
             model_root,
             family_policy,
             track_path,
             "adaptive",
             request_cfg,
+            auxiliary,
         )
         cached = SEMANTIC_RESULT_CACHE.get(cache_key)
         if cached is not None:
@@ -533,6 +758,7 @@ def analyze_semantic_tracks(
     def analyze_one(track_path: str) -> dict[str, object]:
         bundle = load_thread_bundle(model_root, family_policy)
         auxiliary = dict(auxiliary_features_by_track.get(track_path, {}) or {})
+
         payload = analyze_semantic_audio(bundle, track_path, auxiliary, request_cfg)
         payload.update(
             {
@@ -542,12 +768,14 @@ def analyze_semantic_tracks(
                 "tf_logical_gpu_count": bundle["tf_logical_gpu_count"],
             }
         )
+
         cache_key = build_semantic_cache_key(
             model_root,
             family_policy,
             track_path,
             "adaptive",
             request_cfg,
+            auxiliary,
         )
         SEMANTIC_RESULT_CACHE[cache_key] = dict(payload)
         return payload
@@ -570,11 +798,14 @@ def analyze_semantic_tracks(
                     computed_payloads.append(future.result())
                 except Exception as exc:
                     computed_payloads.append({"track_path": item, "error": str(exc)})
+
         computed_by_track = {str(item.get("track_path")): item for item in computed_payloads}
 
     mode_counts: dict[str, int] = {}
     trigger_counts: dict[str, int] = {}
-    for payload in computed_by_track.values():
+
+    all_payloads = [*cached_by_track.values(), *computed_by_track.values()]
+    for payload in all_payloads:
         if "error" in payload:
             continue
         mode = str(payload.get("sampling_mode") or "unknown")
@@ -595,6 +826,7 @@ def analyze_semantic_tracks(
                 "batch_sampling_trigger_counts": dict(trigger_counts),
             }
         results.append(item)
+
     return results
 
 
@@ -649,15 +881,23 @@ class SharedTensorflowHandler(BaseHTTPRequestHandler):
         model_path = str(payload.get("model_path") or "").strip()
         track_paths = payload.get("tracks") or []
         if not model_path or not isinstance(track_paths, list) or not track_paths:
-            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "model_path and tracks[] are required."})
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "model_path and tracks[] are required."},
+            )
             return
+
         tf_physical_gpu_count, tf_logical_gpu_count = detect_gpu_counts()
         try:
             model = get_tempo_model(model_path)
         except Exception as exc:
             self._send_json(
                 HTTPStatus.BAD_REQUEST,
-                {"error": f"model_load_failed: {exc}", "tf_physical_gpu_count": tf_physical_gpu_count, "tf_logical_gpu_count": tf_logical_gpu_count},
+                {
+                    "error": f"model_load_failed: {exc}",
+                    "tf_physical_gpu_count": tf_physical_gpu_count,
+                    "tf_logical_gpu_count": tf_logical_gpu_count,
+                },
             )
             return
 
@@ -665,25 +905,30 @@ class SharedTensorflowHandler(BaseHTTPRequestHandler):
         results: list[dict[str, object]] = []
         missing: list[str] = []
         cached_results: dict[str, dict[str, object]] = {}
+
         for track_path in resolved_track_paths:
             try:
                 cache_key = build_tempo_cache_key(model_path, track_path)
             except Exception as exc:
                 results.append({"track_path": track_path, "error": str(exc)})
                 continue
+
             cached = TEMPO_RESULT_CACHE.get(cache_key)
             if cached is None:
                 missing.append(track_path)
             else:
                 cached_results[track_path] = dict(cached)
+
         computed = {
             str(item.get("track_path")): item
             for item in analyze_tempo_tracks(model, missing)
         }
+
         for track_path in missing:
             item = computed.get(track_path)
             if item and "error" not in item:
                 TEMPO_RESULT_CACHE[build_tempo_cache_key(model_path, track_path)] = dict(item)
+
         ordered_results = []
         for track_path in resolved_track_paths:
             ordered_results.append(
@@ -691,6 +936,7 @@ class SharedTensorflowHandler(BaseHTTPRequestHandler):
                 or computed.get(track_path)
                 or {"track_path": track_path, "error": "missing_result"}
             )
+
         self._send_json(
             HTTPStatus.OK,
             {
@@ -706,15 +952,21 @@ class SharedTensorflowHandler(BaseHTTPRequestHandler):
         device = str(payload.get("device") or "auto")
         family_policy = str(payload.get("family_policy") or "best_per_task")
         auxiliary_features_by_track = payload.get("auxiliary_features_by_track") or {}
+
         if not model_root or not isinstance(track_paths, list) or not track_paths:
-            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "model_root and tracks[] are required."})
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "model_root and tracks[] are required."},
+            )
             return
+
         try:
             state = load_bundle_state(model_root, family_policy)
             validate_requested_device(state, device)
         except Exception as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
+
         request_cfg = {
             "default_excerpt_seconds": float(payload.get("default_excerpt_seconds") or 60.0),
             "multisample_excerpt_seconds": float(payload.get("multisample_excerpt_seconds") or 30.0),
@@ -723,7 +975,15 @@ class SharedTensorflowHandler(BaseHTTPRequestHandler):
             "structure_rms_cv_threshold": float(payload.get("structure_rms_cv_threshold") or 0.45),
             "outlier_zscore_threshold": float(payload.get("outlier_zscore_threshold") or 1.35),
         }
-        results = analyze_semantic_tracks(model_root, family_policy, [str(track_path) for track_path in track_paths], auxiliary_features_by_track, request_cfg)
+
+        results = analyze_semantic_tracks(
+            model_root,
+            family_policy,
+            [str(track_path) for track_path in track_paths],
+            auxiliary_features_by_track,
+            request_cfg,
+        )
+
         self._send_json(
             HTTPStatus.OK,
             {
@@ -737,18 +997,24 @@ class SharedTensorflowHandler(BaseHTTPRequestHandler):
 def main() -> int:
     port = int(os.getenv("ESSENTIA_SEMANTIC_SERVICE_PORT", "47833"))
     default_model_root = os.getenv("CUEMATE_ESSENTIA_SEMANTIC_MODEL_ROOT")
-    default_family_policy = os.getenv("CUEMATE_ESSENTIA_SEMANTIC_MODEL_FAMILY_POLICY", "best_per_task")
+    default_family_policy = os.getenv(
+        "CUEMATE_ESSENTIA_SEMANTIC_MODEL_FAMILY_POLICY",
+        "best_per_task",
+    )
     default_tempo_model = os.getenv("CUEMATE_TEMPOCNN_DEFAULT_MODEL")
+
     if default_model_root:
         try:
             load_thread_bundle(default_model_root, default_family_policy)
         except Exception:
             pass
+
     if default_tempo_model:
         try:
             get_tempo_model(default_tempo_model)
         except Exception:
             pass
+
     server = ThreadingHTTPServer(("0.0.0.0", port), SharedTensorflowHandler)
     server.serve_forever()
     return 0

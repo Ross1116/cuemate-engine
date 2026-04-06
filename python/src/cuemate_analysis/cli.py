@@ -227,6 +227,62 @@ def print_backend_diagnostics(label: str, estimates: list[object], *, requested_
         print(f"- sampling_triggers: {trigger_summary}")
 
 
+def _fmt_float(value, digits: int = 3) -> str:
+    if value is None:
+        return "None"
+    return f"{float(value):.{digits}f}"
+
+
+def format_full_analysis_summary(result) -> str:
+    parts: list[str] = []
+
+    # Core resolved outputs
+    parts.append(f"bpm={_fmt_float(result.bpm, 1)}")
+    parts.append(f"bpm_conf={_fmt_float(result.bpm_confidence, 2)}")
+    parts.append(f"bpm_source={result.bpm_source}")
+
+    parts.append(f"key={result.key}")
+    parts.append(f"key_conf={_fmt_float(result.key_confidence, 2)}")
+    parts.append(f"key_source={result.key_source}")
+
+    parts.append(f"time_sig={result.time_signature}")
+    parts.append(f"time_sig_conf={_fmt_float(result.time_signature_confidence, 2)}")
+
+    # Energy / DSP
+    parts.append(f"energy_abs={_fmt_float(result.energy_abs)}")
+    parts.append(f"energy_heuristic_abs={_fmt_float(result.energy_heuristic_abs)}")
+    parts.append(f"energy_sustained={_fmt_float(result.energy_sustained)}")
+    parts.append(f"energy_peak={_fmt_float(result.energy_peak)}")
+    parts.append(f"loudness_lufs={_fmt_float(result.loudness_lufs, 2)}")
+    parts.append(f"loudness_norm={_fmt_float(result.loudness_norm)}")
+    parts.append(f"bass_abs={_fmt_float(result.bass_abs)}")
+    # deferred (dsp full analysis) for now
+    # parts.append(f"drums_abs={_fmt_float(result.drums_abs)}")
+    # parts.append(f"harmonic_abs={_fmt_float(result.harmonic_abs)}")
+    # parts.append(f"groove_abs={_fmt_float(result.groove_abs)}")
+
+    # Essentia semantics, only when present
+    if result.danceability_abs is not None:
+        parts.append(f"danceability_abs={_fmt_float(result.danceability_abs)}")
+    if result.arousal_abs is not None:
+        parts.append(f"arousal_abs={_fmt_float(result.arousal_abs)}")
+    if result.valence_abs is not None:
+        parts.append(f"valence_abs={_fmt_float(result.valence_abs)}")
+    if result.mood_aggressive_abs is not None:
+        parts.append(f"mood_aggressive_abs={_fmt_float(result.mood_aggressive_abs)}")
+    if result.mood_party_abs is not None:
+        parts.append(f"mood_party_abs={_fmt_float(result.mood_party_abs)}")
+    if result.mood_relaxed_abs is not None:
+        parts.append(f"mood_relaxed_abs={_fmt_float(result.mood_relaxed_abs)}")
+    if result.energy_essentia_fused is not None:
+        parts.append(f"energy_essentia_fused={_fmt_float(result.energy_essentia_fused)}")
+    if result.energy_essentia_bucket is not None:
+        parts.append(f"energy_essentia_bucket={result.energy_essentia_bucket}")
+    if result.essentia_semantic_source is not None:
+        parts.append(f"essentia_source={result.essentia_semantic_source}")
+
+    return " :: ".join(parts)
+
 def build_bpm_payload(path: Path, metadata, estimate: TempoEstimate) -> dict[str, object]:
     return {
         "file_path": path.as_posix(),
@@ -654,14 +710,21 @@ def should_skip_fast_analysis(
 ) -> bool:
     if force:
         return False
-    return (
-        row.get("fast_source_file_hash") == track.file_hash
-        and row.get("fast_analysis_signature") == effective_analysis_signature
-        and row.get("fast_config_signature") == config_signature
-        and row.get("fast_bpm") is not None
-        and row.get("fast_key") is not None
-    )
 
+    row_keys = set(row.keys()) if hasattr(row, "keys") else set()
+
+    def optional_value(key: str):
+        if row_keys and key not in row_keys:
+            return None
+        return row[key]
+
+    return (
+        optional_value("fast_source_file_hash") == track.file_hash
+        and optional_value("fast_analysis_signature") == effective_analysis_signature
+        and optional_value("fast_config_signature") == config_signature
+        and optional_value("fast_bpm") is not None
+        and optional_value("fast_key") is not None
+    )
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -1036,8 +1099,8 @@ def _process_enrichment_batch(
         return 0, [], [], [], [], []
 
     pending_prepared = [item["prepared"] for item in pending_items]
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        dsp_future = executor.submit(run_dsp_lane, pending_prepared, settings, "fast_pass")
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        dsp_future = executor.submit(run_dsp_lane, pending_prepared, settings, "full")
         prefetched_tempocnn_estimates = run_tempo_lane(pending_prepared, settings)
         prefetched_musicalkeycnn_estimates = run_key_lane(pending_prepared, settings)
         prefetched_dsp_results = dsp_future.result()
@@ -1127,11 +1190,17 @@ def _process_enrichment_batch(
                 utc_now(),
             )
             processed += 1
+            if essentia_estimate is not None and not getattr(essentia_estimate, "available", False):
+                print(
+                    f"[{index}/{total}] essentia_debug {track.id}: "
+                    + " | ".join(str(note) for note in (essentia_estimate.notes or [])),
+                    file=sys.stderr,
+                )
             if print_progress:
                 degraded_suffix = f" (degraded: missing {', '.join(missing_lanes)})" if degraded else ""
                 print(
-                    f"[{index}/{total}] analyzed {track.id} ({track.title}){degraded_suffix} -> "
-                    f"{result.bpm:.1f} BPM ({result.bpm_source}), {result.key} ({result.key_source})"
+                    f"[{index}/{total}] analyzed {track.id} ({track.title}){degraded_suffix} :: "
+                    f"{format_full_analysis_summary(result)}"
                 )
         except Exception as exc:
             duration_seconds = round(time.perf_counter() - start_time, 3)

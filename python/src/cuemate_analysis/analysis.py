@@ -921,7 +921,13 @@ def resolve_key_with_backend(
         device=musicalkeycnn_device,
         policy=musicalkeycnn_policy,
     )
-    if estimate.available and estimate.key and estimate.key_number is not None and estimate.key_letter is not None:
+
+    if (
+        estimate.available
+        and estimate.key
+        and estimate.key_number is not None
+        and estimate.key_letter is not None
+    ):
         return resolve_key(
             track.key_tag,
             track.key_imported,
@@ -936,8 +942,30 @@ def resolve_key_with_backend(
             },
         )
 
-    return resolve_tag_only_key(track.key_tag, track.key_imported)
+    try:
+        chroma_detected = detect_key(y, sr)
+        if (
+            chroma_detected.get("key")
+            and chroma_detected.get("key_number") is not None
+            and chroma_detected.get("key_letter") is not None
+        ):
+            return resolve_key(
+                track.key_tag,
+                track.key_imported,
+                {
+                    "key": str(chroma_detected["key"]),
+                    "key_number": int(chroma_detected["key_number"]),
+                    "key_letter": str(chroma_detected["key_letter"]),
+                    "key_confidence": clamp(float(chroma_detected.get("key_confidence", 0.0) or 0.0)),
+                    "pitch": chroma_detected.get("pitch"),
+                    "mode": chroma_detected.get("mode"),
+                    "key_source": "chroma",
+                },
+            )
+    except Exception:
+        pass
 
+    return resolve_tag_only_key(track.key_tag, track.key_imported)
 
 def extract_energy(
     y: np.ndarray | None = None,

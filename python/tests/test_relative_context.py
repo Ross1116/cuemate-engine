@@ -3,7 +3,14 @@ import sqlite3
 from pathlib import Path
 
 from cuemate_analysis.cli import main
-from cuemate_analysis.config import load_runtime_settings
+from cuemate_analysis.config import (
+    AnalysisSettings,
+    RuntimeSettings,
+    ScoringSettings,
+    SemanticCalibrationSettings,
+    ThresholdSettings,
+    WeightAdaptationSettings,
+)
 from cuemate_analysis.relative_context import (
     RelativeTrackInput,
     assign_intensity_band,
@@ -179,21 +186,94 @@ def _load_relative_rows(database_path: Path, playlist_name: str):
     return rows
 
 
-def _settings_for_database(database_path: Path):
-    settings = load_runtime_settings()
-    return settings.__class__(
-        repo_root=settings.repo_root,
-        env_path=settings.env_path,
-        config_path=settings.config_path,
+def _settings_for_database(database_path: Path) -> RuntimeSettings:
+    repo_root = database_path.parent.resolve()
+    env_path = repo_root / ".env.test"
+    config_path = repo_root / "config.test.json"
+
+    analysis = AnalysisSettings(
+        sample_rate=22050,
+        mono=True,
+        key_backend="musicalkeycnn",
+        key_model_path=None,
+        key_device="auto",
+        key_policy="full_track",
+        parallel_workers=2,
+        max_workers_auto=False,
+        per_track_timeout_seconds=120,
+        model_preload=False,
+        fast_pass_enabled=True,
+        analysis_signature_seed="test-analysis-seed",
+        energy_source_default="canonical",
+        essentia_semantics_enabled=True,
+        essentia_semantic_image="cuemate-essentia-semantics:test",
+        essentia_semantic_device="auto",
+        essentia_semantic_model_family_policy="best_per_task",
+        essentia_semantic_model_root="python/models/essentia_semantics",
+        essentia_semantic_default_excerpt_seconds=60.0,
+        essentia_semantic_multisample_excerpt_seconds=30.0,
+        essentia_semantic_trigger_mismatch_threshold=0.22,
+        essentia_semantic_trigger_confidence_threshold=0.58,
+        essentia_semantic_trigger_structure_rms_cv=0.45,
+        essentia_semantic_trigger_outlier_zscore=1.35,
+        full_chunk_size=4,
+        tempo_chunk_size=8,
+        key_chunk_size=8,
+        essentia_chunk_size=4,
+        dsp_workers=2,
+    )
+
+    thresholds = ThresholdSettings(
+        small_playlist_limit=12,
+        min_playlist_for_relative=5,
+    )
+
+    scoring = ScoringSettings(
+        static_weights={
+            "target_energy": 0.22,
+            "transition_support": 0.18,
+            "bass_transition": 0.15,
+            "vocal_transition": 0.13,
+            "harmonic": 0.12,
+            "tempo": 0.10,
+            "history_fit": 0.06,
+            "rhythmic_continuity": 0.04,
+        },
+        weight_floors={
+            "target_energy": 0.08,
+            "transition_support": 0.05,
+            "bass_transition": 0.04,
+            "vocal_transition": 0.03,
+            "harmonic": 0.04,
+            "tempo": 0.03,
+            "history_fit": 0.03,
+            "rhythmic_continuity": 0.02,
+        },
+    )
+
+    weight_adaptation = WeightAdaptationSettings(
+        mode="auto",
+        adaptation_strength=0.7,
+    )
+
+    semantic_calibration = SemanticCalibrationSettings(
+        calibration_version="identity",
+        heads={},
+    )
+
+    return RuntimeSettings(
+        repo_root=repo_root,
+        env_path=env_path,
+        config_path=config_path,
         database_path=database_path,
         database_url=f"sqlite:{database_path.as_posix()}",
-        config_signature=settings.config_signature,
-        analysis_signature=settings.analysis_signature,
-        analysis=settings.analysis,
-        thresholds=settings.thresholds,
-        scoring=settings.scoring,
-        weight_adaptation=settings.weight_adaptation,
-        semantic_calibration=settings.semantic_calibration,
+        config_signature="test-config",
+        analysis_signature="test-analysis",
+        analysis=analysis,
+        thresholds=thresholds,
+        scoring=scoring,
+        weight_adaptation=weight_adaptation,
+        semantic_calibration=semantic_calibration,
     )
 
 
@@ -231,7 +311,7 @@ def test_role_hints_use_neutral_mid_energy_label() -> None:
 
 def test_relative_preview_marks_small_playlists_as_insufficient(tmp_path: Path) -> None:
     database_path = _create_relative_test_db(tmp_path, "Small", 4)
-    settings = load_runtime_settings()
+    settings = _settings_for_database(database_path)
     preview = compute_relative_playlist_preview(
         [row_to_relative_track_input(row) for row in _load_relative_rows(database_path, "Small")],
         settings,
@@ -244,7 +324,7 @@ def test_relative_preview_marks_small_playlists_as_insufficient(tmp_path: Path) 
 
 def test_relative_preview_computes_rows_but_skips_weights_for_small_eligible_playlist(tmp_path: Path) -> None:
     database_path = _create_relative_test_db(tmp_path, "Medium", 8)
-    settings = load_runtime_settings()
+    settings = _settings_for_database(database_path)
     preview = compute_relative_playlist_preview(
         [row_to_relative_track_input(row) for row in _load_relative_rows(database_path, "Medium")],
         settings,
@@ -258,7 +338,7 @@ def test_relative_preview_computes_rows_but_skips_weights_for_small_eligible_pla
 
 def test_relative_preview_computes_weights_for_large_playlist(tmp_path: Path) -> None:
     database_path = _create_relative_test_db(tmp_path, "Large", 12)
-    settings = load_runtime_settings()
+    settings = _settings_for_database(database_path)
     preview = compute_relative_playlist_preview(
         [row_to_relative_track_input(row) for row in _load_relative_rows(database_path, "Large")],
         settings,
@@ -272,7 +352,7 @@ def test_relative_preview_computes_weights_for_large_playlist(tmp_path: Path) ->
 
 def test_relative_preview_is_deterministic(tmp_path: Path) -> None:
     database_path = _create_relative_test_db(tmp_path, "Stable", 12)
-    settings = load_runtime_settings()
+    settings = _settings_for_database(database_path)
     first = compute_relative_playlist_preview(
         [row_to_relative_track_input(row) for row in _load_relative_rows(database_path, "Stable")],
         settings,
@@ -288,8 +368,9 @@ def test_relative_preview_is_deterministic(tmp_path: Path) -> None:
     assert json.dumps(first, sort_keys=True) == json.dumps(second, sort_keys=True)
 
 
-def test_relative_preview_can_use_essentia_fused_with_heuristic_fallback() -> None:
-    settings = load_runtime_settings()
+def test_relative_preview_can_use_essentia_fused_with_heuristic_fallback(tmp_path: Path) -> None:
+    database_path = tmp_path / "essentia.db"
+    settings = _settings_for_database(database_path)
     rows = [
         RelativeTrackInput(
             playlist_id="plt_test",

@@ -1339,6 +1339,7 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
                     "The local database schema is out of date and is missing the track_features_fast table. Apply migrations first with "
                     "powershell -ExecutionPolicy Bypass -File .\\scripts\\docker-compose.ps1 --profile ops run --rm migrate"
                 )
+
         rows = database.get_playlist_tracks(playlist_name)
         if not rows:
             raise SystemExit(f"Playlist '{playlist_name}' was not found. Import it first.")
@@ -1352,6 +1353,7 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
         key_diagnostics: list[KeyEstimate] = []
         essentia_diagnostics: list[EssentiaSemanticEstimate] = []
         pending_enrichment_items: list[dict[str, object]] = []
+
         for chunk in chunk_items(rows, settings.analysis.full_chunk_size):
             prepared_tracks, prepare_failures = prepare_analysis_chunk(chunk)
             for row, error_message in prepare_failures:
@@ -1363,10 +1365,12 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
 
             prefetched_tempocnn_estimates = run_tempo_lane(prepared_tracks, settings)
             prefetched_musicalkeycnn_estimates = run_key_lane(prepared_tracks, settings)
+
             for prepared in prepared_tracks:
                 row = prepared.row
                 track = prepared.track
                 index = prepared.position
+
                 database.upsert_track(track, utc_now())
 
                 if not should_skip_fast_analysis(
@@ -1469,8 +1473,6 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
             return 0
 
         if args.analysis_mode == "full":
-            for item in pending_enrichment_items:
-                database.mark_analysis_job_started(int(item["job_id"]), utc_now())
             (
                 processed,
                 updated_track_ids,
@@ -1505,6 +1507,7 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
                     _refresh_relative_for_playlists(post_db, settings, {playlist_id})
             except Exception as exc:
                 print(f"Warning: canonical relative refresh failed for '{playlist_name}': {exc}", file=sys.stderr)
+
             if updated_track_ids and hasattr(post_db, "get_playlists_containing_tracks") and hasattr(post_db, "mark_playlists_stale"):
                 linked = post_db.get_playlists_containing_tracks(updated_track_ids)
                 stale_targets = [pid for pid in linked if pid != playlist_id]
@@ -1949,14 +1952,30 @@ def handle_analyze_relative_playlist(args: argparse.Namespace) -> int:
         playlist_id = str(abs_rows[0]["playlist_id"])
 
         if energy_source == "canonical":
-            # Persisted-first: check whether rows are current or stale.
+            # Persisted-first: refresh when rows are missing, stale, or the current
+            # relative signature no longer matches the persisted signature.
+            from cuemate_analysis.config import build_relative_experiment_signature
+
             stats_row = database.get_playlist_stats(playlist_id)
+            current_relative_signature = build_relative_experiment_signature(
+                settings,
+                energy_source="canonical",
+            )
+
             needs_refresh = (
                 stats_row is None
                 or bool(stats_row["is_stale"])
+                or str(stats_row["relative_signature"]) != current_relative_signature
             )
+
             if needs_refresh:
-                reason = "missing" if stats_row is None else stats_row["stale_reason"]
+                if stats_row is None:
+                    reason = "missing"
+                elif bool(stats_row["is_stale"]):
+                    reason = str(stats_row["stale_reason"] or "stale")
+                else:
+                    reason = "relative_signature_changed"
+
                 preview = _refresh_canonical_relative_preview(
                     database,
                     playlist_name=args.playlist,
@@ -1971,6 +1990,7 @@ def handle_analyze_relative_playlist(args: argparse.Namespace) -> int:
                 preview = _load_persisted_canonical_preview(
                     database, args.playlist, playlist_id, abs_rows, settings
                 )
+
             if args.limit and args.limit > 0:
                 preview = _limit_relative_preview(preview, limit=args.limit)
         else:
@@ -2411,7 +2431,11 @@ def handle_run_analysis_worker(args: argparse.Namespace) -> int:
     )
 
     with Database(settings.database_path) as database:
-        jobs = database.get_pending_analysis_jobs(job_kind="enrichment", limit=args.limit)
+        jobs = database.claim_pending_analysis_jobs(
+            job_kind="enrichment",
+            limit=args.limit,
+            started_at=utc_now(),
+        )
         if not jobs:
             print("No pending enrichment jobs were found.")
             return 0
@@ -2420,8 +2444,14 @@ def handle_run_analysis_worker(args: argparse.Namespace) -> int:
         for offset, job in enumerate(jobs, start=1):
             track_row = database.get_track_row(str(job["track_id"]))
             if track_row is None:
-                database.mark_analysis_job_failed(int(job["id"]), "Track metadata was missing.", 0.0, utc_now())
+                database.mark_analysis_job_failed(
+                    int(job["id"]),
+                    "Track metadata was missing.",
+                    0.0,
+                    utc_now(),
+                )
                 continue
+
             track = read_track_metadata_with_overrides(
                 Path(str(track_row["file_path"])),
                 bpm_imported=track_row["imported_bpm"],
@@ -2432,12 +2462,15 @@ def handle_run_analysis_worker(args: argparse.Namespace) -> int:
                 import_source=track_row["import_source"] or "local_files",
             )
             prepared = PreparedTrack(
-                row={"playlist_id": job["playlist_id"], "track_id": job["track_id"], "file_path": track.file_path.as_posix()},
+                row={
+                    "playlist_id": job["playlist_id"],
+                    "track_id": job["track_id"],
+                    "file_path": track.file_path.as_posix(),
+                },
                 track=track,
                 position=offset,
                 resolved_path=track.file_path.resolve(),
             )
-            database.mark_analysis_job_started(int(job["id"]), utc_now())
             pending_items.append(
                 {
                     "prepared": prepared,
@@ -2448,13 +2481,17 @@ def handle_run_analysis_worker(args: argparse.Namespace) -> int:
                 }
             )
 
+        if not pending_items:
+            print("No runnable enrichment jobs were found.")
+            return 0
+
         (
             processed,
             updated_track_ids,
-            _dsp,
-            _tempo,
-            _key,
-            _essentia,
+            dsp_diagnostics,
+            tempo_diagnostics,
+            key_diagnostics,
+            essentia_diagnostics,
         ) = _process_enrichment_batch(
             pending_items=pending_items,
             settings=settings,
@@ -2464,22 +2501,53 @@ def handle_run_analysis_worker(args: argparse.Namespace) -> int:
             print_progress=True,
         )
 
+        claimed_job_ids = [int(job["id"]) for job in jobs]
+        final_jobs = database.get_analysis_jobs_by_ids(claimed_job_ids)
+
+        jobs_by_playlist: dict[str, list[sqlite3.Row]] = {}
+        for job in final_jobs:
+            playlist_id = job["playlist_id"]
+            if playlist_id:
+                jobs_by_playlist.setdefault(str(playlist_id), []).append(job)
+
         touched_playlists = {
-            str(job["playlist_id"])
-            for job in jobs
-            if job["playlist_id"] is not None
+            playlist_id
+            for playlist_id, playlist_jobs in jobs_by_playlist.items()
+            if all(str(job["status"]) == "completed" for job in playlist_jobs)
         }
+
         if touched_playlists:
             _refresh_relative_for_playlists(database, settings, touched_playlists)
-        if updated_track_ids:
+
+        updated_playlist_names: list[str] = []
+        for playlist_id in touched_playlists:
+            playlist_name = database.get_playlist_name_by_id(playlist_id)
+            if playlist_name:
+                updated_playlist_names.append(playlist_name)
+
+        for playlist_name in updated_playlist_names:
+            print(f"Refreshed canonical relative data for '{playlist_name}'.")
+
+        if updated_track_ids and hasattr(database, "get_playlists_containing_tracks") and hasattr(database, "mark_playlists_stale"):
             linked = database.get_playlists_containing_tracks(updated_track_ids)
             stale_targets = [pid for pid in linked if pid not in touched_playlists]
             if stale_targets:
                 database.mark_playlists_stale(stale_targets, "absolute_track_changed", utc_now())
                 print(f"Marked {len(stale_targets)} linked playlist(s) stale.")
 
-    print(f"Processed {processed} enrichment job(s).")
-    return 0
+        print(f"Processed {processed} enrichment job(s).")
+
+        if args.print_backend_diagnostics:
+            print_backend_diagnostics("DSP local lane", dsp_diagnostics, requested_device="cpu")
+            print_backend_diagnostics("TempoCNN", tempo_diagnostics, requested_device="auto")
+            print_backend_diagnostics("MusicalKeyCNN", key_diagnostics, requested_device=settings.analysis.key_device)
+            print_backend_diagnostics(
+                "Essentia semantics",
+                essentia_diagnostics,
+                requested_device=settings.analysis.essentia_semantic_device,
+            )
+
+        return 0
 
 
 def handle_prewarm_model_services(args: argparse.Namespace) -> int:

@@ -648,10 +648,12 @@ def purge_tempocnn_cache(
             )
     except Exception:
         deleted = 0
-    if clear_warm_service:
-        remove_docker_container(resolve_tempocnn_service_name(None))
-    return deleted
 
+    # Always invalidate the warm TempoCNN service after cache purge so the
+    # in-memory service cache cannot return stale results.
+    remove_docker_container(resolve_tempocnn_service_name(None))
+
+    return deleted
 
 def estimate_tempocnn_bpms(
     paths: list[Path],

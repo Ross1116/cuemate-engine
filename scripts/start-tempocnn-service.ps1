@@ -7,3 +7,7 @@ if (-not (Test-Path $delegateScript)) {
 
 Write-Output "TempoCNN now runs through the shared TensorFlow/Essentia service."
 & powershell -ExecutionPolicy Bypass -File $delegateScript
+
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}

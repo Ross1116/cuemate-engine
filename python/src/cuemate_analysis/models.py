@@ -37,7 +37,7 @@ class ImportedTrack:
         }
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class AnalysisResult:
     track_id: str
     source_file_hash: str
@@ -89,7 +89,7 @@ class AnalysisResult:
         return payload
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class FastAnalysisResult:
     track_id: str
     source_file_hash: str

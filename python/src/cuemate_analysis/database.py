@@ -298,7 +298,7 @@ class Database:
                 DELETE FROM analysis_jobs
                 WHERE track_id = ?
                 AND job_kind = ?
-                AND status IN ('pending', 'running')
+                AND status = 'pending'
                 AND analysis_signature = ?
                 AND config_signature = ?
                 """,
@@ -752,3 +752,44 @@ class Database:
                     """,
                     (reason, timestamp, playlist_id),
                 )
+    
+    def claim_pending_analysis_jobs(
+        self,
+        *,
+        job_kind: str,
+        limit: int = 100,
+        started_at: str,
+    ) -> list[sqlite3.Row]:
+        with self.connection:
+            rows = self.connection.execute(
+                """
+                WITH to_claim AS (
+                    SELECT id
+                    FROM analysis_jobs
+                    WHERE status = 'pending' AND job_kind = ?
+                    ORDER BY priority DESC, created_at ASC
+                    LIMIT ?
+                )
+                UPDATE analysis_jobs
+                SET status = 'running',
+                    started_at = ?
+                WHERE id IN (SELECT id FROM to_claim)
+                RETURNING *
+                """,
+                (job_kind, limit, started_at),
+            ).fetchall()
+        return rows
+    
+    def get_analysis_jobs_by_ids(self, job_ids: Iterable[int]) -> list[sqlite3.Row]:
+        ids = [int(job_id) for job_id in job_ids]
+        if not ids:
+            return []
+        placeholders = ", ".join("?" * len(ids))
+        return self.connection.execute(
+            f"""
+            SELECT *
+            FROM analysis_jobs
+            WHERE id IN ({placeholders})
+            """,
+            ids,
+        ).fetchall()

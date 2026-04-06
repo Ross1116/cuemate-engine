@@ -22,6 +22,4 @@ CREATE TABLE IF NOT EXISTS track_features_fast (
 ALTER TABLE analysis_jobs ADD COLUMN job_kind TEXT NOT NULL DEFAULT 'full';
 
 -- migrate:down
-DROP TABLE IF EXISTS track_features_fast;
--- SQLite does not support dropping analysis_jobs.job_kind in-place.
--- This migration is intentionally irreversible for the analysis_jobs alteration.
+SELECT RAISE(FAIL, 'Irreversible migration: cannot remove analysis_jobs.job_kind safely without rebuilding analysis_jobs');

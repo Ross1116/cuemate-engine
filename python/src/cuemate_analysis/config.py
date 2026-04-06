@@ -204,12 +204,51 @@ def _serialize_semantic_calibration(calibration: SemanticCalibrationSettings) ->
     }
 
 
+def _fingerprint_file(path: Path) -> dict[str, Any]:
+    stat = path.stat()
+    return {
+        "path": path.as_posix(),
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "sha1": hashlib.sha1(path.read_bytes()).hexdigest(),
+    }
+
+
+def _fingerprint_directory(path: Path) -> str:
+    if not path.exists():
+        return "missing"
+
+    if path.is_file():
+        payload = _fingerprint_file(path)
+        return hashlib.sha1(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+    entries: list[dict[str, Any]] = []
+    for child in sorted(p for p in path.rglob("*") if p.is_file()):
+        rel = child.relative_to(path)
+        stat = child.stat()
+        entries.append(
+            {
+                "relative_path": rel.as_posix(),
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+                "sha1": hashlib.sha1(child.read_bytes()).hexdigest(),
+            }
+        )
+
+    return hashlib.sha1(json.dumps(entries, sort_keys=True).encode("utf-8")).hexdigest()
+
+
 def _analysis_signature(
     config_signature: str,
     analysis_config: AnalysisSettings,
     *,
+    repo_root: Path,
     semantic_calibration: SemanticCalibrationSettings,
 ) -> str:
+    model_root = Path(analysis_config.essentia_semantic_model_root)
+    if not model_root.is_absolute():
+        model_root = (repo_root / model_root).resolve()
+
     payload = {
         "config_signature": config_signature,
         "seed": analysis_config.analysis_signature_seed,
@@ -224,7 +263,7 @@ def _analysis_signature(
         "essentia_semantic_image": analysis_config.essentia_semantic_image,
         "essentia_semantic_device": analysis_config.essentia_semantic_device,
         "essentia_semantic_model_family_policy": analysis_config.essentia_semantic_model_family_policy,
-        "essentia_semantic_model_root": analysis_config.essentia_semantic_model_root,
+        "essentia_semantic_model_root_fingerprint": _fingerprint_directory(model_root),
         "essentia_semantic_default_excerpt_seconds": analysis_config.essentia_semantic_default_excerpt_seconds,
         "essentia_semantic_multisample_excerpt_seconds": analysis_config.essentia_semantic_multisample_excerpt_seconds,
         "essentia_semantic_trigger_mismatch_threshold": analysis_config.essentia_semantic_trigger_mismatch_threshold,
@@ -355,6 +394,7 @@ def load_runtime_settings(repo_root: Path | None = None) -> RuntimeSettings:
         analysis_signature=_analysis_signature(
             config_signature,
             analysis_settings,
+            repo_root=root,
             semantic_calibration=semantic_calibration,
         ),
         analysis=analysis_settings,

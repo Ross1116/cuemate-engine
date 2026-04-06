@@ -10,7 +10,7 @@ import librosa
 import numpy as np
 import pyloudnorm as pyln
 
-from cuemate_analysis.config import RuntimeSettings
+from cuemate_analysis.config import RuntimeSettings, build_fast_analysis_signature
 from cuemate_analysis.essentia_semantic_backend import EssentiaSemanticEstimate
 from cuemate_analysis.models import AnalysisResult, FastAnalysisResult, ImportedTrack
 
@@ -749,6 +749,7 @@ def resolve_key(
         agreeing_sources: list[str] = []
         metadata_confidences: list[float] = []
         has_conflict = False
+        has_any_metadata = parsed_tag is not None or parsed_imported is not None
 
         if parsed_tag is not None:
             if parsed_tag["key"] == detected_payload["key"]:
@@ -772,14 +773,22 @@ def resolve_key(
                     meta_conf,
                     provenance_independent=False,
                 )
-        elif has_conflict:
+
+        if has_conflict:
             final_confidence = clamp(final_confidence * MUSICALKEYCNN_METADATA_CONFLICT_PENALTY)
 
         key_band = classify_musicalkeycnn_band(
             final_confidence,
-            has_metadata=(parsed_tag is not None or parsed_imported is not None),
-            has_conflict=has_conflict and not bool(agreeing_sources),
+            has_metadata=has_any_metadata,
+            has_conflict=has_conflict,
         )
+
+        if agreeing_sources and not has_conflict:
+            key_agreement: int | None = 1
+        elif has_any_metadata:
+            key_agreement = 0
+        else:
+            key_agreement = None
 
         return {
             **detected_payload,
@@ -787,7 +796,7 @@ def resolve_key(
             "key_source": merge_key_sources("musicalkeycnn", agreeing_sources),
             "key_imported": imported_key,
             "key_tagged": tagged_key,
-            "key_agreement": 1 if agreeing_sources else (0 if (parsed_tag is not None or parsed_imported is not None) else None),
+            "key_agreement": key_agreement,
             "key_band": key_band,
         }
 
@@ -1140,7 +1149,8 @@ def load_track_audio(track: ImportedTrack, settings: RuntimeSettings) -> tuple[n
     )
     if y.size == 0:
         raise ValueError(f"No audio samples decoded for {track.file_path}")
-    return y, sr, build_track_dsp_artifacts(y, sr)
+    artifacts = build_track_dsp_artifacts(y, sr)
+    return artifacts.y, sr, artifacts
 
 
 def compute_dsp_lane_result(
@@ -1196,7 +1206,7 @@ def build_fast_analysis_result(
             track.bpm_tag,
             {
                 "bpm": float(prefetched_tempocnn_estimate.bpm),
-                "bpm_confidence": float(prefetched_tempocnn_estimate.confidence or 0.0),
+                "bpm_confidence": clamp(float(prefetched_tempocnn_estimate.confidence or 0.0)),
             },
             detected_source="tempocnn",
         )
@@ -1248,7 +1258,7 @@ def build_fast_analysis_result(
         key_tagged=key["key_tagged"],
         key_agreement=key["key_agreement"],
         analyzed_at=utc_now(),
-        analysis_signature=analysis_signature or settings.analysis_signature,
+        analysis_signature=analysis_signature or build_fast_analysis_signature(settings),
         config_signature=settings.config_signature,
     )
 

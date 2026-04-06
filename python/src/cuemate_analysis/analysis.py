@@ -158,7 +158,11 @@ class TrackDspArtifacts:
     @property
     def beat_frames(self) -> np.ndarray:
         if self._beat_frames is None:
-            _, frames = librosa.beat.beat_track(onset_envelope=self.onset_env, sr=self.sr)
+            _, frames = librosa.beat.beat_track(
+                onset_envelope=self.onset_env,
+                sr=self.sr,
+                hop_length=self.hop_length,
+            )
             self._beat_frames = np.asarray(frames, dtype=int)
         return self._beat_frames
 
@@ -207,13 +211,21 @@ class TrackDspArtifacts:
     @property
     def percussive_onset_env(self) -> np.ndarray:
         if self._percussive_onset_env is None:
-            self._percussive_onset_env = librosa.onset.onset_strength(y=self.percussive_waveform, sr=self.sr)
+            self._percussive_onset_env = librosa.onset.onset_strength(
+                y=self.percussive_waveform,
+                sr=self.sr,
+                hop_length=self.hop_length,
+            )
         return self._percussive_onset_env
 
     @property
     def pulse(self) -> np.ndarray:
         if self._pulse is None:
-            self._pulse = librosa.beat.plp(onset_envelope=self.onset_env, sr=self.sr)
+            self._pulse = librosa.beat.plp(
+                onset_envelope=self.onset_env,
+                sr=self.sr,
+                hop_length=self.hop_length,
+            )
         return self._pulse
 
     @property
@@ -388,7 +400,11 @@ def detect_bpm(
             raise ValueError("detect_bpm requires either raw audio or TrackDspArtifacts.")
         artifacts = build_track_dsp_artifacts(y, sr)
     onset_env = artifacts.onset_env
-    tempo_value, beat_frames = librosa.beat.beat_track(onset_envelope=onset_env, sr=artifacts.sr)
+    tempo_value, beat_frames = librosa.beat.beat_track(
+        onset_envelope=onset_env,
+        sr=artifacts.sr,
+        hop_length=artifacts.hop_length,
+    )
     tempo = float(np.atleast_1d(tempo_value)[0])
     beat_times = librosa.frames_to_time(beat_frames, sr=artifacts.sr, hop_length=artifacts.hop_length)
 
@@ -400,7 +416,11 @@ def detect_bpm(
     else:
         bpm_confidence = 0.3
 
-    tempogram = librosa.feature.tempogram(onset_envelope=onset_env, sr=artifacts.sr)
+    tempogram = librosa.feature.tempogram(
+        onset_envelope=onset_env,
+        sr=artifacts.sr,
+        hop_length=artifacts.hop_length,
+    )
     peak_sharpness = float(np.max(tempogram) / (np.mean(tempogram) + 1e-10)) if tempogram.size else 0.0
     tempogram_confidence = clamp(peak_sharpness / 20.0)
     combined_confidence = clamp((0.5 * bpm_confidence) + (0.5 * tempogram_confidence))
@@ -800,23 +820,38 @@ def resolve_key(
             "key_band": key_band,
         }
 
-    # Non-CNN fallback path (e.g. chroma): preserve existing metadata-first behavior.
-    if parsed_tag is not None:
-        if parsed_tag["key"] == detected_payload["key"]:
-            return {
-                **parsed_tag,
-                "key_confidence": bayesian_key_confidence(
-                    detected_confidence,
-                    FILE_TAG_KEY_CONFIDENCE,
-                    provenance_independent=False,
-                ),
-                "key_source": f"tag+{detected_source}",
-                "key_imported": imported_key,
-                "key_tagged": tagged_key,
-                "key_agreement": 1,
-                "key_band": "confirmed",
-            }
+    # Non-CNN fallback path (e.g. chroma): evaluate both metadata sources before deciding conflict.
+    if parsed_tag is not None and parsed_tag["key"] == detected_payload["key"]:
+        return {
+            **parsed_tag,
+            "key_confidence": bayesian_key_confidence(
+                detected_confidence,
+                FILE_TAG_KEY_CONFIDENCE,
+                provenance_independent=False,
+            ),
+            "key_source": f"tag+{detected_source}",
+            "key_imported": imported_key,
+            "key_tagged": tagged_key,
+            "key_agreement": 1,
+            "key_band": "confirmed",
+        }
 
+    if parsed_imported is not None and parsed_imported["key"] == detected_payload["key"]:
+        return {
+            **parsed_imported,
+            "key_confidence": bayesian_key_confidence(
+                detected_confidence,
+                IMPORTED_KEY_CONFIDENCE,
+                provenance_independent=False,
+            ),
+            "key_source": f"imported+{detected_source}",
+            "key_imported": imported_key,
+            "key_tagged": tagged_key,
+            "key_agreement": 1,
+            "key_band": "confirmed",
+        }
+
+    if parsed_tag is not None:
         return {
             **parsed_tag,
             "key_confidence": clamp(min(detected_confidence, FILE_TAG_KEY_CONFIDENCE) * 0.6),
@@ -828,21 +863,6 @@ def resolve_key(
         }
 
     if parsed_imported is not None:
-        if parsed_imported["key"] == detected_payload["key"]:
-            return {
-                **parsed_imported,
-                "key_confidence": bayesian_key_confidence(
-                    detected_confidence,
-                    IMPORTED_KEY_CONFIDENCE,
-                    provenance_independent=False,
-                ),
-                "key_source": f"imported+{detected_source}",
-                "key_imported": imported_key,
-                "key_tagged": tagged_key,
-                "key_agreement": 1,
-                "key_band": "confirmed",
-            }
-
         return {
             **parsed_imported,
             "key_confidence": clamp(min(detected_confidence, IMPORTED_KEY_CONFIDENCE) * 0.6),

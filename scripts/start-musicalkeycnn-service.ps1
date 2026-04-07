@@ -126,6 +126,13 @@ try {
 
     if ($containerId) {
         try {
+            Write-Warning "MusicalKeyCNN service timed out; recent container logs:"
+            & docker logs $containerId --tail 200
+        }
+        catch {
+            Write-Warning "Failed to fetch MusicalKeyCNN container logs ${containerId}: $_"
+        }
+        try {
             & docker rm -f $containerId | Out-Null
         }
         catch {

@@ -12,6 +12,53 @@
     "per_track_timeout_seconds": 120,
     "model_preload": true,
     "fast_pass_enabled": true,
-    "analysis_signature_seed": "m1-absolute-v1"
+    "analysis_signature_seed": "m1-canonical-v2",
+    "energy_source_default": "canonical",
+    "essentia_semantics_enabled": true,
+    "essentia_semantic_image": "cuemate-essentia-semantics:local",
+    "essentia_semantic_device": "auto",
+    "essentia_semantic_model_family_policy": "best_per_task",
+    "essentia_semantic_model_root": "python/models/essentia_semantics",
+    "essentia_semantic_default_excerpt_seconds": 36.0,
+    "essentia_semantic_multisample_excerpt_seconds": 20.0,
+    "essentia_semantic_trigger_mismatch_threshold": 0.22,
+    "essentia_semantic_trigger_confidence_threshold": 0.58,
+    "essentia_semantic_trigger_structure_rms_cv": 0.55,
+    "essentia_semantic_trigger_outlier_zscore": 1.35,
+    "full_chunk_size": 4,
+    "tempo_chunk_size": 8,
+    "key_chunk_size": 8,
+    "essentia_chunk_size": 4,
+    "dsp_workers": 4
+  },
+  "thresholds": {
+    "small_playlist_limit": 12,
+    "min_playlist_for_relative": 5
+  },
+  "scoring": {
+    "static_weights": {
+      "target_energy": 0.22,
+      "transition_support": 0.18,
+      "bass_transition": 0.15,
+      "vocal_transition": 0.13,
+      "harmonic": 0.12,
+      "tempo": 0.10,
+      "history_fit": 0.06,
+      "rhythmic_continuity": 0.04
+    },
+    "weight_floors": {
+      "target_energy": 0.08,
+      "transition_support": 0.05,
+      "bass_transition": 0.04,
+      "vocal_transition": 0.03,
+      "harmonic": 0.04,
+      "tempo": 0.03,
+      "history_fit": 0.03,
+      "rhythmic_continuity": 0.02
+    }
+  },
+  "weight_adaptation": {
+    "mode": "auto",
+    "adaptation_strength": 0.7
   }
 }

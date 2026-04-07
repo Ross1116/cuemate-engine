@@ -71,8 +71,8 @@ def test_resolve_tempocnn_service_defaults(monkeypatch) -> None:
     monkeypatch.delenv("CUEMATE_TEMPOCNN_SERVICE_NAME", raising=False)
     monkeypatch.delenv("CUEMATE_TEMPOCNN_SERVICE_PORT", raising=False)
 
-    assert resolve_tempocnn_service_name() == "cuemate-tempocnn-service"
-    assert resolve_tempocnn_service_port() == 47831
+    assert resolve_tempocnn_service_name() == "cuemate-essentia-semantics-service"
+    assert resolve_tempocnn_service_port() == 47833
 
 
 def test_build_tempocnn_docker_command_mounts_external_model(tmp_path: Path) -> None:
@@ -137,4 +137,4 @@ def test_build_tempocnn_service_run_command_includes_drive_mounts() -> None:
     assert "127.0.0.1:49000:49000" in command_text
     assert "target=/host/d" in command_text
     assert "target=/host/e" in command_text
-    assert "/workspace/docker/tempocnn/service.py" in command
+    assert "/workspace/docker/essentia_semantics/service.py" in command

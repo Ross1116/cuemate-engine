@@ -17,6 +17,8 @@ dependencies = [
   "scipy>=1.13,<2.0",
   "pyloudnorm>=0.1.1,<1.0",
   "soundfile>=0.12.1,<1.0",
+  "scikit-learn>=1.5,<2.0",
+  "joblib>=1.4,<2.0",
 ]
 
 [project.scripts]

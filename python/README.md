@@ -24,7 +24,7 @@ The current implementation covers the first milestone from the decision engine p
 - persist imported tracks, playlists, analysis jobs, and `track_features_abs` into SQLite
 - inspect imported and analyzed tracks from a local CLI
 
-This package does not yet expose scoring, relative features, windowed features, or the gRPC scoring service.
+This package does not yet expose scoring, windowed features, or the gRPC scoring service. Relative features, energy analysis, and Essentia semantic features are implemented and available via the CLI commands listed below.
 
 ## Install
 
@@ -46,6 +46,12 @@ Build the local MusicalKeyCNN Docker image used by the primary key backend:
 powershell -ExecutionPolicy Bypass -File .\scripts\build-musicalkeycnn-image.ps1
 ```
 
+Build the local Essentia semantics Docker image used by the semantic absolute-feature lane:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build-essentia-semantics-image.ps1
+```
+
 Optional: warm-start the persistent TempoCNN service container yourself. The CLI will auto-start it on demand too.
 
 ```powershell
@@ -56,6 +62,12 @@ Optional: warm-start the persistent MusicalKeyCNN service container yourself. Th
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\start-musicalkeycnn-service.ps1
+```
+
+Optional: warm-start the persistent Essentia semantics service container yourself. The CLI will auto-start it on demand too.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\start-essentia-semantics-service.ps1
 ```
 
 The default TempoCNN graph expected by the CLI lives at `python/models/essentia/deepsquare-k16-3.pb`. Override it with `CUEMATE_TEMPOCNN_MODEL` or `--tempocnn-model` if you want to compare a different `.pb` model.
@@ -75,6 +87,10 @@ python -m cuemate_analysis analyze-bpm "D:\path\to\track.wav"
 python -m cuemate_analysis analyze-bpm-playlist --playlist "My Playlist"
 python -m cuemate_analysis analyze-bpm-key "D:\path\to\track.wav"
 python -m cuemate_analysis analyze-bpm-key-playlist --playlist "My Playlist"
+python -m cuemate_analysis analyze-relative-playlist --playlist "My Playlist"
+python -m cuemate_analysis analyze-energy-playlist --playlist "My Playlist"
+python -m cuemate_analysis download-essentia-semantic-models
+python -m cuemate_analysis analyze-essentia-playlist --playlist "My Playlist"
 python -m cuemate_analysis purge-model-cache
 python -m cuemate_analysis list-playlist --name "My Playlist"
 python -m cuemate_analysis show-track --track-id trk_example123
@@ -88,6 +104,9 @@ Important notes:
 - Serato crate imports currently provide playlist membership and file-path discovery only; BPM/key metadata is not available from the current parser
 - `analyze-bpm` and `analyze-bpm-playlist` are the intended BPM-only commands
 - `analyze-bpm-key` and `analyze-bpm-key-playlist` are the intended fast paths when you only want BPM + key
+- `analyze-relative-playlist` is the experimental read-only Milestone 2 Phase 1 surface for playlist-relative context and playlist stats previews
+- `analyze-energy-playlist` is the experimental read-only workbench for comparing absolute-energy formulas before promoting one into the production analyzer
+- `download-essentia-semantic-models` and `analyze-essentia-playlist` are the model-acquisition and read-only inspection surfaces for Essentia semantic absolute features
 - if TempoCNN is unavailable for a track, analysis falls back to the current librosa baseline automatically and records `baseline_fallback` as the source
 - TempoCNN now runs through Docker and will try GPU before falling back to CPU
 - TempoCNN now handles BPM only; key extraction is no longer part of the TempoCNN container path
@@ -95,6 +114,7 @@ Important notes:
 - MusicalKeyCNN now defaults to `full_track`
 - if MusicalKeyCNN is unavailable for a track, analysis now falls back to a tagged key only when one exists
 - repeated requests now go through warm TempoCNN and MusicalKeyCNN service containers when possible
+- the Essentia semantic lane uses the same shared TensorFlow/Essentia warm Docker service as TempoCNN (TempoCNN aliases into that shared service — there is a single shared container, not two)
 - repeated requests for unchanged files are cached inside those warm services, so reruns are much faster than the first pass
 - those persistent model caches are also stored in `data/inference-cache.db`, and `purge-model-cache` clears both the persistent rows and the warm service state
 - playlist analysis batches TempoCNN tracks through the warm service so the model stays loaded

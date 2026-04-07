@@ -287,9 +287,9 @@ def assign_role_hints(
     bass_value = 0.5 if bass_rel is None else bass_rel
     drums_value = 0.5 if drums_rel is None else drums_rel
 
-    if vocals_known and vocal_rel is not None and vocal_rel > 0.75:
+    if vocals_known and vocal_rel > 0.75:
         roles.append("vocal_feature")
-    if vocals_known and vocal_rel is not None and bass_value > 0.85 and vocal_rel < 0.3:
+    if vocals_known and bass_value > 0.85 and vocal_rel < 0.3:
         roles.append("bass_driver")
     if energy_rel < 0.20:
         roles.append("opener")
@@ -472,6 +472,7 @@ def compute_relative_playlist_preview(
                 f"Relative analysis requires at least {settings.thresholds.min_playlist_for_relative} eligible tracks.",
             ],
             status="insufficient_tracks",
+            energy_source_used=energy_source,
             relative_signature=relative_signature,
         )
         return RelativePlaylistPreview(

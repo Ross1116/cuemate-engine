@@ -556,7 +556,11 @@ def persist_musicalkeycnn_estimates(
         return
 
 
-def purge_musicalkeycnn_cache(file_paths: list[str] | None = None) -> int:
+def purge_musicalkeycnn_cache(
+    file_paths: list[str] | None = None,
+    *,
+    clear_warm_service: bool = True,
+) -> int:
     deleted = 0
     try:
         with PersistentInferenceCache(resolve_inference_cache_path()) as cache:
@@ -567,7 +571,8 @@ def purge_musicalkeycnn_cache(file_paths: list[str] | None = None) -> int:
             )
     except Exception:
         deleted = 0
-    remove_docker_container(resolve_musicalkeycnn_service_name(None))
+    if clear_warm_service:
+        remove_docker_container(resolve_musicalkeycnn_service_name(None))
     return deleted
 
 

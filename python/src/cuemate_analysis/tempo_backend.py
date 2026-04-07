@@ -24,9 +24,9 @@ from cuemate_analysis.persistent_inference_cache import (
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_TEMPOCNN_MODEL = REPO_ROOT / "python" / "models" / "essentia" / "deepsquare-k16-3.pb"
-DEFAULT_TEMPOCNN_IMAGE = "cuemate-tempocnn:local"
-DEFAULT_TEMPOCNN_SERVICE_NAME = "cuemate-tempocnn-service"
-DEFAULT_TEMPOCNN_SERVICE_PORT = 47831
+DEFAULT_TEMPOCNN_IMAGE = "cuemate-essentia-semantics:local"
+DEFAULT_TEMPOCNN_SERVICE_NAME = "cuemate-essentia-semantics-service"
+DEFAULT_TEMPOCNN_SERVICE_PORT = 47833
 TEMPO_BACKEND_BASELINE = "baseline"
 TEMPO_BACKEND_TEMPOCNN = "tempocnn"
 TEMPO_BACKEND_CHOICES = {TEMPO_BACKEND_BASELINE, TEMPO_BACKEND_TEMPOCNN}
@@ -320,7 +320,7 @@ def build_tempocnn_service_run_command(
         [
             resolved_image_name,
             "python",
-            "/workspace/docker/tempocnn/service.py",
+            "/workspace/docker/essentia_semantics/service.py",
         ]
     )
     return command
@@ -633,7 +633,11 @@ def persist_tempocnn_estimates(
         return
 
 
-def purge_tempocnn_cache(file_paths: list[str] | None = None) -> int:
+def purge_tempocnn_cache(
+    file_paths: list[str] | None = None,
+    *,
+    clear_warm_service: bool = True,
+) -> int:
     deleted = 0
     try:
         with PersistentInferenceCache(resolve_inference_cache_path()) as cache:
@@ -644,9 +648,12 @@ def purge_tempocnn_cache(file_paths: list[str] | None = None) -> int:
             )
     except Exception:
         deleted = 0
-    remove_docker_container(resolve_tempocnn_service_name(None))
-    return deleted
 
+    # Always invalidate the warm TempoCNN service after cache purge so the
+    # in-memory service cache cannot return stale results.
+    remove_docker_container(resolve_tempocnn_service_name(None))
+
+    return deleted
 
 def estimate_tempocnn_bpms(
     paths: list[Path],

@@ -1,0 +1,15 @@
+-- migrate:up
+ALTER TABLE track_features_abs ADD COLUMN danceability_abs REAL;
+ALTER TABLE track_features_abs ADD COLUMN arousal_abs REAL;
+ALTER TABLE track_features_abs ADD COLUMN valence_abs REAL;
+ALTER TABLE track_features_abs ADD COLUMN mood_aggressive_abs REAL;
+ALTER TABLE track_features_abs ADD COLUMN mood_party_abs REAL;
+ALTER TABLE track_features_abs ADD COLUMN mood_relaxed_abs REAL;
+ALTER TABLE track_features_abs ADD COLUMN energy_essentia_fused REAL;
+ALTER TABLE track_features_abs ADD COLUMN energy_essentia_bucket TEXT;
+ALTER TABLE track_features_abs ADD COLUMN essentia_semantic_signature TEXT;
+ALTER TABLE track_features_abs ADD COLUMN essentia_semantic_source TEXT;
+ALTER TABLE track_features_abs ADD COLUMN essentia_semantic_inferred_at TEXT;
+
+-- migrate:down
+SELECT 1;

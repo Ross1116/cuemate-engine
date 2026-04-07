@@ -37,7 +37,7 @@ class ImportedTrack:
         }
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class AnalysisResult:
     track_id: str
     source_file_hash: str
@@ -55,8 +55,20 @@ class AnalysisResult:
     key_tagged: str | None
     key_agreement: int | None
     energy_abs: float
+    energy_heuristic_abs: float | None
     energy_sustained: float | None
     energy_peak: float | None
+    danceability_abs: float | None
+    arousal_abs: float | None
+    valence_abs: float | None
+    mood_aggressive_abs: float | None
+    mood_party_abs: float | None
+    mood_relaxed_abs: float | None
+    energy_essentia_fused: float | None
+    energy_essentia_bucket: str | None
+    essentia_semantic_signature: str | None
+    essentia_semantic_source: str | None
+    essentia_semantic_inferred_at: str | None
     loudness_lufs: float
     loudness_norm: float
     bass_abs: float
@@ -70,6 +82,31 @@ class AnalysisResult:
     analysis_signature: str
     config_signature: str
     scoring_contract_id_at_analysis: str | None = None
+
+    def to_db_row(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload["user_id"] = "local"
+        return payload
+
+
+@dataclass(frozen=True, kw_only=True)
+class FastAnalysisResult:
+    track_id: str
+    source_file_hash: str
+    bpm: float
+    bpm_confidence: float
+    bpm_source: str
+    key: str
+    key_number: int
+    key_letter: str
+    key_confidence: float
+    key_source: str
+    key_imported: str | None
+    key_tagged: str | None
+    key_agreement: int | None
+    analyzed_at: str
+    analysis_signature: str
+    config_signature: str
 
     def to_db_row(self) -> dict[str, Any]:
         payload = asdict(self)

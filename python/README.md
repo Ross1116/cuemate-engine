@@ -24,7 +24,7 @@ The current implementation covers the first milestone from the decision engine p
 - persist imported tracks, playlists, analysis jobs, and `track_features_abs` into SQLite
 - inspect imported and analyzed tracks from a local CLI
 
-This package does not yet expose scoring, relative features, windowed features, or the gRPC scoring service.
+This package does not yet expose scoring, windowed features, or the gRPC scoring service. Relative features, energy analysis, and Essentia semantic features are implemented and available via the CLI commands listed below.
 
 ## Install
 
@@ -114,7 +114,7 @@ Important notes:
 - MusicalKeyCNN now defaults to `full_track`
 - if MusicalKeyCNN is unavailable for a track, analysis now falls back to a tagged key only when one exists
 - repeated requests now go through warm TempoCNN and MusicalKeyCNN service containers when possible
-- the Essentia semantic lane also uses its own warm Docker service when enabled
+- the Essentia semantic lane uses the same shared TensorFlow/Essentia warm Docker service as TempoCNN (TempoCNN aliases into that shared service — there is a single shared container, not two)
 - repeated requests for unchanged files are cached inside those warm services, so reruns are much faster than the first pass
 - those persistent model caches are also stored in `data/inference-cache.db`, and `purge-model-cache` clears both the persistent rows and the warm service state
 - playlist analysis batches TempoCNN tracks through the warm service so the model stays loaded

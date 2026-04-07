@@ -939,6 +939,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=100,
         help="Maximum pending jobs to process in one pass.",
     )
+    run_worker_parser.add_argument(
+        "--print-backend-diagnostics",
+        action="store_true",
+        help="Print backend diagnostics after processing jobs.",
+    )
 
     prewarm_parser = subparsers.add_parser(
         "prewarm-model-services",
@@ -2519,15 +2524,6 @@ def handle_run_analysis_worker(args: argparse.Namespace) -> int:
 
         if touched_playlists:
             _refresh_relative_for_playlists(database, settings, touched_playlists)
-
-        updated_playlist_names: list[str] = []
-        for playlist_id in touched_playlists:
-            playlist_name = database.get_playlist_name_by_id(playlist_id)
-            if playlist_name:
-                updated_playlist_names.append(playlist_name)
-
-        for playlist_name in updated_playlist_names:
-            print(f"Refreshed canonical relative data for '{playlist_name}'.")
 
         if updated_track_ids and hasattr(database, "get_playlists_containing_tracks") and hasattr(database, "mark_playlists_stale"):
             linked = database.get_playlists_containing_tracks(updated_track_ids)

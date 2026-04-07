@@ -30,6 +30,28 @@ DIMENSION_TO_SCORER = {
 
 VOCAL_CONFIDENCE_THRESHOLD = 0.5
 
+# Keys are considered corroborated (strong) when multiple sources agree or when a
+# single model estimate clears this confidence threshold.  Below this, a standalone
+# MusicalKeyCNN-only key is advisory only and should not drive key_diversity scoring.
+KEY_CONFIDENCE_THRESHOLD = 0.5
+
+
+def is_key_corroborated(track: "RelativeTrackInput") -> bool:
+    """Return True when the key can be treated as strong for scoring purposes.
+
+    A key is corroborated when:
+    - key_agreement >= 1 (multiple independent sources agree), OR
+    - key_confidence >= KEY_CONFIDENCE_THRESHOLD (single model but high-confidence).
+    Standalone low-confidence MusicalKeyCNN-only keys are advisory and return False.
+    """
+    if track.key is None:
+        return False
+    if track.key_agreement is not None and track.key_agreement >= 1:
+        return True
+    if track.key_confidence is not None and track.key_confidence >= KEY_CONFIDENCE_THRESHOLD:
+        return True
+    return False
+
 
 def resolve_relative_energy_value(
     track: "RelativeTrackInput",
@@ -58,6 +80,9 @@ class RelativeTrackInput:
     has_absolute_analysis: bool
     bpm: float | None
     key: str | None
+    key_confidence: float | None
+    key_source: str | None
+    key_agreement: int | None
     energy_abs: float | None
     energy_heuristic_abs: float | None
     energy_essentia_fused: float | None
@@ -168,6 +193,9 @@ def row_to_relative_track_input(row) -> RelativeTrackInput:
         has_absolute_analysis=bool(row["has_absolute_analysis"]),
         bpm=float(read_optional("bpm")) if read_optional("bpm") is not None else None,
         key=str(read_optional("key")) if read_optional("key") is not None else None,
+        key_confidence=float(read_optional("key_confidence")) if read_optional("key_confidence") is not None else None,
+        key_source=str(read_optional("key_source")) if read_optional("key_source") is not None else None,
+        key_agreement=int(read_optional("key_agreement")) if read_optional("key_agreement") is not None else None,
         energy_abs=float(read_optional("energy_abs")) if read_optional("energy_abs") is not None else None,
         energy_heuristic_abs=float(read_optional("energy_heuristic_abs")) if read_optional("energy_heuristic_abs") is not None else None,
         energy_essentia_fused=float(read_optional("energy_essentia_fused")) if read_optional("energy_essentia_fused") is not None else None,
@@ -317,9 +345,10 @@ def build_weight_profile_from_playlist_features(
     if len(playlist_features) < small_playlist_limit:
         return None, {}
 
-    avg_harmonic = float(np.mean([track.harmonic_abs for track in playlist_features if track.harmonic_abs is not None]))
+    harmonic_values_for_weight = [track.harmonic_abs for track in playlist_features if track.harmonic_abs is not None]
+    avg_harmonic = float(np.mean(harmonic_values_for_weight)) if harmonic_values_for_weight else 0.0
     harmonic_significance = min(1.0, avg_harmonic / 0.6)
-    unique_keys = len({track.key for track in playlist_features if track.key})
+    unique_keys = len({track.key for track in playlist_features if is_key_corroborated(track)})
     key_diversity = min(1.0, unique_keys / min(len(playlist_features), 12))
     drums_values = [float(track.drums_abs) for track in playlist_features if track.drums_abs is not None]
     bass_values = [float(track.bass_abs) for track in playlist_features if track.bass_abs is not None]
@@ -482,7 +511,7 @@ def compute_relative_playlist_preview(
     groove_spread = percentile_spread(groove_values) if len(groove_values) > 5 else 0.2
     vocals_spread = percentile_spread(vocal_values) if len(vocal_values) > 5 else 0.3
     avg_harmonic = float(np.mean(harmonic_values)) if harmonic_values else None
-    key_diversity = min(1.0, len({track.key for track in eligible_tracks if track.key}) / min(eligible_track_count, 12))
+    key_diversity = min(1.0, len({track.key for track in eligible_tracks if is_key_corroborated(track)}) / min(eligible_track_count, 12))
     bpm_range = (max(bpm_values) - min(bpm_values)) if bpm_values else None
 
     previews: list[RelativeTrackPreview] = []
@@ -610,7 +639,7 @@ def _preview_to_db_rows(
             "intensity_membership": json.dumps(track.intensity_membership, sort_keys=True),
             "role_hints": json.dumps(track.role_hints),
             "valid_as_of_track_count": track.valid_as_of_track_count,
-            "relative_signature": track.analysis_signature and preview.playlist_stats.relative_signature or preview.playlist_stats.relative_signature,
+            "relative_signature": preview.playlist_stats.relative_signature,
             "analysis_signature": track.analysis_signature or "",
             "config_signature": track.config_signature or "",
             "refreshed_at": timestamp,

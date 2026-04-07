@@ -18,6 +18,10 @@ if (-not $env:CUEMATE_ESSENTIA_SEMANTIC_SERVICE_NAME -and $env:CUEMATE_TEMPOCNN_
     $env:CUEMATE_ESSENTIA_SEMANTIC_SERVICE_NAME = $env:CUEMATE_TEMPOCNN_SERVICE_NAME
 }
 
+if (-not $env:CUEMATE_ESSENTIA_SEMANTIC_IMAGE -and $env:CUEMATE_TEMPOCNN_IMAGE) {
+    $env:CUEMATE_ESSENTIA_SEMANTIC_IMAGE = $env:CUEMATE_TEMPOCNN_IMAGE
+}
+
 Write-Output "TempoCNN now runs through the shared TensorFlow/Essentia service."
 & powershell -ExecutionPolicy Bypass -File $delegateScript
 

@@ -7,6 +7,7 @@ This directory holds setup and contract-maintenance helpers. No product logic li
 - `check-prereqs.ps1`: checks whether the core local tools are available from the current shell and whether Docker/Tailscale look reachable
 - `compile-proto.ps1`: validates the protobuf contract with the local `protoc` compiler and writes a descriptor set to `data/scoring.pb`
 - `build-tempocnn-image.ps1`: compatibility alias that builds the shared TensorFlow/Essentia image used by TempoCNN and Essentia semantics
+- `build-essentia-semantics-image.ps1`: builds the shared TensorFlow/Essentia image directly (same image as `build-tempocnn-image.ps1`)
 - `build-musicalkeycnn-image.ps1`: builds the local Docker image that backs the primary MusicalKeyCNN key analyzer
 - `start-tempocnn-service.ps1`: compatibility alias that starts the shared TensorFlow/Essentia service used by TempoCNN and Essentia semantics
 - `start-essentia-semantics-service.ps1`: starts the shared TensorFlow/Essentia service directly
@@ -20,6 +21,7 @@ This directory holds setup and contract-maintenance helpers. No product logic li
 powershell -ExecutionPolicy Bypass -File .\scripts\check-prereqs.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\compile-proto.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\build-tempocnn-image.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\build-essentia-semantics-image.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\build-musicalkeycnn-image.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\start-tempocnn-service.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\start-essentia-semantics-service.ps1

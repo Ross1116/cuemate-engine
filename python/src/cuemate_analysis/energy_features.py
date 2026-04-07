@@ -78,7 +78,7 @@ def build_energy_feature_vector(
     groove_value = clamp(_safe_float(groove_abs))
     bass_value = clamp(float(bass_abs))
     loudness_norm_value = clamp(float(loudness_norm))
-    loudness_lufs_value = float(loudness_lufs)
+    loudness_lufs_value = _safe_float(loudness_lufs)
 
     loudness_fusion = clamp(
         (0.40 * loudness_norm_value)

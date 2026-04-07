@@ -55,20 +55,20 @@ class AnalysisResult:
     key_tagged: str | None
     key_agreement: int | None
     energy_abs: float
-    energy_heuristic_abs: float | None
-    energy_sustained: float | None
-    energy_peak: float | None
-    danceability_abs: float | None
-    arousal_abs: float | None
-    valence_abs: float | None
-    mood_aggressive_abs: float | None
-    mood_party_abs: float | None
-    mood_relaxed_abs: float | None
-    energy_essentia_fused: float | None
-    energy_essentia_bucket: str | None
-    essentia_semantic_signature: str | None
-    essentia_semantic_source: str | None
-    essentia_semantic_inferred_at: str | None
+    energy_heuristic_abs: float | None = None
+    energy_sustained: float | None = None
+    energy_peak: float | None = None
+    danceability_abs: float | None = None
+    arousal_abs: float | None = None
+    valence_abs: float | None = None
+    mood_aggressive_abs: float | None = None
+    mood_party_abs: float | None = None
+    mood_relaxed_abs: float | None = None
+    energy_essentia_fused: float | None = None
+    energy_essentia_bucket: str | None = None
+    essentia_semantic_signature: str | None = None
+    essentia_semantic_source: str | None = None
+    essentia_semantic_inferred_at: str | None = None
     loudness_lufs: float
     loudness_norm: float
     bass_abs: float

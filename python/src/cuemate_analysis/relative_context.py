@@ -148,6 +148,7 @@ class PlaylistStatsPreview:
     adaptation_strength: float | None
     weight_adaptation_notes: list[str]
     status: str
+    energy_source_used: str
     relative_signature: str
 
     def to_payload(self) -> dict[str, Any]:
@@ -597,6 +598,7 @@ def compute_relative_playlist_preview(
         adaptation_strength=None if adaptation_strength is None else round(adaptation_strength, 4),
         weight_adaptation_notes=weight_adaptation_notes,
         status="ok" if adapted_weights is not None else "relative_only",
+        energy_source_used=energy_source,
         relative_signature=relative_signature,
     )
     return RelativePlaylistPreview(
@@ -664,7 +666,7 @@ def _preview_to_db_rows(
         "adaptation_strength": stats.adaptation_strength,
         "weight_adaptation_notes": json.dumps(stats.weight_adaptation_notes),
         "status": stats.status,
-        "energy_source_used": "canonical",
+        "energy_source_used": stats.energy_source_used,
         "relative_signature": stats.relative_signature,
         "refreshed_at": timestamp,
     }

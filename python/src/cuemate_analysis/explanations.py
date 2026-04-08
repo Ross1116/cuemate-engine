@@ -142,6 +142,15 @@ def generate_window_advisory(
         level = "orange"
         notes.append("Crowded section — lots happening early")
 
+    if level == "orange" and notes and notes[-1] == "Crowded section â€” lots happening early" and not is_intro:
+        notes[-1] = "Crowded section â€” lots happening late" if is_outro else "Crowded section â€” many events"
+
+    if level == "orange" and notes and not is_intro:
+        if is_outro:
+            notes[0] = "Crowded section - lots happening late"
+        else:
+            notes[0] = "Crowded section - many events"
+
     if bass > 0.6 and is_outro:
         notes.append("Bass still carrying")
         if level == "green":
@@ -354,9 +363,12 @@ def describe_character_shift(
     elif not cur_vocal_feat and cand_vocal_feat:
         notes.append("instrumental → vocal shift")
     else:
-        cur_v = current_vocals_rel or 0.0
-        cand_v = candidate_vocals_rel or 0.0
-        if cur_v < 0.15 and cand_v < 0.15:
+        if (
+            current_vocals_rel is not None
+            and candidate_vocals_rel is not None
+            and current_vocals_rel < 0.15
+            and candidate_vocals_rel < 0.15
+        ):
             notes.append("both mostly instrumental")
 
     cur_bass_driver = "bass_driver" in cur
@@ -604,7 +616,7 @@ def track_recommendation_outcome(
         "was_recommended": False,
         "position": None,
         "lane": None,
-        "higher_scored_lanes": [lane_name for lane_name, lane_items in lanes.items() if lane_items],
+        "higher_scored_lanes": [],
     }
 
 
@@ -649,8 +661,16 @@ def build_live_candidate_explanation(
         candidate_bpm=candidate_track.get("bpm", 0.0),
         current_key=current_track.get("key"),
         candidate_key=candidate_track.get("key"),
-        current_key_confidence=current_track.get("key_confidence"),
-        candidate_key_confidence=candidate_track.get("key_confidence"),
+        current_key_confidence=(
+            current_track.get("key_confidence")
+            if current_track.get("key_confidence") is not None
+            else transition_features.get("key_confidence_current")
+        ),
+        candidate_key_confidence=(
+            candidate_track.get("key_confidence")
+            if candidate_track.get("key_confidence") is not None
+            else transition_features.get("key_confidence_candidate")
+        ),
     )
 
     character_shift = describe_character_shift(

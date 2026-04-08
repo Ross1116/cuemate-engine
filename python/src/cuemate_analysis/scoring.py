@@ -644,9 +644,13 @@ def contrast_score(
     candidate_energy = candidate_rel.get("energy_rel") if candidate_rel.get("energy_rel") is not None else 0.5
     energy_delta = abs(current_energy - candidate_energy)
     dims.append(("energy", energy_delta, 0.30))
-    current_vocals = current_rel.get("vocals_rel") if current_rel.get("vocals_rel") is not None else 0.0
-    candidate_vocals = candidate_rel.get("vocals_rel") if candidate_rel.get("vocals_rel") is not None else 0.0
-    vocal_delta = abs(current_vocals - candidate_vocals)
+    current_vocals = current_rel.get("vocals_rel")
+    candidate_vocals = candidate_rel.get("vocals_rel")
+    vocal_delta = (
+        None
+        if current_vocals is None or candidate_vocals is None
+        else abs(current_vocals - candidate_vocals)
+    )
     dims.append(("vocal", vocal_delta, 0.20))
     current_bass = current_rel.get("bass_rel") if current_rel.get("bass_rel") is not None else 0.5
     candidate_bass = candidate_rel.get("bass_rel") if candidate_rel.get("bass_rel") is not None else 0.5
@@ -665,8 +669,8 @@ def contrast_score(
     else:
         role_dissimilarity = 0.0
     dims.append(("role", role_dissimilarity, 0.20))
-    raw = sum(delta * weight for _, delta, weight in dims)
-    breadth_bonus = min(0.15, sum(1 for _, delta, _ in dims if delta > 0.25) * 0.05)
+    raw = sum((delta or 0.0) * weight for _, delta, weight in dims)
+    breadth_bonus = min(0.15, sum(1 for _, delta, _ in dims if delta is not None and delta > 0.25) * 0.05)
     return round(min(1.0, raw + breadth_bonus), 4)
 
 
@@ -996,8 +1000,11 @@ def filter_candidates(
     bpm_hard_by_target: dict[str, float] = thresholds.get("bpm_hard_by_target", {})
     bpm_hard = bpm_hard_by_target.get(target, thresholds.get("bpm_hard", 8.0))
     bpm_ratio_pass: set[str] = set(thresholds.get("bpm_ratio_pass", []))
-    cooldown_window = thresholds.get("cooldown_window", 5)
-    recent_ids = {h.get("id") or h.get("track_id") for h in history[-cooldown_window:]}
+    cooldown_window = int(thresholds.get("cooldown_window", 5))
+    if cooldown_window <= 0:
+        recent_ids: set[str | None] = set()
+    else:
+        recent_ids = {h.get("id") or h.get("track_id") for h in history[-cooldown_window:]}
 
     filtered: list[ScoringTrackContext] = []
     for candidate in candidates:
@@ -1063,7 +1070,12 @@ def classify_move(
     #   (a) clear energy drop — the classic pressure release
     #   (b) moderate dip with bass relief or vocal reframing
     candidate_vocal_reset = (
-        vocal_candidate_rel is not None and vocal_candidate_rel >= reset_v_t
+        vocal_candidate_rel is not None
+        and vocal_candidate_rel >= reset_v_t
+        and (
+            vocal_current_rel is None
+            or vocal_candidate_rel >= vocal_current_rel + 0.05
+        )
     )
     if delta_energy_rel < reset_e_t:
         return "reset", 0.90, None

@@ -567,6 +567,13 @@ class TestContrastScore:
                "groove_rel": 0.0, "role_hints": []}
         assert contrast_score(r_a, r_b) == 0.0
 
+    def test_missing_vocals_do_not_count_as_instrumental_contrast(self):
+        r_a = {"energy_rel": 0.5, "bass_rel": 0.5, "vocals_rel": None,
+               "groove_rel": 0.5, "role_hints": []}
+        r_b = {"energy_rel": 0.5, "bass_rel": 0.5, "vocals_rel": None,
+               "groove_rel": 0.5, "role_hints": []}
+        assert contrast_score(r_a, r_b) == 0.0
+
 
 # ---------------------------------------------------------------------------
 # Key trust / build_confidence_map
@@ -842,6 +849,17 @@ class TestFilterCandidates:
         result = filter_candidates(current, [candidate], history, _DEFAULT_CONFIG)
         assert result == []
 
+    def test_cooldown_zero_disables_recent_history_filter(self):
+        current = _track(track_id="t1", bpm=128)
+        candidate = _track(track_id="t2", bpm=128)
+        history = [{"track_id": "t2", "energy_rel": 0.5}] * 3
+        cfg = {
+            **_DEFAULT_CONFIG,
+            "thresholds": {**_DEFAULT_CONFIG["thresholds"], "cooldown_window": 0},
+        }
+        result = filter_candidates(current, [candidate], history, cfg)
+        assert len(result) == 1
+
     def test_bypass_bpm_filter(self):
         current = _track(track_id="t1", bpm=128)
         far = _track(track_id="t2", bpm=160)
@@ -891,6 +909,10 @@ class TestClassifyMove:
         assert name == "reset"
         assert conf == 0.75
         assert note == "vocal reframe"
+
+    def test_reset_vocal_reframe_requires_actual_vocal_increase(self):
+        name, conf, note = classify_move(-0.06, 0.0, 0.7, 0.72, None, _DEFAULT_CONFIG)
+        assert name != "reset" or note != "vocal reframe"
 
     def test_drop(self):
         name, conf, _ = classify_move(-0.08, 0.0, 0.2, 0.2, None, _DEFAULT_CONFIG)

@@ -224,6 +224,12 @@ class TestGenerateWindowAdvisory:
     def test_crowded_section_orange(self):
         result = generate_window_advisory(_window(cleanliness_abs=0.20), "intro_32")
         assert result["level"] == "orange"
+        assert any("early" in n.lower() for n in result["notes"])
+
+    def test_crowded_outro_uses_late_wording(self):
+        result = generate_window_advisory(_window(cleanliness_abs=0.20), "outro_32")
+        assert result["level"] == "orange"
+        assert any("late" in n.lower() for n in result["notes"])
 
     def test_zero_cleanliness_is_preserved(self):
         result = generate_window_advisory(_window(cleanliness_abs=0.0), "intro_32")
@@ -721,7 +727,7 @@ class TestTrackRecommendationOutcome:
         assert result["was_recommended"] is False
         assert result["position"] is None
         assert result["lane"] is None
-        assert "maintain" in result["higher_scored_lanes"]
+        assert result["higher_scored_lanes"] == []
 
     def test_not_found_ignores_empty_lanes(self):
         lanes = {
@@ -729,7 +735,7 @@ class TestTrackRecommendationOutcome:
             "maintain": [],
         }
         result = track_recommendation_outcome(lanes, "trk_Z")
-        assert result["higher_scored_lanes"] == ["build"]
+        assert result["higher_scored_lanes"] == []
 
     def test_higher_scored_lanes(self):
         lanes = {
@@ -829,6 +835,28 @@ class TestBuildLiveCandidateExplanation:
             None,
         )
         assert any("Harmonically friendly" in note for note in result["why"])
+
+    def test_missing_track_key_confidence_falls_back_to_transition_features(self):
+        result = build_live_candidate_explanation(
+            _track(key_confidence=None),
+            _track(move="maintain", key_confidence=None),
+            _tf(key_confidence_current=0.3, key_confidence_candidate=0.4),
+            _scores(),
+            None,
+            None,
+        )
+        assert result["tempo_key"]["key_state"] != "trusted"
+
+    def test_unknown_vocals_do_not_imply_instrumental(self):
+        result = build_live_candidate_explanation(
+            _track(vocals_rel=None),
+            _track(move="maintain", vocals_rel=None),
+            _tf(),
+            _scores(),
+            None,
+            None,
+        )
+        assert "both mostly instrumental" not in result["character_shift"]
 
     def test_language_policy(self):
         result = build_live_candidate_explanation(

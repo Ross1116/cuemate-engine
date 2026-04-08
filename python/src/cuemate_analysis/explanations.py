@@ -299,7 +299,13 @@ def compute_set_trend(history: list[dict[str, Any]]) -> dict[str, str]:
     if len(history) < 2:
         return {"label": "just started", "direction": "unknown"}
 
-    energies = [_coalesce_numeric(h.get("energy_rel"), 0.5) for h in history]
+    energies = [
+        _coalesce_numeric(h.get("energy_rel"), 0.5)
+        for h in history
+        if h.get("energy_rel") is not None
+    ]
+    if len(energies) < 2:
+        return {"label": "just started", "direction": "unknown"}
 
     if len(energies) < 3:
         delta = energies[-1] - energies[0]
@@ -649,7 +655,7 @@ def build_live_candidate_explanation(
         {"summary": [str], "why": [str], "watch": [str],
          "handoff": dict|None, "tempo_key": dict, "character_shift": [str]}
     """
-    move = candidate_track.get("move", "")
+    move = scores.get("move") or candidate_track.get("move", "")
     component_scores = scores.get("component_scores") if isinstance(scores.get("component_scores"), dict) else {}
     normalized_scores = {**component_scores, **scores}
     reasons = generate_reasons(transition_features, normalized_scores, move)

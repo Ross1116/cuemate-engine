@@ -449,6 +449,25 @@ class TestComputeSetTrend:
         result = compute_set_trend(history)
         assert result["direction"] == "flat"
 
+    def test_ignores_unmeasured_entries(self):
+        history = [
+            {"energy_rel": None},
+            {"energy_rel": 0.3},
+            {"energy_rel": None},
+            {"energy_rel": 0.5},
+        ]
+        result = compute_set_trend(history)
+        assert result["direction"] == "up"
+
+    def test_too_few_measured_entries_returns_unknown(self):
+        history = [
+            {"energy_rel": None},
+            {"energy_rel": None},
+            {"energy_rel": 0.4},
+        ]
+        result = compute_set_trend(history)
+        assert result["direction"] == "unknown"
+
 
 # ---------------------------------------------------------------------------
 # describe_character_shift
@@ -842,6 +861,20 @@ class TestBuildLiveCandidateExplanation:
             None,
         )
         assert any("Harmonically friendly" in note for note in result["why"])
+
+    def test_score_payload_move_overrides_candidate_track_move(self):
+        result = build_live_candidate_explanation(
+            _track(),
+            _track(move="maintain"),
+            _tf(),
+            {
+                **_scores(),
+                "move": "jump",
+            },
+            None,
+            None,
+        )
+        assert any("Deliberate contrast move" in note for note in result["why"])
 
     def test_missing_track_key_confidence_falls_back_to_transition_features(self):
         result = build_live_candidate_explanation(

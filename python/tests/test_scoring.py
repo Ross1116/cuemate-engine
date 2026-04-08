@@ -541,6 +541,11 @@ class TestHistoryFitScore:
         ]
         assert history_fit_score(c, history) == 1.0
 
+    def test_unknown_candidate_key_does_not_trigger_repeat_penalty(self):
+        c = _track(track_id="t7", key=None)
+        history = [{"key": None, "energy_rel": 0.5}] * 3
+        assert history_fit_score(c, history) == pytest.approx(0.8)
+
 
 # ---------------------------------------------------------------------------
 # contrast_score

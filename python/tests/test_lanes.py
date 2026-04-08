@@ -417,6 +417,17 @@ class TestGetRecommendations:
         for lane_items in out["lanes"].values():
             assert len(lane_items) <= 2
 
+    def test_uses_configured_max_per_lane_when_arg_omitted(self):
+        current = self._make_current()
+        candidates = [
+            _ctx(track_id=f"trk_{i:02d}", bpm=128.0, key="8B", energy_rel=0.01 * i)
+            for i in range(6)
+        ]
+        cfg = {**_default_config(), "max_per_lane": 2}
+        out = get_recommendations(current, candidates, [], cfg)
+        for lane_items in out["lanes"].values():
+            assert len(lane_items) <= 2
+
     def test_playlist_stats_passed_through(self):
         """get_recommendations accepts playlist_stats without crashing."""
         current = self._make_current()

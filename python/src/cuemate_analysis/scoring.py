@@ -611,7 +611,7 @@ def history_fit_score(
     key_penalty = sum(
         0.15 * (0.8**i)
         for i, h in enumerate(reversed(recent))
-        if h.get("key") == candidate.key
+        if candidate.key is not None and h.get("key") is not None and h.get("key") == candidate.key
     )
     measured_energies = [h.get("energy_rel") for h in recent if h.get("energy_rel") is not None]
     stagnation = (
@@ -1422,7 +1422,7 @@ def get_recommendations(
     config: dict[str, Any],
     playlist_stats: dict[str, Any] | None = None,
     target: str = "maintain",
-    max_per_lane: int = 3,
+    max_per_lane: int | None = None,
 ) -> dict[str, Any]:
     """Top-level recommendation entry point.
 
@@ -1451,7 +1451,8 @@ def get_recommendations(
         else:
             normalized_history.append(dict(item))
 
-    cfg = {**config, "max_per_lane": max_per_lane, "target": target}
+    effective_max_per_lane = config.get("max_per_lane", 3) if max_per_lane is None else max_per_lane
+    cfg = {**config, "max_per_lane": effective_max_per_lane, "target": target}
 
     # Filter candidates (removes current track, cooldown, BPM hard limit)
     filtered = filter_candidates(current_track, candidates, normalized_history, cfg, target=target)

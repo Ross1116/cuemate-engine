@@ -488,7 +488,7 @@ def generate_session_notes(
             notes.append("Was not in recommendations")
 
         if skipped:
-            lane_names = ", ".join(l.upper() for l in skipped)
+            lane_names = ", ".join(lane.upper() for lane in skipped)
             notes.append(f"You skipped higher-scored {lane_names} options")
 
     return notes
@@ -604,7 +604,7 @@ def track_recommendation_outcome(
         "was_recommended": False,
         "position": None,
         "lane": None,
-        "higher_scored_lanes": list(lanes.keys()),
+        "higher_scored_lanes": [lane_name for lane_name, lane_items in lanes.items() if lane_items],
     }
 
 
@@ -638,7 +638,9 @@ def build_live_candidate_explanation(
          "handoff": dict|None, "tempo_key": dict, "character_shift": [str]}
     """
     move = candidate_track.get("move", "")
-    reasons = generate_reasons(transition_features, scores, move)
+    component_scores = scores.get("component_scores") if isinstance(scores.get("component_scores"), dict) else {}
+    normalized_scores = {**component_scores, **scores}
+    reasons = generate_reasons(transition_features, normalized_scores, move)
 
     handoff = generate_handoff_narrative(current_outro_window, candidate_intro_window)
 

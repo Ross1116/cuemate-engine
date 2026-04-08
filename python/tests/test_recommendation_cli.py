@@ -93,6 +93,8 @@ class _FakeDB:
 class _FakeWeightsDB(_FakeDB):
     def get_playlist_stats_for_scoring(self, playlist_id: str):
         return {
+            "is_stale": False,
+            "relative_signature": "sig-current",
             "adapted_weights": {
                 "target_energy": 0.31,
                 "harmonic": 0.08,
@@ -366,6 +368,10 @@ def test_inspect_scoring_weights_json(monkeypatch, capsys):
         "cuemate_analysis.cli.load_runtime_settings",
         lambda: SimpleNamespace(database_path=Path("fake.db")),
     )
+    monkeypatch.setattr(
+        "cuemate_analysis.config.build_relative_experiment_signature",
+        lambda settings, energy_source="canonical": "sig-current",
+    )
     monkeypatch.setattr("cuemate_analysis.cli.Database", lambda _: _FakeWeightsDB())
     monkeypatch.setattr(
         "cuemate_analysis.config.build_scoring_config",
@@ -387,6 +393,10 @@ def test_inspect_scoring_weights_text(monkeypatch, capsys):
         "cuemate_analysis.cli.load_runtime_settings",
         lambda: SimpleNamespace(database_path=Path("fake.db")),
     )
+    monkeypatch.setattr(
+        "cuemate_analysis.config.build_relative_experiment_signature",
+        lambda settings, energy_source="canonical": "sig-current",
+    )
     monkeypatch.setattr("cuemate_analysis.cli.Database", lambda _: _FakeWeightsDB())
     monkeypatch.setattr(
         "cuemate_analysis.config.build_scoring_config",
@@ -406,6 +416,9 @@ def test_inspect_scoring_weights_text(monkeypatch, capsys):
 
 def test_recommend_next_requires_fresh_relative_artifacts(monkeypatch, capsys):
     class _StaleDB(_FakeDB):
+        def get_scoring_candidates(self, playlist_id: str):
+            raise AssertionError("freshness should be checked before scoring-row queries")
+
         def get_playlist_stats_for_scoring(self, playlist_id: str):
             return {
                 "is_stale": True,

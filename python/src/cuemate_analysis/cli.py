@@ -10,6 +10,7 @@ from pathlib import Path
 import sqlite3
 import sys
 import time
+from typing import Any
 import numpy as np
 
 from cuemate_analysis.analysis import (
@@ -2787,6 +2788,9 @@ def handle_recommend_next(args: argparse.Namespace) -> int:
             raise SystemExit(f"Playlist '{args.playlist}' was not found.")
         playlist_id = str(playlist_row["id"])
 
+        playlist_stats = db.get_playlist_stats_for_scoring(playlist_id)
+        _ensure_scoring_relative_freshness(args.playlist, playlist_stats, settings)
+
         candidate_rows = db.get_scoring_candidates(playlist_id)
         if not candidate_rows:
             raise SystemExit(f"No analyzed tracks found for playlist '{args.playlist}'.")
@@ -2798,9 +2802,6 @@ def handle_recommend_next(args: argparse.Namespace) -> int:
         current_row = db.get_track_scoring_context(current_id, playlist_id)
         if current_row is None:
             raise SystemExit(f"Track '{current_id}' not found in playlist '{args.playlist}'.")
-
-        playlist_stats = db.get_playlist_stats_for_scoring(playlist_id)
-        _ensure_scoring_relative_freshness(args.playlist, playlist_stats, settings)
         current = row_to_scoring_track_context(current_row)
         candidates = [row_to_scoring_track_context(r) for r in candidate_rows]
 
@@ -2879,15 +2880,15 @@ def handle_score_pair(args: argparse.Namespace) -> int:
             raise SystemExit(f"Playlist '{args.playlist}' was not found.")
         playlist_id = str(playlist_row["id"])
 
+        playlist_stats = db.get_playlist_stats_for_scoring(playlist_id)
+        _ensure_scoring_relative_freshness(args.playlist, playlist_stats, settings)
+
         current_row = db.get_track_scoring_context(args.current, playlist_id)
         if current_row is None:
             raise SystemExit(f"Track '{args.current}' not found in playlist '{args.playlist}'.")
         candidate_row = db.get_track_scoring_context(args.candidate, playlist_id)
         if candidate_row is None:
             raise SystemExit(f"Track '{args.candidate}' not found in playlist '{args.playlist}'.")
-
-        playlist_stats = db.get_playlist_stats_for_scoring(playlist_id)
-        _ensure_scoring_relative_freshness(args.playlist, playlist_stats, settings)
 
     current = row_to_scoring_track_context(current_row)
     candidate = row_to_scoring_track_context(candidate_row)
@@ -2984,10 +2985,11 @@ def handle_inspect_scoring_weights(args: argparse.Namespace) -> int:
             raise SystemExit(f"Playlist '{args.playlist}' was not found.")
         playlist_id = str(playlist_row["id"])
         playlist_stats = db.get_playlist_stats_for_scoring(playlist_id)
+        _ensure_scoring_relative_freshness(args.playlist, playlist_stats, settings)
 
     static_weights = config["static_weights"]
     adapted_weights = (playlist_stats or {}).get("adapted_weights") if playlist_stats else None
-    effective_weights = resolve_effective_weights(playlist_stats)
+    effective_weights = resolve_effective_weights(playlist_stats, config)
 
     if args.json:
         print(json.dumps({

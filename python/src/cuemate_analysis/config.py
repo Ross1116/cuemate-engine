@@ -31,6 +31,28 @@ DEFAULT_WEIGHT_FLOORS = {
     "rhythmic_continuity": 0.02,
 }
 
+DEFAULT_SCORING_THRESHOLDS = {
+    "bpm_hard": 8.0,
+    "bpm_soft": 3.0,
+    "cooldown_window": 5,
+}
+
+DEFAULT_SCORING_MOVE_TYPES = {
+    "jump_threshold": 0.12,
+    "build_threshold": 0.05,
+    "maintain_range": 0.05,
+    "reset_energy_threshold": -0.08,
+    "reset_vocal_threshold": 0.50,
+    "drop_threshold": -0.05,
+}
+
+DEFAULT_SCORING_PENALTIES = {
+    "max_total_penalty": 0.80,
+    "bpm_over_soft": 0.30,
+    "key_mismatch": 0.45,
+    "vocal_clash": 0.35,
+}
+
 
 @dataclass(frozen=True)
 class AnalysisSettings:
@@ -92,27 +114,11 @@ class ScoringSettings:
     def __post_init__(self) -> None:
         # Provide mutable defaults after frozen dataclass construction
         if self.thresholds is None:
-            object.__setattr__(self, "thresholds", {
-                "bpm_hard": 8.0,
-                "bpm_soft": 3.0,
-                "cooldown_window": 5,
-            })
+            object.__setattr__(self, "thresholds", dict(DEFAULT_SCORING_THRESHOLDS))
         if self.move_types is None:
-            object.__setattr__(self, "move_types", {
-                "jump_threshold": 0.12,
-                "build_threshold": 0.05,
-                "maintain_range": 0.05,
-                "reset_energy_threshold": -0.08,
-                "reset_vocal_threshold": 0.50,
-                "drop_threshold": -0.05,
-            })
+            object.__setattr__(self, "move_types", dict(DEFAULT_SCORING_MOVE_TYPES))
         if self.penalties is None:
-            object.__setattr__(self, "penalties", {
-                "max_total_penalty": 0.80,
-                "bpm_over_soft": 0.30,
-                "key_mismatch": 0.45,
-                "vocal_clash": 0.35,
-            })
+            object.__setattr__(self, "penalties", dict(DEFAULT_SCORING_PENALTIES))
 
 
 @dataclass(frozen=True)
@@ -454,14 +460,6 @@ def load_runtime_settings(repo_root: Path | None = None) -> RuntimeSettings:
         small_playlist_limit=int(thresholds_payload.get("small_playlist_limit", 12)),
         min_playlist_for_relative=int(thresholds_payload.get("min_playlist_for_relative", 5)),
     )
-    _default_thresholds = {"bpm_hard": 8.0, "bpm_soft": 3.0, "cooldown_window": 5}
-    _default_move_types = {
-        "jump_threshold": 0.12, "build_threshold": 0.05, "maintain_range": 0.05,
-        "reset_energy_threshold": -0.08, "reset_vocal_threshold": 0.50, "drop_threshold": -0.05,
-    }
-    _default_penalties = {
-        "max_total_penalty": 0.80, "bpm_over_soft": 0.30, "key_mismatch": 0.45, "vocal_clash": 0.35,
-    }
     scoring = ScoringSettings(
         static_weights={
             key: float(value)
@@ -472,9 +470,9 @@ def load_runtime_settings(repo_root: Path | None = None) -> RuntimeSettings:
             for key, value in scoring_payload.get("weight_floors", DEFAULT_WEIGHT_FLOORS).items()
         },
         harmonic_confidence_floor=float(scoring_payload.get("harmonic_confidence_floor", 0.15)),
-        thresholds={**_default_thresholds, **scoring_payload.get("thresholds", {})},
-        move_types={**_default_move_types, **scoring_payload.get("move_types", {})},
-        penalties={**_default_penalties, **scoring_payload.get("penalties", {})},
+        thresholds={**DEFAULT_SCORING_THRESHOLDS, **scoring_payload.get("thresholds", {})},
+        move_types={**DEFAULT_SCORING_MOVE_TYPES, **scoring_payload.get("move_types", {})},
+        penalties={**DEFAULT_SCORING_PENALTIES, **scoring_payload.get("penalties", {})},
         contrast_threshold=float(scoring_payload.get("contrast_threshold", 0.45)),
         secondary_contrast_threshold=float(scoring_payload.get("secondary_contrast_threshold", 0.65)),
         max_per_lane=int(scoring_payload.get("max_per_lane", 3)),

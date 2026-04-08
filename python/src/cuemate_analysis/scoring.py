@@ -613,7 +613,10 @@ def history_fit_score(
         for i, h in enumerate(reversed(recent))
         if h.get("key") == candidate.key
     )
-    energies = [h.get("energy_rel", 0.5) for h in recent]
+    energies = [
+        h.get("energy_rel") if h.get("energy_rel") is not None else 0.5
+        for h in recent
+    ]
     stagnation = (
         0.2
         if len(set(round(e, 1) for e in energies)) <= 2 and len(energies) >= 3
@@ -674,14 +677,18 @@ def contrast_score(
 
 def resolve_effective_weights(
     playlist_stats: dict[str, Any] | None,
+    config: dict[str, Any] | None = None,
 ) -> dict[str, float]:
     """Return effective per-component weights for live scoring.
 
     Reads precomputed `adapted_weights` from playlist_stats when available.
-    Falls back to STATIC_WEIGHTS so scoring works without a DB-populated crate.
+    Falls back to config-provided static weights when available, otherwise
+    STATIC_WEIGHTS so scoring works without a DB-populated crate.
     """
     if playlist_stats and playlist_stats.get("adapted_weights"):
         return dict(playlist_stats["adapted_weights"])
+    if config and config.get("static_weights"):
+        return dict(config["static_weights"])
     return dict(STATIC_WEIGHTS)
 
 
@@ -690,13 +697,21 @@ def resolve_effective_weights(
 # ---------------------------------------------------------------------------
 
 
-def _harmonic_confidence(track: ScoringTrackContext) -> float:
+def _harmonic_confidence(
+    track: ScoringTrackContext,
+    harmonic_confidence_floor: float | None = None,
+) -> float:
     """Derive harmonic confidence from key trust policy.
 
     - Corroborated (key_agreement >= 1): full weight (1.0)
     - High-confidence standalone (key_confidence >= 0.5): medium (key_confidence)
     - Weak standalone: floor (max(HARMONIC_CONFIDENCE_FLOOR, key_confidence * 0.5))
     """
+    floor = (
+        HARMONIC_CONFIDENCE_FLOOR
+        if harmonic_confidence_floor is None
+        else float(harmonic_confidence_floor)
+    )
     # Corroborated: multiple independent sources agree
     if track.key_agreement is not None and track.key_agreement >= 1:
         return 1.0
@@ -705,12 +720,13 @@ def _harmonic_confidence(track: ScoringTrackContext) -> float:
     if kc >= KEY_CONFIDENCE_THRESHOLD:
         return kc
     # Weak standalone — clamped to floor
-    return max(HARMONIC_CONFIDENCE_FLOOR, kc * 0.5)
+    return max(floor, kc * 0.5)
 
 
 def build_confidence_map(
     current: ScoringTrackContext,
     candidate: ScoringTrackContext,
+    config: dict[str, Any] | None = None,
 ) -> dict[str, float]:
     """Assemble per-component confidence values for the current→candidate pair.
 
@@ -720,9 +736,10 @@ def build_confidence_map(
     All other components default to 1.0 (fully trusted) in v1. Groove and vocal
     confidence modulation will be added when those score components are wired in.
     """
+    harmonic_floor = None if config is None else config.get("harmonic_confidence_floor")
     harmonic_conf = min(
-        _harmonic_confidence(current),
-        _harmonic_confidence(candidate),
+        _harmonic_confidence(current, harmonic_floor),
+        _harmonic_confidence(candidate, harmonic_floor),
     )
     return {
         "target_energy": 1.0,
@@ -740,6 +757,9 @@ def compute_weighted_score(
     feature_scores: dict[str, float | None],
     weights: dict[str, float],
     confidences: dict[str, float],
+    *,
+    weight_floors: dict[str, float] | None = None,
+    harmonic_confidence_floor: float | None = None,
 ) -> float:
     """Weight-modulated score in [0, 1].
 
@@ -749,16 +769,22 @@ def compute_weighted_score(
     remaining weights are renormalized — the weight table is left unchanged.
     This is weight modulation, NOT calibrated statistical probability.
     """
+    floors = WEIGHT_FLOORS if weight_floors is None else weight_floors
+    confidence_floor = (
+        HARMONIC_CONFIDENCE_FLOOR
+        if harmonic_confidence_floor is None
+        else float(harmonic_confidence_floor)
+    )
     adjusted: dict[str, float] = {}
     for feature, weight in weights.items():
         if feature_scores.get(feature) is None:
             continue  # stub — excluded from this scoring pass
         conf = confidences.get(feature, 1.0)
-        effective_conf = max(conf, HARMONIC_CONFIDENCE_FLOOR)
+        effective_conf = max(conf, confidence_floor)
         adjusted[feature] = weight * effective_conf
     for feature in list(adjusted):
-        if feature in WEIGHT_FLOORS:
-            adjusted[feature] = max(adjusted[feature], WEIGHT_FLOORS[feature])
+        if feature in floors:
+            adjusted[feature] = max(adjusted[feature], floors[feature])
     total = sum(adjusted.values())
     if total < 1e-6:
         return 0.5
@@ -1131,7 +1157,7 @@ def score_candidate(
     `confidences` is computed from key trust when not supplied externally.
     """
     if confidences is None:
-        confidences = build_confidence_map(current, candidate)
+        confidences = build_confidence_map(current, candidate, config)
 
     transition_features = compute_transition_features(current, candidate)
 
@@ -1154,8 +1180,14 @@ def score_candidate(
         "rhythmic_continuity": STUB_SCORE,
     }
 
-    weights = resolve_effective_weights(playlist_stats)
-    raw_score = compute_weighted_score(feature_scores, weights, confidences)
+    weights = resolve_effective_weights(playlist_stats, config)
+    raw_score = compute_weighted_score(
+        feature_scores,
+        weights,
+        confidences,
+        weight_floors=config.get("weight_floors"),
+        harmonic_confidence_floor=config.get("harmonic_confidence_floor"),
+    )
 
     penalty_multiplier, penalty_factors = compute_penalties(
         transition_features, feature_scores, confidences, config
@@ -1316,7 +1348,7 @@ def organize_into_lanes(
     # non-empty non-contrast lane so empty-target fallbacks are obvious in the CLI.
     present_lanes = [name for name in _CANONICAL_ORDER if lanes[name]]
     if target_lane in present_lanes:
-        ordered = [target_lane] + [l for l in present_lanes if l != target_lane]
+        ordered = [target_lane] + [lane for lane in present_lanes if lane != target_lane]
     else:
         ordered = sorted(
             [lane for lane in present_lanes if lane != "contrast"],

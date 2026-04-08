@@ -24,7 +24,6 @@ from cuemate_analysis.scoring import (
     HARMONIC_SCORE_MAP,
     KEY_CONFIDENCE_THRESHOLD,
     STATIC_WEIGHTS,
-    WEIGHT_FLOORS,
     ScoringTrackContext,
     bass_transition_score,
     build_confidence_map,
@@ -609,6 +608,16 @@ class TestKeyTrust:
         for key in ("target_energy", "tempo", "bass_transition", "history_fit"):
             assert conf[key] == 1.0
 
+    def test_custom_harmonic_floor_from_config(self):
+        current = _track(key_confidence=0.10, key_agreement=None)
+        candidate = _track(key_confidence=0.10, key_agreement=None)
+        conf = build_confidence_map(
+            current,
+            candidate,
+            {"harmonic_confidence_floor": 0.25},
+        )
+        assert conf["harmonic"] == pytest.approx(0.25)
+
 
 # ---------------------------------------------------------------------------
 # compute_weighted_score
@@ -652,6 +661,18 @@ class TestComputeWeightedScore:
         result = compute_weighted_score(scores, STATIC_WEIGHTS, confs)
         assert 0.0 <= result <= 1.0
 
+    def test_uses_configured_weight_floors_and_confidence_floor(self):
+        scores = {k: 0.5 for k in STATIC_WEIGHTS}
+        confs = {k: 0.01 for k in STATIC_WEIGHTS}
+        result = compute_weighted_score(
+            scores,
+            STATIC_WEIGHTS,
+            confs,
+            weight_floors={"harmonic": 0.20},
+            harmonic_confidence_floor=0.30,
+        )
+        assert 0.0 <= result <= 1.0
+
 
 # ---------------------------------------------------------------------------
 # resolve_effective_weights
@@ -673,6 +694,12 @@ class TestResolveEffectiveWeights:
         stats = {"energy_spread": 0.3}
         w = resolve_effective_weights(stats)
         assert w == STATIC_WEIGHTS
+
+    def test_uses_config_static_weights_when_provided(self):
+        stats = {"energy_spread": 0.3}
+        config = {"static_weights": {"target_energy": 0.40, "harmonic": 0.10}}
+        w = resolve_effective_weights(stats, config)
+        assert w == config["static_weights"]
 
 
 # ---------------------------------------------------------------------------

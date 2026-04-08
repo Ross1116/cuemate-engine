@@ -513,8 +513,8 @@ def compute_relative_playlist_preview(
 
     energy_spread = percentile_spread(energy_values)
     bass_spread = percentile_spread(bass_values)
-    drums_spread = percentile_spread(drums_values) if len(drums_values) > 5 else 0.2
-    harmonic_spread = percentile_spread(harmonic_values) if len(harmonic_values) > 5 else 0.2
+    drums_spread = percentile_spread(drums_values)
+    harmonic_spread = percentile_spread(harmonic_values)
     groove_spread = percentile_spread(groove_values) if len(groove_values) > 5 else 0.2
     vocals_spread = percentile_spread(vocal_values) if len(vocal_values) > 5 else 0.3
     avg_harmonic = float(np.mean(harmonic_values)) if harmonic_values else None
@@ -635,9 +635,11 @@ def _preview_to_db_rows(
             "position": track.position,
             "energy_rel": track.energy_rel,
             "bass_rel": track.bass_rel,
-            "drums_rel": track.drums_rel,
+            # Persist neutral defaults for dimensions the canonical preview loader
+            # reconstructs as non-null floats.
+            "drums_rel": 0.5 if track.drums_rel is None else track.drums_rel,
             "vocals_rel": track.vocals_rel,
-            "groove_rel": track.groove_rel,
+            "groove_rel": 0.5 if track.groove_rel is None else track.groove_rel,
             "energy_spread": track.energy_spread,
             "bass_spread": track.bass_spread,
             "drums_spread": track.drums_spread,

@@ -25,7 +25,6 @@ import pytest
 
 from cuemate_analysis.explanations import (
     COMPACT_MAX_REASONS,
-    COMPACT_MAX_WATCHOUTS,
     EXPANDED_MAX_WATCH,
     EXPANDED_MAX_WHY,
     build_live_candidate_explanation,
@@ -724,6 +723,14 @@ class TestTrackRecommendationOutcome:
         assert result["lane"] is None
         assert "maintain" in result["higher_scored_lanes"]
 
+    def test_not_found_ignores_empty_lanes(self):
+        lanes = {
+            "build": self._lane([("trk_A", 0.9)]),
+            "maintain": [],
+        }
+        result = track_recommendation_outcome(lanes, "trk_Z")
+        assert result["higher_scored_lanes"] == ["build"]
+
     def test_higher_scored_lanes(self):
         lanes = {
             "build": self._lane([("trk_X", 0.95)]),
@@ -805,6 +812,23 @@ class TestBuildLiveCandidateExplanation:
             None,
         )
         assert "Higher harmonic tension" in result["watch"]
+
+    def test_full_score_payload_uses_component_scores_for_reasons(self):
+        result = build_live_candidate_explanation(
+            _track(),
+            _track(move="maintain"),
+            _tf(),
+            {
+                "component_scores": {
+                    "harmonic": 0.90,
+                    "transition_support": 0.80,
+                },
+                "risk_factors": [],
+            },
+            None,
+            None,
+        )
+        assert any("Harmonically friendly" in note for note in result["why"])
 
     def test_language_policy(self):
         result = build_live_candidate_explanation(

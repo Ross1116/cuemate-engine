@@ -885,7 +885,7 @@ class TestBuildLiveCandidateExplanation:
             None,
             None,
         )
-        assert result["tempo_key"]["key_state"] != "trusted"
+        assert result["tempo_key"]["key_state"] == "uncertain"
 
     def test_unknown_vocals_do_not_imply_instrumental(self):
         result = build_live_candidate_explanation(

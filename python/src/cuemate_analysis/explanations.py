@@ -151,6 +151,14 @@ def generate_window_advisory(
         else:
             notes[0] = "Crowded section - many events"
 
+    if level == "orange" and notes and notes[-1].startswith("Crowded section"):
+        if is_intro:
+            notes[-1] = "Crowded section â€” lots happening early"
+        elif is_outro:
+            notes[-1] = "Crowded section â€” lots happening late"
+        else:
+            notes[-1] = "Crowded section â€” many events"
+
     if bass > 0.6 and is_outro:
         notes.append("Bass still carrying")
         if level == "green":

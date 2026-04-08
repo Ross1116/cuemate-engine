@@ -24,7 +24,13 @@ The current implementation covers the first milestone from the decision engine p
 - persist imported tracks, playlists, analysis jobs, and `track_features_abs` into SQLite
 - inspect imported and analyzed tracks from a local CLI
 
-This package does not yet expose scoring, windowed features, or the gRPC scoring service. Relative features, energy analysis, and Essentia semantic features are implemented and available via the CLI commands listed below.
+This package now exposes the local recommendation/scoring CLI, but a few signals are still intentionally incomplete:
+
+- `transition_support`
+- `vocal_transition`
+- `rhythmic_continuity`
+
+Those components are explicit stubs and are excluded from weighted scoring until they are implemented. Windowed intro/outro features are still deferred, and `vocals_abs` / `vocals_rel` are not populated by the current analysis pipeline yet.
 
 ## Install
 
@@ -91,6 +97,8 @@ python -m cuemate_analysis analyze-relative-playlist --playlist "My Playlist"
 python -m cuemate_analysis analyze-energy-playlist --playlist "My Playlist"
 python -m cuemate_analysis download-essentia-semantic-models
 python -m cuemate_analysis analyze-essentia-playlist --playlist "My Playlist"
+python -m cuemate_analysis recommend-next --playlist "My Playlist" --current-track trk_example123 --target maintain
+python -m cuemate_analysis score-pair --playlist "My Playlist" --current trk_example123 --candidate trk_example456
 python -m cuemate_analysis purge-model-cache
 python -m cuemate_analysis list-playlist --name "My Playlist"
 python -m cuemate_analysis show-track --track-id trk_example123
@@ -107,6 +115,9 @@ Important notes:
 - `analyze-relative-playlist` is the experimental read-only Milestone 2 Phase 1 surface for playlist-relative context and playlist stats previews
 - `analyze-energy-playlist` is the experimental read-only workbench for comparing absolute-energy formulas before promoting one into the production analyzer
 - `download-essentia-semantic-models` and `analyze-essentia-playlist` are the model-acquisition and read-only inspection surfaces for Essentia semantic absolute features
+- `recommend-next` organizes scored suggestions into `maintain`, `build`, `reset`, `jump`, and `contrast` lanes
+- `score-pair` is the main diagnostics surface for auditing one current->candidate transition
+- treat vocal-related weights and diagnostics as placeholders for now: `vocal_transition` is stubbed, and `vocals_abs` / `vocals_rel` are currently unavailable in analysis output
 - if TempoCNN is unavailable for a track, analysis falls back to the current librosa baseline automatically and records `baseline_fallback` as the source
 - TempoCNN now runs through Docker and will try GPU before falling back to CPU
 - TempoCNN now handles BPM only; key extraction is no longer part of the TempoCNN container path

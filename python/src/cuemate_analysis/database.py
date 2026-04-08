@@ -783,6 +783,125 @@ class Database:
             ).fetchall()
         return rows
     
+    # ------------------------------------------------------------------
+    # Scoring queries (Phase 2 / Milestone 3)
+    # ------------------------------------------------------------------
+
+    def get_scoring_candidates(
+        self,
+        playlist_id: str,
+        exclude_track_ids: list[str] | None = None,
+    ) -> list[sqlite3.Row]:
+        """Return all playlist tracks with abs+rel features for scoring.
+
+        Tracks that have no absolute analysis row are excluded — they cannot
+        be scored without BPM/key data. Tracks listed in `exclude_track_ids`
+        are also excluded (used to remove the current track and history).
+        """
+        exclusions = list(exclude_track_ids or [])
+        placeholders = ", ".join("?" * len(exclusions)) if exclusions else "'__none__'"
+        query = f"""
+            SELECT
+              t.id          AS track_id,
+              t.title,
+              t.artist,
+              t.file_path,
+              pt.position,
+              f.bpm,
+              f.key,
+              f.key_confidence,
+              f.key_source,
+              f.key_agreement,
+              f.energy_abs,
+              f.bass_abs,
+              f.drums_abs,
+              f.vocals_abs,
+              f.vocals_confidence,
+              f.groove_abs,
+              f.harmonic_abs,
+              r.energy_rel,
+              r.bass_rel,
+              r.drums_rel,
+              r.vocals_rel,
+              r.groove_rel,
+              r.intensity_band,
+              r.role_hints
+            FROM playlist_tracks pt
+            JOIN tracks t ON t.id = pt.track_id
+            JOIN track_features_abs f ON f.track_id = t.id
+            LEFT JOIN track_features_rel r
+              ON r.track_id = t.id AND r.playlist_id = pt.playlist_id
+            WHERE pt.playlist_id = ?
+              AND t.id NOT IN ({placeholders})
+            ORDER BY pt.position ASC
+        """
+        params: list[Any] = [playlist_id] + exclusions
+        return self.connection.execute(query, params).fetchall()
+
+    def get_track_scoring_context(
+        self,
+        track_id: str,
+        playlist_id: str,
+    ) -> sqlite3.Row | None:
+        """Return a single track's abs+rel feature row for scoring."""
+        return self.connection.execute(
+            """
+            SELECT
+              t.id          AS track_id,
+              t.title,
+              t.artist,
+              t.file_path,
+              pt.position,
+              f.bpm,
+              f.key,
+              f.key_confidence,
+              f.key_source,
+              f.key_agreement,
+              f.energy_abs,
+              f.bass_abs,
+              f.drums_abs,
+              f.vocals_abs,
+              f.vocals_confidence,
+              f.groove_abs,
+              f.harmonic_abs,
+              r.energy_rel,
+              r.bass_rel,
+              r.drums_rel,
+              r.vocals_rel,
+              r.groove_rel,
+              r.intensity_band,
+              r.role_hints
+            FROM playlist_tracks pt
+            JOIN tracks t ON t.id = pt.track_id
+            JOIN track_features_abs f ON f.track_id = t.id
+            LEFT JOIN track_features_rel r
+              ON r.track_id = t.id AND r.playlist_id = pt.playlist_id
+            WHERE pt.playlist_id = ?
+              AND t.id = ?
+            """,
+            (playlist_id, track_id),
+        ).fetchone()
+
+    def get_playlist_stats_for_scoring(self, playlist_id: str) -> dict[str, Any] | None:
+        """Return the playlist_stats row as a plain dict, JSON-decoding adapted_weights.
+
+        Returns None when no stats row exists (playlist not yet enriched).
+        """
+        row = self.connection.execute(
+            "SELECT * FROM playlist_stats WHERE playlist_id = ?",
+            (playlist_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        result: dict[str, Any] = {key: row[key] for key in row.keys()}
+        raw_weights = result.get("adapted_weights")
+        if isinstance(raw_weights, str):
+            try:
+                result["adapted_weights"] = json.loads(raw_weights)
+            except (json.JSONDecodeError, TypeError):
+                result["adapted_weights"] = None
+        return result
+
     def get_analysis_jobs_by_ids(self, job_ids: Iterable[int]) -> list[sqlite3.Row]:
         ids = [int(job_id) for job_id in job_ids]
         if not ids:

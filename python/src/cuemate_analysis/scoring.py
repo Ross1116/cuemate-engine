@@ -6,15 +6,20 @@ isolation. DB integration, config loading, and CLI surface come in later phases.
 
 Deferred (add after v1 ranking is validated):
   - vocal_transition_score
-  - groove_score
-  - transition_support_score (returns neutral 0.5 always in v1)
-  - Any window-shaped interfaces
+  - groove_score / rhythmic_continuity
+  - transition_support_score (requires window data)
+
+Stub components use STUB_SCORE = None. compute_weighted_score skips None scores
+and renormalizes over active components — weight table is unchanged for reporting.
 """
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass, field
 from typing import Any
+
+from cuemate_analysis import __version__
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -56,12 +61,93 @@ WEIGHT_FLOORS: dict[str, float] = {
     "rhythmic_continuity": 0.02,
 }
 
+# Sentinel for scoring components that are not yet implemented.
+# compute_weighted_score skips these entirely and renormalizes over active components.
+# The weight table is left unchanged for reporting / contract stability.
+STUB_SCORE: None = None
+
 # Explicit floor for harmonic contribution when a key is weak and unverified.
 # Tunable here rather than buried in scoring logic. Also stored in config/default.json.
 HARMONIC_CONFIDENCE_FLOOR: float = 0.15
 
 # Threshold below which a standalone key estimate is not considered corroborated.
 KEY_CONFIDENCE_THRESHOLD: float = 0.5
+
+# Phase 6 metadata/versioning contract for the Python scoring core.
+SCORING_CONTRACT_ID: str = "m3-v1"
+
+# Applied to absolute features only.
+LABEL_CONFIG: dict[str, dict[str, list[float] | list[str]]] = {
+    "energy": {
+        "boundaries": [0.55, 0.68, 0.78, 0.88],
+        "labels": ["Low", "Groove", "High", "Peak", "Max"],
+    },
+    "bass": {
+        "boundaries": [0.55, 0.70, 0.82],
+        "labels": ["Light", "Groove", "Punch", "Heavy"],
+    },
+    "drums": {
+        "boundaries": [0.60, 0.75, 0.90],
+        "labels": ["Soft", "Drive", "Strong", "Max"],
+    },
+    "harmonic": {
+        "boundaries": [0.65, 0.75],
+        "labels": ["Mid", "Full", "Rich"],
+    },
+    "vocals": {
+        "boundaries": [0.35, 0.60],
+        "labels": ["Instrumental", "Mixed", "Vocal"],
+    },
+    "groove": {
+        "boundaries": [0.65, 0.75, 0.85],
+        "labels": ["Flat", "Groove", "Drive", "Swing"],
+    },
+}
+
+COMPONENT_DESCRIPTIONS: dict[str, str] = {
+    "target_energy": "How well the candidate matches the requested pressure direction.",
+    "transition_support": "Intro/outro handoff support from windowed analysis.",
+    "bass_transition": "Low-end continuity or relief across the transition.",
+    "vocal_transition": "Blend-space risk/opportunity from vocal overlap or contrast.",
+    "harmonic": "Camelot/key compatibility, confidence-modulated by key trust.",
+    "tempo": "BPM proximity after ratio-aware tempo matching.",
+    "history_fit": "Penalty for repetition or stagnant recent sequencing.",
+    "rhythmic_continuity": "Groove/rhythmic feel continuity across the handoff.",
+}
+
+STUBBED_COMPONENTS: set[str] = {
+    "transition_support",
+    "vocal_transition",
+    "rhythmic_continuity",
+}
+
+SUPPORTED_LANE_GROUPS: list[dict[str, str]] = [
+    {
+        "lane_id": "maintain",
+        "display_name": "Maintain",
+        "summary": "Keep the room on its current frame.",
+    },
+    {
+        "lane_id": "build",
+        "display_name": "Build",
+        "summary": "Raise momentum without making it a full jump.",
+    },
+    {
+        "lane_id": "reset",
+        "display_name": "Reset",
+        "summary": "Create space or reframe the room before the next move.",
+    },
+    {
+        "lane_id": "jump",
+        "display_name": "Jump",
+        "summary": "Make a bigger energy or character move.",
+    },
+    {
+        "lane_id": "contrast",
+        "display_name": "Contrast",
+        "summary": "Exploratory, higher-contrast alternatives.",
+    },
+]
 
 
 # ---------------------------------------------------------------------------
@@ -91,12 +177,63 @@ class ScoringTrackContext:
     groove_rel: float | None
     intensity_band: str | None
     role_hints: list[str] = field(default_factory=list)
+    title: str | None = None
+    artist: str | None = None
 
     # Convenience alias so code copied from the plan spec (`candidate.id`) works
     # without patching every call site.
     @property
     def id(self) -> str:
         return self.track_id
+
+
+# ---------------------------------------------------------------------------
+# DB row → ScoringTrackContext
+# ---------------------------------------------------------------------------
+
+
+def row_to_scoring_track_context(row: Any) -> ScoringTrackContext:
+    """Convert a DB row (from get_scoring_candidates / get_track_scoring_context) to a ScoringTrackContext.
+
+    Accepts sqlite3.Row, dict, or any mapping-like object. JSON-encoded
+    role_hints columns are decoded here so the rest of the scoring layer
+    never has to deal with raw strings.
+    """
+    # Support both sqlite3.Row (key access) and plain dict
+    def _get(key: str, default: Any = None) -> Any:
+        try:
+            return row[key]
+        except (KeyError, IndexError):
+            return default
+
+    raw_role_hints = _get("role_hints")
+    if isinstance(raw_role_hints, str):
+        try:
+            role_hints: list[str] = json.loads(raw_role_hints)
+        except (json.JSONDecodeError, TypeError):
+            role_hints = []
+    elif isinstance(raw_role_hints, list):
+        role_hints = raw_role_hints
+    else:
+        role_hints = []
+
+    return ScoringTrackContext(
+        track_id=str(_get("track_id")),
+        bpm=float(_get("bpm") or 0.0),
+        key=_get("key") or None,
+        key_confidence=float(_get("key_confidence")) if _get("key_confidence") is not None else None,
+        key_source=_get("key_source") or None,
+        key_agreement=int(_get("key_agreement")) if _get("key_agreement") is not None else None,
+        energy_rel=float(_get("energy_rel")) if _get("energy_rel") is not None else None,
+        bass_rel=float(_get("bass_rel")) if _get("bass_rel") is not None else None,
+        drums_rel=float(_get("drums_rel")) if _get("drums_rel") is not None else None,
+        vocals_rel=float(_get("vocals_rel")) if _get("vocals_rel") is not None else None,
+        groove_rel=float(_get("groove_rel")) if _get("groove_rel") is not None else None,
+        intensity_band=_get("intensity_band") or None,
+        role_hints=role_hints,
+        title=_get("title") or None,
+        artist=_get("artist") or None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +330,200 @@ def sigmoid_normalize(x: float, center: float = 0.0, spread: float = 0.1) -> flo
 
 
 # ---------------------------------------------------------------------------
+# Phase 6: Labels & scoring metadata
+# ---------------------------------------------------------------------------
+
+
+def classify_label(
+    value: float | None,
+    boundaries: list[float],
+    labels: list[str],
+) -> str | None:
+    """Bucket an absolute feature value into a calibrated label."""
+    if value is None:
+        return None
+    for i, threshold in enumerate(boundaries):
+        if value < threshold:
+            return labels[i]
+    return labels[-1]
+
+
+def classify_track_labels(track_abs: Any) -> dict[str, str | None]:
+    """Return absolute feature labels for a dict/dataclass/object with *_abs fields."""
+
+    def _get(name: str) -> float | None:
+        if isinstance(track_abs, dict):
+            value = track_abs.get(name)
+        else:
+            value = getattr(track_abs, name, None)
+        return float(value) if value is not None else None
+
+    return {
+        feature_name: classify_label(
+            _get(f"{feature_name}_abs"),
+            spec["boundaries"],  # type: ignore[arg-type]
+            spec["labels"],      # type: ignore[arg-type]
+        )
+        for feature_name, spec in LABEL_CONFIG.items()
+    }
+
+
+def get_scoring_metadata(
+    settings: Any | None = None,
+    *,
+    compatible_analysis_signatures: list[str] | None = None,
+    compatible_config_signatures: list[str] | None = None,
+    healthy: bool = True,
+    status_note: str | None = None,
+) -> dict[str, Any]:
+    """Return scoring metadata in a proto-aligned dict shape."""
+    if settings is None:
+        from cuemate_analysis.config import load_runtime_settings
+
+        settings = load_runtime_settings()
+
+    active_analysis_signature = str(getattr(settings, "analysis_signature"))
+    active_config_signature = str(getattr(settings, "config_signature"))
+    active_weights = dict(getattr(settings, "scoring").static_weights)
+    metadata_status_note = status_note or (
+        "Python scoring core metadata. "
+        "transition_support, vocal_transition, and rhythmic_continuity are currently stubbed and excluded from weighted scoring."
+    )
+
+    return {
+        "active_signatures": {
+            "analysis_signature": active_analysis_signature,
+            "scoring_contract_id": SCORING_CONTRACT_ID,
+            "config_signature": active_config_signature,
+        },
+        "compatible_analysis_signatures": compatible_analysis_signatures or [active_analysis_signature],
+        "compatible_config_signatures": compatible_config_signatures or [active_config_signature],
+        "components": [
+            {
+                "component_id": component_id,
+                "description": COMPONENT_DESCRIPTIONS.get(component_id, ""),
+                "weight": active_weights.get(component_id, STATIC_WEIGHTS.get(component_id, 0.0)),
+                "available": component_id not in STUBBED_COMPONENTS,
+                "active": component_id not in STUBBED_COMPONENTS,
+                "status": "live" if component_id not in STUBBED_COMPONENTS else "stubbed",
+            }
+            for component_id in STATIC_WEIGHTS
+        ],
+        "supported_lane_groups": list(SUPPORTED_LANE_GROUPS),
+        "capability_flags": {
+            "vocals_available": False,
+            "window_features_available": False,
+            "transition_support_available": False,
+            "vocal_transition_available": False,
+            "rhythmic_continuity_available": False,
+            "explanations_available": True,
+            "label_classification_available": True,
+        },
+        "healthy": healthy,
+        "engine_version": __version__,
+        "status_note": metadata_status_note,
+    }
+
+
+def check_analysis_compatibility(
+    track_analysis_signature: str | None,
+    track_config_signature: str | None,
+    track_scoring_contract_id_at_analysis: str | None = None,
+    *,
+    scoring_metadata: dict[str, Any] | None = None,
+    settings: Any | None = None,
+) -> dict[str, Any]:
+    """Compare artifact signatures against the active scoring metadata."""
+    metadata = scoring_metadata or get_scoring_metadata(settings)
+    active = metadata["active_signatures"]
+    active_analysis_signature = active["analysis_signature"]
+    active_config_signature = active["config_signature"]
+    active_scoring_contract_id = active["scoring_contract_id"]
+    compatible_analysis_signatures = set(metadata.get("compatible_analysis_signatures", []))
+    compatible_config_signatures = set(metadata.get("compatible_config_signatures", []))
+
+    if not track_analysis_signature or not track_config_signature:
+        return {
+            "exact_match": False,
+            "compatible": False,
+            "requires_reanalysis": True,
+            "reason": "missing_signature_metadata",
+            "notes": ["Artifact is missing analysis_signature or config_signature."],
+        }
+
+    if track_scoring_contract_id_at_analysis is None:
+        return {
+            "exact_match": False,
+            "compatible": False,
+            "requires_reanalysis": True,
+            "reason": "missing_scoring_contract_id",
+            "notes": ["Artifact predates scoring contract tagging; reanalysis is required."],
+        }
+
+    if track_scoring_contract_id_at_analysis != active_scoring_contract_id:
+        return {
+            "exact_match": False,
+            "compatible": False,
+            "requires_reanalysis": True,
+            "reason": "scoring_contract_mismatch",
+            "notes": [
+                f"Artifact scoring contract {track_scoring_contract_id_at_analysis} does not match active {active_scoring_contract_id}."
+            ],
+        }
+
+    analysis_exact = track_analysis_signature == active_analysis_signature
+    config_exact = track_config_signature == active_config_signature
+    if analysis_exact and config_exact:
+        return {
+            "exact_match": True,
+            "compatible": True,
+            "requires_reanalysis": False,
+            "reason": "exact_match",
+            "notes": [],
+        }
+
+    notes: list[str] = []
+    analysis_compatible = track_analysis_signature in compatible_analysis_signatures
+    config_compatible = track_config_signature in compatible_config_signatures
+    if not analysis_compatible:
+        return {
+            "exact_match": False,
+            "compatible": False,
+            "requires_reanalysis": True,
+            "reason": "analysis_signature_incompatible",
+            "notes": [
+                f"Artifact analysis signature {track_analysis_signature} is not in the active compatibility set."
+            ],
+        }
+    if not config_compatible:
+        return {
+            "exact_match": False,
+            "compatible": False,
+            "requires_reanalysis": True,
+            "reason": "config_signature_incompatible",
+            "notes": [
+                f"Artifact config signature {track_config_signature} is not in the active compatibility set."
+            ],
+        }
+
+    if not analysis_exact:
+        notes.append(
+            f"Artifact analysis signature {track_analysis_signature} is compatible with active {active_analysis_signature}."
+        )
+    if not config_exact:
+        notes.append(
+            f"Artifact config signature {track_config_signature} is compatible with active {active_config_signature}."
+        )
+    return {
+        "exact_match": False,
+        "compatible": True,
+        "requires_reanalysis": False,
+        "reason": "compatible_but_not_exact",
+        "notes": notes,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Score components — v1 set
 # ---------------------------------------------------------------------------
 
@@ -224,11 +555,20 @@ def target_energy_score(delta_energy_rel: float, target: str) -> float:
     if target == "build":
         return sigmoid_normalize(delta_energy_rel, 0.08, 0.10)
     if target == "reset":
-        return sigmoid_normalize(-delta_energy_rel, 0.08, 0.10)
+        # Reset prefers pressure drop but tolerates near-neutral energy if
+        # the track reframes the room (captured by other components).
+        # Strongly negative → great, slightly negative → good, neutral → okay,
+        # positive → poor.
+        if delta_energy_rel <= -0.03:
+            return sigmoid_normalize(-delta_energy_rel, 0.06, 0.12)
+        # Near-neutral: gentle falloff rather than cliff
+        return max(0.25, 1.0 - delta_energy_rel * 4)
     if target == "maintain":
         return 1.0 - min(abs(delta_energy_rel) * 5, 1.0)
     if target == "jump":
         return sigmoid_normalize(abs(delta_energy_rel), 0.15, 0.10)
+    if target == "contrast":
+        return sigmoid_normalize(abs(delta_energy_rel), 0.10, 0.12)
     return 0.5
 
 
@@ -244,7 +584,14 @@ def bass_transition_score(
     if target == "build":
         return sigmoid_normalize(delta, 0.1, 0.15)
     if target == "reset":
-        return sigmoid_normalize(-delta, 0.1, 0.15)
+        # Reset prefers lower/flatter bass (pressure release) but tolerates
+        # neutral bass if energy or character is shifting.
+        if delta <= 0:
+            return sigmoid_normalize(-delta, 0.05, 0.15)
+        # Rising bass during reset is mildly penalized, not banned
+        return max(0.2, 1.0 - delta * 3)
+    if target == "contrast":
+        return 1.0 - min(abs(delta) * 2, 0.8)
     return 1.0 - min(abs(delta) * 3, 1.0)
 
 
@@ -390,7 +737,7 @@ def build_confidence_map(
 
 
 def compute_weighted_score(
-    feature_scores: dict[str, float],
+    feature_scores: dict[str, float | None],
     weights: dict[str, float],
     confidences: dict[str, float],
 ) -> float:
@@ -398,10 +745,14 @@ def compute_weighted_score(
 
     Confidence values reduce the effective weight of uncertain signals.
     Weight floors prevent any component from vanishing entirely.
+    Components with a score of None (STUB_SCORE) are skipped entirely and the
+    remaining weights are renormalized — the weight table is left unchanged.
     This is weight modulation, NOT calibrated statistical probability.
     """
     adjusted: dict[str, float] = {}
     for feature, weight in weights.items():
+        if feature_scores.get(feature) is None:
+            continue  # stub — excluded from this scoring pass
         conf = confidences.get(feature, 1.0)
         effective_conf = max(conf, HARMONIC_CONFIDENCE_FLOOR)
         adjusted[feature] = weight * effective_conf
@@ -413,7 +764,7 @@ def compute_weighted_score(
         return 0.5
     normalized = {k: v / total for k, v in adjusted.items()}
     return sum(
-        normalized[f] * feature_scores[f]
+        normalized[f] * feature_scores[f]  # type: ignore[operator]
         for f in feature_scores
         if f in normalized
     )
@@ -430,8 +781,9 @@ def compute_transition_features(
 ) -> dict[str, Any]:
     """Canonical per-pair feature bundle used by penalties, risk, and explanations.
 
-    Window parameters (current_outro, candidate_intro) are deferred — transition_support
-    scores a neutral 0.5 when windows are absent.
+    Window parameters (current_outro, candidate_intro) are deferred.
+    Vocal-relative fields stay as None when the analysis pipeline has not populated
+    them yet so diagnostics can distinguish "unknown" from "measured silence".
     """
     bpm_dist, _, bpm_relationship, raw_bpm_dist = effective_bpm_distance(
         current.bpm, candidate.bpm
@@ -458,8 +810,8 @@ def compute_transition_features(
             (candidate.bass_rel if candidate.bass_rel is not None else 0.5)
             - (current.bass_rel if current.bass_rel is not None else 0.5)
         ),
-        "current_vocals_rel": current.vocals_rel if current.vocals_rel is not None else 0.0,
-        "candidate_vocals_rel": candidate.vocals_rel if candidate.vocals_rel is not None else 0.0,
+        "current_vocals_rel": current.vocals_rel,
+        "candidate_vocals_rel": candidate.vocals_rel,
         # Window-based low-end fields — always 0.0 in v1 (no window data)
         "current_outro_low_end": 0.0,
         "candidate_intro_low_end": 0.0,
@@ -524,10 +876,13 @@ def compute_penalties(
         )
 
     # Vocal clash penalty
-    vocal_product = (transition_features.get("current_vocals_rel") or 0.0) * (
-        transition_features.get("candidate_vocals_rel") or 0.0
-    )
-    if vocal_product > 0.25:
+    cur_vocals = transition_features.get("current_vocals_rel")
+    cand_vocals = transition_features.get("candidate_vocals_rel")
+    if cur_vocals is not None and cand_vocals is not None:
+        vocal_product = cur_vocals * cand_vocals
+    else:
+        vocal_product = None
+    if vocal_product is not None and vocal_product > 0.25:
         severity = min(1.0, (vocal_product - 0.25) / 0.5)
         vocal_conf = max(0.25, confidences.get("vocal_transition", 1.0))
         base_penalty = penalty_config.get("vocal_clash", 0.35) * severity * vocal_conf
@@ -594,20 +949,27 @@ def filter_candidates(
     history: list[dict[str, Any]],
     config: dict[str, Any],
     bypass_filters: set[str] | None = None,
+    target: str = "maintain",
 ) -> list[ScoringTrackContext]:
     """Remove candidates that fail hard filters.
 
     Hard filters (permissive assistant-mode defaults):
     - same track as current
     - recently played cooldown
-    - BPM distance beyond hard limit
+    - BPM distance beyond lane-specific hard limit
+
+    The BPM hard limit varies by target lane (bpm_hard_by_target). Ratio-based
+    relationships listed in bpm_ratio_pass (e.g. half/double, 3:2/2:3) bypass
+    the hard limit entirely — they are intentional tempo pivots, not wide jumps.
 
     Key is NOT a hard filter. It contributes to score and risk only.
     """
     if bypass_filters is None:
         bypass_filters = set()
     thresholds = config.get("thresholds", {})
-    bpm_hard = thresholds.get("bpm_hard", 8.0)
+    bpm_hard_by_target: dict[str, float] = thresholds.get("bpm_hard_by_target", {})
+    bpm_hard = bpm_hard_by_target.get(target, thresholds.get("bpm_hard", 8.0))
+    bpm_ratio_pass: set[str] = set(thresholds.get("bpm_ratio_pass", []))
     cooldown_window = thresholds.get("cooldown_window", 5)
     recent_ids = {h.get("id") or h.get("track_id") for h in history[-cooldown_window:]}
 
@@ -616,10 +978,15 @@ def filter_candidates(
         # Same-track exclusion (always applied)
         if candidate.track_id == current.track_id:
             continue
-        # BPM hard limit
-        if "bpm" not in bypass_filters:
-            bpm_dist, _, _, _ = effective_bpm_distance(current.bpm, candidate.bpm)
-            if bpm_dist > bpm_hard:
+        # BPM hard limit — wildcard has no distance cap; ratio relationships in
+        # bpm_ratio_pass bypass the distance check.  Non-direct relationships
+        # that are NOT in bpm_ratio_pass (e.g. four_three, three_four) are
+        # always blocked — they are too adventurous for default recommendations.
+        if "bpm" not in bypass_filters and target not in ("wildcard", "contrast"):
+            bpm_dist, _, bpm_relationship, _ = effective_bpm_distance(current.bpm, candidate.bpm)
+            if bpm_relationship != "direct" and bpm_relationship not in bpm_ratio_pass:
+                continue
+            if bpm_dist > bpm_hard and bpm_relationship not in bpm_ratio_pass:
                 continue
         # Cooldown
         if "cooldown" not in bypass_filters and candidate.track_id in recent_ids:
@@ -666,10 +1033,13 @@ def classify_move(
         return "jump", 0.95, None
     if delta_energy_rel > build_t:
         return "build", 0.85, None
-    if delta_energy_rel < reset_e_t and (
-        vocal_candidate_rel > reset_v_t or delta_energy_rel < -0.15
-    ):
-        return "reset", 0.85, None
+    # Reset = room reframe / pressure drop.  Two paths:
+    #   (a) clear energy drop — the classic pressure release
+    #   (b) moderate dip with bass relief — reframe without cliff
+    if delta_energy_rel < reset_e_t:
+        return "reset", 0.90, None
+    if delta_energy_rel < drop_t and delta_bass_rel < -0.05:
+        return "reset", 0.75, "reframe"
     if delta_energy_rel < drop_t:
         return "drop", 0.80, None
     if abs(delta_energy_rel) <= maintain_t:
@@ -706,9 +1076,9 @@ def compute_risk(
         factors.append(f"Higher harmonic tension (distance {key_dist})")
         factor_weights.append(0.25)
 
-    cur_voc = transition_features.get("current_vocals_rel", 0.0)
-    cand_voc = transition_features.get("candidate_vocals_rel", 0.0)
-    if cur_voc > 0.6 and cand_voc > 0.6:
+    cur_voc = transition_features.get("current_vocals_rel")
+    cand_voc = transition_features.get("candidate_vocals_rel")
+    if cur_voc is not None and cand_voc is not None and cur_voc > 0.6 and cand_voc > 0.6:
         factors.append("Both tracks carry strong vocal content")
         factor_weights.append(0.2)
 
@@ -765,18 +1135,18 @@ def score_candidate(
         "target_energy": target_energy_score(
             transition_features["delta_energy_rel"], target
         ),
-        # transition_support returns neutral 0.5 in v1 — no window data yet
-        "transition_support": 0.5,
+        # transition_support, vocal_transition, rhythmic_continuity are not yet
+        # implemented — STUB_SCORE (None) causes compute_weighted_score to skip
+        # them and renormalize over active components only.
+        "transition_support": STUB_SCORE,
         "bass_transition": bass_transition_score(
             current.bass_rel, candidate.bass_rel, target
         ),
-        # vocal_transition deferred — returns neutral 0.5 in v1
-        "vocal_transition": 0.5,
+        "vocal_transition": STUB_SCORE,
         "harmonic": harmonic_score(current.key, candidate.key),
         "tempo": tempo_score(current.bpm, candidate.bpm, config),
         "history_fit": history_fit_score(candidate, history),
-        # rhythmic_continuity (groove_score) deferred — neutral 0.5 in v1
-        "rhythmic_continuity": 0.5,
+        "rhythmic_continuity": STUB_SCORE,
     }
 
     weights = resolve_effective_weights(playlist_stats)
@@ -831,4 +1201,277 @@ def score_candidate(
         "transition_features": transition_features,
         "confidences": confidences,
         "weights_used": weights,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Lane Organization & Top-Level Orchestration
+# ---------------------------------------------------------------------------
+
+# Move-type → lane mapping. Contrast is a virtual lane populated via dual-membership.
+_MOVE_TO_LANE: dict[str, str] = {
+    "jump": "jump",
+    "build": "build",
+    "maintain": "maintain",
+    "reset": "reset",
+    "drop": "reset",
+}
+
+
+def compute_ranking_strength(candidate_score: float, lane_scores: list[float]) -> float:
+    """Return a [0, 1] strength value showing how this candidate stands against lane peers.
+
+    When lane_scores is empty or has only this candidate, returns 1.0 (top by default).
+    The score is position-weighted: 1st place gets 1.0, last place (in a lane of
+    max_per_lane entries) gets 0.0, with linear interpolation in between.
+    """
+    if not lane_scores:
+        return 1.0
+    sorted_scores = sorted(lane_scores, reverse=True)
+    rank = 0
+    for i, s in enumerate(sorted_scores):
+        if s <= candidate_score:
+            rank = i
+            break
+    n = len(sorted_scores)
+    if n == 1:
+        return 1.0
+    return 1.0 - rank / (n - 1)
+
+
+def organize_into_lanes(
+    ranked_results: list[dict[str, Any]],
+    target_lane: str,
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Organize scored candidates into move lanes.
+
+    Lane names: "build", "jump", "maintain", "reset", "wildcard", "contrast".
+    - Each candidate's primary lane is derived from its move type via _MOVE_TO_LANE.
+    - Candidates with contrast_score >= secondary_contrast_threshold (0.65) that are
+      NOT already in the contrast lane get added to "contrast" as secondary members
+      (secondary_lane=True).
+    - "contrast" is the user-facing exploratory lane.
+    - Candidates that don't map to any lane via move type land in "wildcard",
+      which is mainly an internal fallback.
+    - Each lane is capped at max_per_lane (default 3).
+    - lane_order: target_lane first, then remaining lanes in canonical order, then wildcard/contrast.
+
+    Returns dict:
+        {
+            "lane_order": [...],
+            "lanes": {lane_name: [result_with_lane_fields, ...]},
+            "target_lane": target_lane,
+        }
+    """
+    cfg = config or {}
+    max_per_lane: int = cfg.get("max_per_lane", 3)
+    contrast_threshold: float = cfg.get("contrast_threshold", 0.45)
+    secondary_contrast_threshold: float = cfg.get("secondary_contrast_threshold", 0.65)
+
+    # Canonical ordering of non-target lanes
+    _CANONICAL_ORDER = ["build", "jump", "maintain", "reset", "wildcard", "contrast"]
+
+    lanes: dict[str, list[dict[str, Any]]] = {name: [] for name in _CANONICAL_ORDER}
+
+    # First pass: assign primary lanes.
+    # When targeting contrast, route high-contrast tracks to the contrast lane directly.
+    for result in ranked_results:
+        move = result.get("move", "")
+        cs = result.get("contrast_score", 0.0) or 0.0
+        if target_lane == "contrast" and cs >= contrast_threshold:
+            primary = "contrast"
+        else:
+            primary = _MOVE_TO_LANE.get(move, "wildcard")
+        if len(lanes[primary]) < max_per_lane:
+            entry = {**result, "primary_lane": primary, "secondary_lane": False}
+            lanes[primary].append(entry)
+
+    # Second pass: contrast dual-membership (only when not already targeting contrast).
+    # Iterate ranked_results again (in score order) to fill contrast lane.
+    if target_lane != "contrast":
+        for result in ranked_results:
+            if len(lanes["contrast"]) >= max_per_lane:
+                break
+            cs = result.get("contrast_score", 0.0) or 0.0
+            if cs >= secondary_contrast_threshold:
+                move = result.get("move", "")
+                primary = _MOVE_TO_LANE.get(move, "wildcard")
+                # Add as secondary member (even if primary lane is full — already appended above)
+                entry = {**result, "primary_lane": primary, "secondary_lane": True}
+                lanes["contrast"].append(entry)
+
+    lane_top_scores = {
+        name: max((item.get("score", 0.0) or 0.0) for item in items)
+        for name, items in lanes.items()
+        if items
+    }
+
+    # Build lane_order: target first when available; otherwise promote the best
+    # non-empty non-contrast lane so empty-target fallbacks are obvious in the CLI.
+    present_lanes = [name for name in _CANONICAL_ORDER if lanes[name]]
+    if target_lane in present_lanes:
+        ordered = [target_lane] + [l for l in present_lanes if l != target_lane]
+    else:
+        ordered = sorted(
+            [lane for lane in present_lanes if lane != "contrast"],
+            key=lambda lane: (-lane_top_scores[lane], _CANONICAL_ORDER.index(lane)),
+        )
+        if "contrast" in present_lanes:
+            ordered.append("contrast")
+
+    return {
+        "lane_order": ordered,
+        "lanes": {name: items for name, items in lanes.items() if items},
+        "target_lane": target_lane,
+    }
+
+
+def compute_recommendation_confidence(
+    ranked_results: list[dict[str, Any]],
+    analysis_coverage: float = 1.0,
+    avg_feature_conf: float = 1.0,
+) -> float:
+    """Return a [0, 1] recommendation confidence for the full result set.
+
+    v1 formula (simple):
+    - Score separation between top-2 candidates (wider = more decisive = higher confidence)
+    - Number of candidates available (more candidates = more options = higher confidence)
+    - Average feature confidence (quality of underlying analysis)
+    - analysis_coverage fraction (what proportion of candidates have rel features)
+
+    All factors blended with fixed weights; result clamped to [0, 1].
+    """
+    if not ranked_results:
+        return 0.0
+
+    scores = [r.get("score", 0.0) or 0.0 for r in ranked_results]
+    top_score = scores[0]
+
+    # Separation factor: gap between 1st and 2nd (or 0 if only one candidate)
+    if len(scores) >= 2:
+        gap = top_score - scores[1]
+        # A gap of 0.3+ is considered decisive; normalize to [0, 1]
+        separation_factor = min(gap / 0.30, 1.0)
+    else:
+        separation_factor = 1.0  # only one candidate — decisive by default
+
+    # Depth factor: ≥10 candidates → 1.0
+    depth_factor = min(len(ranked_results) / 10.0, 1.0)
+
+    # Combine: separation 40%, depth 20%, feature conf 25%, coverage 15%
+    confidence = (
+        0.40 * separation_factor
+        + 0.20 * depth_factor
+        + 0.25 * avg_feature_conf
+        + 0.15 * analysis_coverage
+    )
+    return max(0.0, min(1.0, confidence))
+
+
+def get_recommendations(
+    current_track: ScoringTrackContext,
+    candidates: list[ScoringTrackContext],
+    history: list[ScoringTrackContext],
+    config: dict[str, Any],
+    playlist_stats: dict[str, Any] | None = None,
+    target: str = "maintain",
+    max_per_lane: int = 3,
+) -> dict[str, Any]:
+    """Top-level recommendation entry point.
+
+    Filters candidates, scores each one, organizes into lanes, computes
+    recommendation confidence, and returns the structured result.
+
+    Returns:
+        {
+            "lane_order": [...],
+            "lanes": {lane_name: [scored_result, ...]},
+            "recommendation_confidence": float,
+            "meta": {
+                "target": str,
+                "total_candidates": int,
+                "scored_candidates": int,
+                "current_track_id": str,
+            }
+        }
+    """
+    cfg = {**config, "max_per_lane": max_per_lane}
+
+    # Filter candidates (removes current track, cooldown, BPM hard limit)
+    filtered = filter_candidates(current_track, candidates, history, cfg, target=target)
+
+    # Score each candidate
+    scored: list[dict[str, Any]] = []
+    for candidate in filtered:
+        result = score_candidate(
+            current=current_track,
+            candidate=candidate,
+            history=history,
+            config=cfg,
+            playlist_stats=playlist_stats,
+        )
+        scored.append(result)
+
+    # Sort by final score descending
+    ranked = sorted(scored, key=lambda r: r.get("score", 0.0), reverse=True)
+
+    # Lane organization
+    lane_result = organize_into_lanes(ranked, target_lane=target, config=cfg)
+
+    # Average feature confidence across all scored candidates (for recommendation confidence)
+    if ranked:
+        all_confs: list[float] = []
+        for r in ranked:
+            for v in (r.get("confidences") or {}).values():
+                all_confs.append(float(v))
+        avg_feature_conf = sum(all_confs) / len(all_confs) if all_confs else 1.0
+    else:
+        avg_feature_conf = 1.0
+
+    # Analysis coverage: fraction of candidates with rel features (non-None energy_rel)
+    total_input = len(candidates)
+    if total_input > 0:
+        rel_count = sum(1 for c in candidates if c.energy_rel is not None)
+        analysis_coverage = rel_count / total_input
+    else:
+        analysis_coverage = 0.0
+
+    rec_confidence = compute_recommendation_confidence(
+        ranked,
+        analysis_coverage=analysis_coverage,
+        avg_feature_conf=avg_feature_conf,
+    )
+
+    target_lane_items = lane_result["lanes"].get(target, [])
+    requested_lane_available = bool(target_lane_items)
+    lane_order = lane_result["lane_order"]
+    best_alternative_lanes = lane_order[:2] if not requested_lane_available else []
+
+    fallback_note: str | None = None
+    if not requested_lane_available:
+        if len(best_alternative_lanes) >= 2:
+            fallback_note = (
+                f"No strong {target} candidates found; best alternatives are "
+                f"{best_alternative_lanes[0]} and {best_alternative_lanes[1]}."
+            )
+        elif len(best_alternative_lanes) == 1:
+            fallback_note = (
+                f"No strong {target} candidates found; best alternative is "
+                f"{best_alternative_lanes[0]}."
+            )
+
+    return {
+        **lane_result,
+        "recommendation_confidence": rec_confidence,
+        "meta": {
+            "target": target,
+            "total_candidates": total_input,
+            "filtered_candidates": len(filtered),
+            "scored_candidates": len(ranked),
+            "current_track_id": current_track.track_id,
+            "requested_lane_available": requested_lane_available,
+            "best_alternative_lanes": best_alternative_lanes,
+            "fallback_note": fallback_note,
+        },
     }

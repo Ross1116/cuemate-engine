@@ -18,6 +18,8 @@ from __future__ import annotations
 import pytest
 
 from cuemate_analysis.scoring import (
+    LABEL_CONFIG,
+    SCORING_CONTRACT_ID,
     HARMONIC_CONFIDENCE_FLOOR,
     HARMONIC_SCORE_MAP,
     KEY_CONFIDENCE_THRESHOLD,
@@ -28,6 +30,9 @@ from cuemate_analysis.scoring import (
     build_confidence_map,
     camelot_compatibility,
     classify_move,
+    classify_label,
+    classify_track_labels,
+    check_analysis_compatibility,
     compute_penalties,
     compute_risk,
     compute_transition_features,
@@ -35,6 +40,7 @@ from cuemate_analysis.scoring import (
     contrast_score,
     effective_bpm_distance,
     filter_candidates,
+    get_scoring_metadata,
     harmonic_score,
     history_fit_score,
     parse_camelot,
@@ -142,6 +148,108 @@ class TestParseCamelot:
 
     def test_non_numeric(self):
         assert parse_camelot("XA") == (None, None)
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: labels & metadata
+# ---------------------------------------------------------------------------
+
+
+class TestAbsoluteLabels:
+    def test_classify_label_uses_boundaries(self):
+        cfg = LABEL_CONFIG["energy"]
+        assert classify_label(0.54, cfg["boundaries"], cfg["labels"]) == "Low"
+        assert classify_label(0.88, cfg["boundaries"], cfg["labels"]) == "Max"
+
+    def test_classify_label_none_returns_none(self):
+        cfg = LABEL_CONFIG["vocals"]
+        assert classify_label(None, cfg["boundaries"], cfg["labels"]) is None
+
+    def test_classify_track_labels_from_dict(self):
+        labels = classify_track_labels(
+            {
+                "energy_abs": 0.80,
+                "bass_abs": 0.71,
+                "drums_abs": 0.76,
+                "harmonic_abs": 0.70,
+                "vocals_abs": 0.20,
+                "groove_abs": 0.86,
+            }
+        )
+        assert labels == {
+            "energy": "Peak",
+            "bass": "Punch",
+            "drums": "Strong",
+            "harmonic": "Full",
+            "vocals": "Instrumental",
+            "groove": "Swing",
+        }
+
+
+class TestScoringMetadata:
+    def test_metadata_exposes_contract_and_version(self):
+        metadata = get_scoring_metadata()
+        assert metadata["active_signatures"]["scoring_contract_id"] == SCORING_CONTRACT_ID
+        assert metadata["engine_version"]
+        assert metadata["capability_flags"]["vocals_available"] is False
+        assert "stubbed and excluded from weighted scoring" in metadata["status_note"]
+
+    def test_metadata_components_follow_weight_table(self):
+        metadata = get_scoring_metadata()
+        component_ids = [component["component_id"] for component in metadata["components"]]
+        assert component_ids == list(STATIC_WEIGHTS.keys())
+
+    def test_metadata_marks_stubbed_components_unavailable(self):
+        metadata = get_scoring_metadata()
+        by_id = {component["component_id"]: component for component in metadata["components"]}
+        assert by_id["transition_support"]["available"] is False
+        assert by_id["transition_support"]["active"] is False
+        assert by_id["transition_support"]["status"] == "stubbed"
+        assert by_id["target_energy"]["available"] is True
+        assert by_id["target_energy"]["active"] is True
+        assert by_id["target_energy"]["status"] == "live"
+
+    def test_check_analysis_compatibility_exact(self):
+        metadata = get_scoring_metadata()
+        active = metadata["active_signatures"]
+        status = check_analysis_compatibility(
+            active["analysis_signature"],
+            active["config_signature"],
+            active["scoring_contract_id"],
+            scoring_metadata=metadata,
+        )
+        assert status["exact_match"] is True
+        assert status["compatible"] is True
+        assert status["requires_reanalysis"] is False
+
+    def test_check_analysis_compatibility_compatible_but_not_exact(self):
+        metadata = get_scoring_metadata(
+            compatible_analysis_signatures=["legacy-analysis"],
+            compatible_config_signatures=["legacy-config"],
+        )
+        status = check_analysis_compatibility(
+            "legacy-analysis",
+            "legacy-config",
+            SCORING_CONTRACT_ID,
+            scoring_metadata=metadata,
+        )
+        assert status["exact_match"] is False
+        assert status["compatible"] is True
+        assert status["requires_reanalysis"] is False
+        assert status["reason"] == "compatible_but_not_exact"
+
+    def test_check_analysis_compatibility_rejects_missing_contract(self):
+        metadata = get_scoring_metadata()
+        active = metadata["active_signatures"]
+        status = check_analysis_compatibility(
+            active["analysis_signature"],
+            active["config_signature"],
+            None,
+            scoring_metadata=metadata,
+        )
+        assert status["compatible"] is False
+        assert status["requires_reanalysis"] is True
+        assert status["reason"] == "missing_scoring_contract_id"
 
 
 # ---------------------------------------------------------------------------
@@ -327,6 +435,10 @@ class TestTargetEnergyScore:
         s = target_energy_score(-0.15, "reset")
         assert s > 0.5
 
+    def test_reset_near_neutral_delta_still_scores_as_viable(self):
+        s = target_energy_score(0.01, "reset")
+        assert s > 0.5
+
     def test_jump_large_delta(self):
         s = target_energy_score(0.3, "jump")
         assert s > 0.7
@@ -352,6 +464,10 @@ class TestBassTransitionScore:
     def test_build_positive_delta(self):
         s = bass_transition_score(0.3, 0.7, "build")
         assert s > 0.5
+
+    def test_reset_small_bass_rise_is_tolerated(self):
+        s = bass_transition_score(0.5, 0.55, "reset")
+        assert 0.2 <= s < 1.0
 
     def test_none_inputs_fallback(self):
         s = bass_transition_score(None, None, "maintain")
@@ -553,6 +669,20 @@ class TestResolveEffectiveWeights:
 
 
 # ---------------------------------------------------------------------------
+# compute_transition_features
+# ---------------------------------------------------------------------------
+
+
+class TestComputeTransitionFeatures:
+    def test_missing_vocals_stay_unknown(self):
+        current = _track(track_id="t1", vocals_rel=None)
+        candidate = _track(track_id="t2", vocals_rel=None)
+        tf = compute_transition_features(current, candidate)
+        assert tf["current_vocals_rel"] is None
+        assert tf["candidate_vocals_rel"] is None
+
+
+# ---------------------------------------------------------------------------
 # compute_penalties
 # ---------------------------------------------------------------------------
 
@@ -715,6 +845,12 @@ class TestClassifyMove:
     def test_reset(self):
         name, conf, _ = classify_move(-0.20, 0.0, 0.2, 0.65, None, _DEFAULT_CONFIG)
         assert name == "reset"
+
+    def test_reset_reframe_path(self):
+        name, conf, note = classify_move(-0.06, -0.10, 0.2, 0.2, None, _DEFAULT_CONFIG)
+        assert name == "reset"
+        assert conf == 0.75
+        assert note == "reframe"
 
     def test_drop(self):
         name, conf, _ = classify_move(-0.08, 0.0, 0.2, 0.2, None, _DEFAULT_CONFIG)

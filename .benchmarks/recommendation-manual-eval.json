@@ -1,0 +1,86 @@
+{
+  "playlist": "Fred again (Rekordbox)",
+  "reviewed_on": "2026-04-08",
+  "review_basis": [
+    "Built from current recommend-next outputs and score-pair breakdowns.",
+    "Use this set before changing lane presentation or scoring behavior.",
+    "Reset-specific tuning still needs ear checks before any stricter penalties are introduced."
+  ],
+  "cases": [
+    {
+      "case_id": "feisty_maintain_empty",
+      "current_track_id": "trk_b5382942d49e4891",
+      "current_track_label": "Fred again.., Bia - ..FEISTY",
+      "requested_target": "maintain",
+      "expected_good_candidates": [],
+      "expected_bad_candidates": [],
+      "expected_alternative_lanes": [
+        "reset",
+        "jump"
+      ],
+      "notes": "Current engine often has no maintain lane here. Good regression case for empty-lane fallback UX; do not force a fake maintain recommendation."
+    },
+    {
+      "case_id": "bleu_maintain_sparse",
+      "current_track_id": "trk_965217ea743730ac",
+      "current_track_label": "Fred again.. - Bleu (better with time)",
+      "requested_target": "maintain",
+      "expected_good_candidates": [
+        "trk_243359a9757ed4c9"
+      ],
+      "expected_bad_candidates": [
+        "trk_c90de67ea2670f2b",
+        "trk_720756f548036572"
+      ],
+      "notes": "Maintain is sparse and weaker than some jump options. Good check that maintain can stay visible without pretending jump is the same thing."
+    },
+    {
+      "case_id": "talk_of_the_town_maintain",
+      "current_track_id": "trk_e1e0128796b785f6",
+      "current_track_label": "Fred again.., Sammy Virji, reggie - Talk Of The Town",
+      "requested_target": "maintain",
+      "expected_good_candidates": [
+        "trk_9db018ef2441bb89"
+      ],
+      "expected_bad_candidates": [
+        "trk_243359a9757ed4c9",
+        "trk_cd404b310a52ef44"
+      ],
+      "notes": "Build candidates currently outscore the maintain lane overall, but the maintain lane should still surface honestly for the requested target."
+    },
+    {
+      "case_id": "victory_lap_reset",
+      "current_track_id": "trk_c1f7e06106a9026e",
+      "current_track_label": "Fred again.., Skepta, PlaqueBoyMax - Victory Lap",
+      "requested_target": "reset",
+      "expected_good_candidates": [
+        "trk_9f80a20e89ad62da",
+        "trk_e7f5bdcfac2e2ddd"
+      ],
+      "expected_bad_candidates": [
+        "trk_f27e1d75122dfa8f",
+        "trk_720756f548036572"
+      ],
+      "questionable_candidates": [
+        "trk_e1c1f9c652bf9107",
+        "trk_89441451a44c4610"
+      ],
+      "notes": "Good check for reset meaning pressure drop or room reframe, not just any lateral high-pressure move. Questionable candidates need ear checks before retuning."
+    },
+    {
+      "case_id": "jungle_reset",
+      "current_track_id": "trk_1ca0c05340f9d8d9",
+      "current_track_label": "Fred again.. - Jungle",
+      "requested_target": "reset",
+      "expected_good_candidates": [
+        "trk_91f5fe23f643839f",
+        "trk_cd404b310a52ef44"
+      ],
+      "expected_bad_candidates": [
+        "trk_88b667bb7c5af347",
+        "trk_9453783e14da70c3"
+      ],
+      "notes": "Useful mid-to-high-pressure reset case. Helps separate actual relief moves from tracks that keep too much pressure on the floor."
+    }
+  ]
+}

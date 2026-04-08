@@ -33,9 +33,14 @@ def _row(position: int, *, track_id: str, file_path: str) -> dict[str, object]:
 
 def _settings() -> SimpleNamespace:
     analysis = SimpleNamespace(
+        sample_rate=22050,
+        mono=True,
+        key_backend="musicalkeycnn",
         key_model_path="python/models/musicalkeycnn/keynet.pt",
         key_device="auto",
         key_policy="full_track",
+        fast_pass_enabled=True,
+        analysis_signature_seed="test-seed",
         full_chunk_size=2,
         tempo_chunk_size=2,
         key_chunk_size=2,

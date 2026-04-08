@@ -13,6 +13,7 @@ import pyloudnorm as pyln
 from cuemate_analysis.config import RuntimeSettings, build_fast_analysis_signature
 from cuemate_analysis.essentia_semantic_backend import EssentiaSemanticEstimate
 from cuemate_analysis.models import AnalysisResult, FastAnalysisResult, ImportedTrack
+from cuemate_analysis.scoring import SCORING_CONTRACT_ID
 
 
 PITCH_CLASSES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
@@ -1200,13 +1201,7 @@ def compute_dsp_lane_result(
         bass_abs = extract_bass_ratio(artifacts=artifacts)
         time_signature = detect_time_signature(artifacts=artifacts)
 
-        # Removed from the critical path for throughput:
-        # extract_full_features(artifacts=artifacts)
-        full_features = {
-            "drums_abs": None,
-            "harmonic_abs": None,
-            "groove_abs": None,
-        }
+        full_features = extract_full_features(artifacts=artifacts)
 
         elapsed_ms = round((time.perf_counter() - started) * 1000.0, 1)
         return DspLaneResult.success(
@@ -1436,12 +1431,14 @@ def build_analysis_result(
         drums_abs=dsp_result.full_features["drums_abs"],
         harmonic_abs=dsp_result.full_features["harmonic_abs"],
         groove_abs=dsp_result.full_features["groove_abs"],
+        # Vocal separation is not implemented in the current analysis pipeline yet.
         vocals_abs=None,
         vocals_confidence=None,
         analysis_mode=analysis_mode,
         analyzed_at=utc_now(),
         analysis_signature=analysis_signature or settings.analysis_signature,
         config_signature=settings.config_signature,
+        scoring_contract_id_at_analysis=SCORING_CONTRACT_ID,
     )
 
 

@@ -55,7 +55,37 @@
       "tempo": 0.03,
       "history_fit": 0.03,
       "rhythmic_continuity": 0.02
-    }
+    },
+    "harmonic_confidence_floor": 0.15,
+    "thresholds": {
+      "bpm_hard": 8.0,
+      "bpm_hard_by_target": {
+        "maintain": 8.0,
+        "build": 12.0,
+        "jump": 20.0,
+        "reset": 20.0
+      },
+      "bpm_ratio_pass": ["half", "double", "three_two", "two_three"],
+      "bpm_soft": 3.0,
+      "cooldown_window": 5
+    },
+    "move_types": {
+      "jump_threshold": 0.12,
+      "build_threshold": 0.05,
+      "maintain_range": 0.05,
+      "reset_energy_threshold": -0.08,
+      "reset_vocal_threshold": 0.50,
+      "drop_threshold": -0.05
+    },
+    "penalties": {
+      "max_total_penalty": 0.80,
+      "bpm_over_soft": 0.30,
+      "key_mismatch": 0.45,
+      "vocal_clash": 0.35
+    },
+    "contrast_threshold": 0.45,
+    "secondary_contrast_threshold": 0.65,
+    "max_per_lane": 3
   },
   "weight_adaptation": {
     "mode": "auto",

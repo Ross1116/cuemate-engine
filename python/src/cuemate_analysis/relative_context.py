@@ -109,9 +109,9 @@ class RelativeTrackPreview:
     energy_source_used: str
     energy_rel: float
     bass_rel: float
-    drums_rel: float
+    drums_rel: float | None
     vocals_rel: float | None
-    groove_rel: float
+    groove_rel: float | None
     energy_spread: float
     bass_spread: float
     drums_spread: float
@@ -229,10 +229,11 @@ def percentile_spread(values: list[float]) -> float:
 def assign_intensity_band(
     energy_rel: float,
     vocal_rel: float | None,
-    drums_rel: float,
+    drums_rel: float | None,
     previous_band: str | None = None,
     previous_energy_rel: float | None = None,
 ) -> str:
+    d = 0.5 if drums_rel is None else drums_rel
     rules = [
         ("Peak", lambda e, v, d: e > 0.75),
         ("Drive", lambda e, v, d: e > 0.50),
@@ -241,7 +242,7 @@ def assign_intensity_band(
     ]
     candidate = "Low"
     for band_name, rule in rules:
-        if rule(energy_rel, vocal_rel, drums_rel):
+        if rule(energy_rel, vocal_rel, d):
             candidate = band_name
             break
     if (
@@ -257,8 +258,13 @@ def assign_intensity_band(
 def compute_intensity_membership(
     energy_rel: float,
     vocal_rel: float | None,
-    drums_rel: float,
+    drums_rel: float | None,
 ) -> dict[str, float]:
+    """Return soft membership across low/groove/drive/peak bands.
+
+    `drums_rel` is intentionally reserved for future shaping so callers can keep a
+    stable interface while the current heuristic stays energy-led.
+    """
     def gaussian(x: float, center: float, width: float) -> float:
         return math.exp(-0.5 * ((x - center) / max(width, 1e-6)) ** 2)
 
@@ -302,6 +308,8 @@ def assign_role_hints(
     if energy_rel > 0.80:
         roles.append("peak_tool")
     if not roles:
+        # Internal role-hint fallback only. The user-facing exploratory lane is
+        # "contrast"; recommendations should not rely on a visible wildcard lane.
         roles.append("wildcard_candidate")
     return roles
 
@@ -442,9 +450,6 @@ def compute_relative_playlist_preview(
         for row in analyzed_tracks
         if resolve_relative_energy_value(row, energy_source)[0] is not None
         and row.bass_abs is not None
-        and row.drums_abs is not None
-        and row.harmonic_abs is not None
-        and row.groove_abs is not None
         and row.bpm is not None
         and row.key is not None
     ]
@@ -502,9 +507,9 @@ def compute_relative_playlist_preview(
 
     energy_bounds = bounds(energy_values)
     bass_bounds = bounds(bass_values)
-    drums_bounds = bounds(drums_values)
-    groove_bounds = bounds(groove_values)
-    vocal_bounds = bounds(vocal_values) if vocal_values else (0.0, 1.0)
+    drums_bounds = bounds(drums_values) if drums_values else None
+    groove_bounds = bounds(groove_values) if groove_values else None
+    vocal_bounds = bounds(vocal_values) if vocal_values else None
 
     energy_spread = percentile_spread(energy_values)
     bass_spread = percentile_spread(bass_values)
@@ -523,9 +528,9 @@ def compute_relative_playlist_preview(
             continue
         energy_rel = robust_scale(effective_energy, *energy_bounds)
         bass_rel = robust_scale(float(track.bass_abs), *bass_bounds)
-        drums_rel = robust_scale(float(track.drums_abs), *drums_bounds)
-        groove_rel = robust_scale(float(track.groove_abs), *groove_bounds)
-        vocals_rel = robust_scale(float(track.vocals_abs), *vocal_bounds) if track.vocals_abs is not None and vocal_values else None
+        drums_rel = robust_scale(float(track.drums_abs), *drums_bounds) if track.drums_abs is not None and drums_bounds else None
+        groove_rel = robust_scale(float(track.groove_abs), *groove_bounds) if track.groove_abs is not None and groove_bounds else None
+        vocals_rel = robust_scale(float(track.vocals_abs), *vocal_bounds) if track.vocals_abs is not None and vocal_bounds else None
         previews.append(
             RelativeTrackPreview(
                 track_id=track.track_id,
@@ -537,9 +542,9 @@ def compute_relative_playlist_preview(
                 energy_source_used=energy_source_used,
                 energy_rel=round(energy_rel, 4),
                 bass_rel=round(bass_rel, 4),
-                drums_rel=round(drums_rel, 4),
+                drums_rel=None if drums_rel is None else round(drums_rel, 4),
                 vocals_rel=None if vocals_rel is None else round(vocals_rel, 4),
-                groove_rel=round(groove_rel, 4),
+                groove_rel=None if groove_rel is None else round(groove_rel, 4),
                 energy_spread=round(energy_spread, 4),
                 bass_spread=round(bass_spread, 4),
                 drums_spread=round(drums_spread, 4),
@@ -630,9 +635,11 @@ def _preview_to_db_rows(
             "position": track.position,
             "energy_rel": track.energy_rel,
             "bass_rel": track.bass_rel,
-            "drums_rel": track.drums_rel,
+            # Persist neutral defaults for dimensions the canonical preview loader
+            # reconstructs as non-null floats.
+            "drums_rel": 0.5 if track.drums_rel is None else track.drums_rel,
             "vocals_rel": track.vocals_rel,
-            "groove_rel": track.groove_rel,
+            "groove_rel": 0.5 if track.groove_rel is None else track.groove_rel,
             "energy_spread": track.energy_spread,
             "bass_spread": track.bass_spread,
             "drums_spread": track.drums_spread,

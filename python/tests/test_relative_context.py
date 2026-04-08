@@ -12,7 +12,11 @@ from cuemate_analysis.config import (
     WeightAdaptationSettings,
 )
 from cuemate_analysis.relative_context import (
+    PlaylistStatsPreview,
     RelativeTrackInput,
+    RelativePlaylistPreview,
+    RelativeTrackPreview,
+    _preview_to_db_rows,
     assign_intensity_band,
     assign_role_hints,
     compute_intensity_membership,
@@ -336,6 +340,50 @@ def test_relative_preview_computes_rows_but_skips_weights_for_small_eligible_pla
     assert preview.playlist_stats.adapted_weights is None
 
 
+def test_relative_preview_small_playlist_spreads_match_weight_profile_logic(tmp_path: Path) -> None:
+    database_path = tmp_path / "small_spreads.db"
+    settings = _settings_for_database(database_path)
+    rows = [
+        RelativeTrackInput(
+            playlist_id="plt_test",
+            playlist_name="SmallSpreads",
+            track_id=f"trk_{index}",
+            position=index,
+            file_path=f"D:/Music/trk_{index}.wav",
+            title=f"Track {index}",
+            artist="Artist",
+            has_absolute_analysis=True,
+            bpm=120.0 + index,
+            key="8A",
+            key_confidence=0.85,
+            key_source="musicalkeycnn",
+            key_agreement=1,
+            energy_abs=0.20 + (index * 0.05),
+            energy_heuristic_abs=0.20 + (index * 0.05),
+            energy_essentia_fused=None,
+            energy_essentia_bucket=None,
+            bass_abs=0.20 + (index * 0.03),
+            drums_abs=0.40,
+            harmonic_abs=0.35,
+            groove_abs=0.30 + (index * 0.02),
+            vocals_abs=None,
+            vocals_confidence=None,
+            analyzed_at="2026-04-04T00:00:00Z",
+            analysis_signature="m1-test",
+            config_signature="default",
+        )
+        for index in range(1, 6)
+    ]
+    preview = compute_relative_playlist_preview(
+        rows,
+        settings,
+        playlist_name="SmallSpreads",
+        is_limited=False,
+    )
+    assert preview.playlist_stats.drums_spread == 0.0
+    assert preview.playlist_stats.harmonic_spread == 0.0
+
+
 def test_relative_preview_computes_weights_for_large_playlist(tmp_path: Path) -> None:
     database_path = _create_relative_test_db(tmp_path, "Large", 12)
     settings = _settings_for_database(database_path)
@@ -368,6 +416,67 @@ def test_relative_preview_is_deterministic(tmp_path: Path) -> None:
     assert json.dumps(first, sort_keys=True) == json.dumps(second, sort_keys=True)
 
 
+def test_preview_to_db_rows_coalesces_missing_drums_and_groove() -> None:
+    preview = RelativePlaylistPreview(
+        playlist="Persist",
+        playlist_id="plt_test",
+        is_limited=False,
+        limited_track_count=1,
+        playlist_stats=PlaylistStatsPreview(
+            playlist_id="plt_test",
+            track_count_total=1,
+            track_count_analyzed=1,
+            eligible_track_count=1,
+            avg_harmonic=0.4,
+            key_diversity=0.1,
+            bpm_range=2.0,
+            energy_spread=0.2,
+            bass_spread=0.1,
+            drums_spread=0.0,
+            vocals_spread=0.3,
+            harmonic_spread=0.0,
+            groove_spread=0.2,
+            adapted_weights=None,
+            adaptation_strength=None,
+            weight_adaptation_notes=[],
+            status="relative_only",
+            energy_source_used="canonical",
+            relative_signature="sig",
+        ),
+        tracks=[
+            RelativeTrackPreview(
+                track_id="trk_1",
+                playlist_id="plt_test",
+                position=1,
+                title="Track 1",
+                artist="Artist",
+                file_path="D:/Music/trk_1.wav",
+                energy_source_used="canonical",
+                energy_rel=0.5,
+                bass_rel=0.5,
+                drums_rel=None,
+                vocals_rel=None,
+                groove_rel=None,
+                energy_spread=0.2,
+                bass_spread=0.1,
+                drums_spread=0.0,
+                vocals_spread=0.3,
+                groove_spread=0.2,
+                intensity_band="Groove",
+                intensity_membership={"low": 0.1, "groove": 0.8, "drive": 0.2, "peak": 0.0},
+                role_hints=["steady_energy"],
+                valid_as_of_track_count=1,
+                analyzed_at=None,
+                analysis_signature="m1-test",
+                config_signature="default",
+            )
+        ],
+    )
+    track_rows, _stats_row = _preview_to_db_rows(preview, "plt_test", "2026-04-04T00:00:00Z")
+    assert track_rows[0]["drums_rel"] == 0.5
+    assert track_rows[0]["groove_rel"] == 0.5
+
+
 def test_relative_preview_can_use_essentia_fused_with_heuristic_fallback(tmp_path: Path) -> None:
     database_path = tmp_path / "essentia.db"
     settings = _settings_for_database(database_path)
@@ -383,6 +492,9 @@ def test_relative_preview_can_use_essentia_fused_with_heuristic_fallback(tmp_pat
             has_absolute_analysis=True,
             bpm=120.0 + index,
             key="8A",
+            key_confidence=0.85,
+            key_source="musicalkeycnn",
+            key_agreement=1,
             energy_abs=0.20 + (index * 0.05),
             energy_heuristic_abs=0.20 + (index * 0.05),
             energy_essentia_fused=None if index == 1 else 0.15 + (index * 0.07),

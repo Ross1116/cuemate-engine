@@ -10,6 +10,7 @@ from pathlib import Path
 import sqlite3
 import sys
 import time
+from typing import Any
 import numpy as np
 
 from cuemate_analysis.analysis import (
@@ -1024,6 +1025,86 @@ def build_parser() -> argparse.ArgumentParser:
         help="Also remove the warm Docker model services so the next run is a true cold start.",
     )
 
+    recommend_next_parser = subparsers.add_parser(
+        "recommend-next",
+        help="Recommend next tracks from a playlist given a current track.",
+    )
+    recommend_next_parser.add_argument("--playlist", required=True, help="Playlist name.")
+    recommend_next_parser.add_argument(
+        "--current-track",
+        default=None,
+        help="Track ID to recommend from. Omit to use the first analyzed track in the playlist.",
+    )
+    recommend_next_parser.add_argument(
+        "--target",
+        choices=["maintain", "build", "reset", "jump", "contrast"],
+        default="maintain",
+        help="Desired move type / energy direction (default: maintain).",
+    )
+    recommend_next_parser.add_argument(
+        "--max-per-lane",
+        type=int,
+        default=3,
+        help="Maximum candidates per lane (default: 3).",
+    )
+    recommend_next_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit structured JSON to stdout.",
+    )
+
+    score_pair_parser = subparsers.add_parser(
+        "score-pair",
+        help="Score a specific current→candidate track pair and show the full breakdown.",
+    )
+    score_pair_parser.add_argument("--playlist", required=True, help="Playlist name.")
+    score_pair_parser.add_argument("--current", required=True, help="Current track ID.")
+    score_pair_parser.add_argument("--candidate", required=True, help="Candidate track ID.")
+    score_pair_parser.add_argument(
+        "--target",
+        choices=["maintain", "build", "reset", "jump", "contrast"],
+        default="maintain",
+        help="Move target for weight resolution (default: maintain).",
+    )
+    score_pair_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit structured JSON to stdout.",
+    )
+
+    inspect_weights_parser = subparsers.add_parser(
+        "inspect-scoring-weights",
+        help="Show effective scoring weights for a playlist.",
+    )
+    inspect_weights_parser.add_argument("--playlist", required=True, help="Playlist name.")
+    inspect_weights_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit structured JSON to stdout.",
+    )
+
+    inspect_metadata_parser = subparsers.add_parser(
+        "inspect-scoring-metadata",
+        help="Show active scoring metadata and optional artifact compatibility status.",
+    )
+    inspect_metadata_parser.add_argument(
+        "--analysis-signature",
+        help="Optional artifact analysis_signature to compare against the active scoring metadata.",
+    )
+    inspect_metadata_parser.add_argument(
+        "--config-signature",
+        help="Optional artifact config_signature to compare against the active scoring metadata.",
+    )
+    inspect_metadata_parser.add_argument(
+        "--scoring-contract-id-at-analysis",
+        help="Optional artifact scoring_contract_id_at_analysis to compare against the active scoring metadata.",
+    )
+    inspect_metadata_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit structured JSON to stdout.",
+    )
+
     benchmark_dsp_parser = subparsers.add_parser(
         "benchmark-dsp",
         help="Profile DSP pipeline substep timings for a playlist or explicit file paths.",
@@ -1940,6 +2021,39 @@ def _refresh_canonical_relative_preview(
     )
 
 
+def _ensure_scoring_relative_freshness(
+    playlist_name: str,
+    playlist_stats: dict[str, Any] | None,
+    settings: RuntimeSettings,
+) -> None:
+    """Fail fast when canonical relative artifacts are missing or stale for scoring."""
+    from cuemate_analysis.config import build_relative_experiment_signature
+
+    expected_relative_signature = build_relative_experiment_signature(
+        settings,
+        energy_source="canonical",
+    )
+
+    if playlist_stats is None:
+        raise SystemExit(
+            f"Playlist '{playlist_name}' has no persisted relative features. "
+            f"Run `python -m cuemate_analysis refresh-relative-playlist --playlist \"{playlist_name}\"` first."
+        )
+
+    if bool(playlist_stats.get("is_stale")):
+        reason = str(playlist_stats.get("stale_reason") or "stale")
+        raise SystemExit(
+            f"Playlist relative features are stale ({reason}); run "
+            f"`python -m cuemate_analysis refresh-relative-playlist --playlist \"{playlist_name}\"`."
+        )
+
+    if str(playlist_stats.get("relative_signature") or "") != expected_relative_signature:
+        raise SystemExit(
+            f"Playlist relative features are out of date for '{playlist_name}'; run "
+            f"`python -m cuemate_analysis refresh-relative-playlist --playlist \"{playlist_name}\"`."
+        )
+
+
 def handle_analyze_relative_playlist(args: argparse.Namespace) -> int:
     settings = load_runtime_settings()
 
@@ -2133,6 +2247,7 @@ def _load_persisted_canonical_preview(
         adaptation_strength=_opt_float(stats_row["adaptation_strength"]) if stats_row else None,
         weight_adaptation_notes=json.loads(str(stats_row["weight_adaptation_notes"])) if stats_row and stats_row["weight_adaptation_notes"] else [],
         status=str(stats_row["status"]) if stats_row else "insufficient_tracks",
+        energy_source_used="canonical",
         relative_signature=relative_sig,
     )
     return RelativePlaylistPreview(
@@ -2660,6 +2775,322 @@ def handle_benchmark_dsp(args: argparse.Namespace) -> int:
     return 0
 
 
+def handle_recommend_next(args: argparse.Namespace) -> int:
+    from cuemate_analysis.config import build_scoring_config
+    from cuemate_analysis.scoring import get_recommendations, row_to_scoring_track_context
+
+    settings = load_runtime_settings()
+    config = build_scoring_config(settings, target=args.target)
+
+    with Database(settings.database_path) as db:
+        playlist_row = db.get_playlist(args.playlist)
+        if playlist_row is None:
+            raise SystemExit(f"Playlist '{args.playlist}' was not found.")
+        playlist_id = str(playlist_row["id"])
+
+        playlist_stats = db.get_playlist_stats_for_scoring(playlist_id)
+        _ensure_scoring_relative_freshness(args.playlist, playlist_stats, settings)
+
+        candidate_rows = db.get_scoring_candidates(playlist_id)
+        if not candidate_rows:
+            raise SystemExit(f"No analyzed tracks found for playlist '{args.playlist}'.")
+
+        current_id = args.current_track
+        if current_id is None:
+            current_id = str(candidate_rows[0]["track_id"])
+
+        current_row = db.get_track_scoring_context(current_id, playlist_id)
+        if current_row is None:
+            raise SystemExit(f"Track '{current_id}' not found in playlist '{args.playlist}'.")
+        current = row_to_scoring_track_context(current_row)
+        candidates = [row_to_scoring_track_context(r) for r in candidate_rows]
+
+    if args.current_track is None and not args.json:
+        current_label = f"{current.artist} - {current.title}" if current.artist or current.title else current.track_id
+        print(f"No --current-track given; using first analyzed track: {current_label} [{current.track_id}]")
+
+    result = get_recommendations(
+        current,
+        candidates,
+        history=[],
+        config=config,
+        playlist_stats=playlist_stats,
+        target=args.target,
+        max_per_lane=args.max_per_lane,
+    )
+
+    if args.json:
+        # Serialize: replace ScoringTrackContext objects with their track_id
+        def _serialize(obj):
+            from cuemate_analysis.scoring import ScoringTrackContext
+            if isinstance(obj, ScoringTrackContext):
+                return obj.track_id
+            if isinstance(obj, dict):
+                return {k: _serialize(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [_serialize(i) for i in obj]
+            return obj
+
+        print(json.dumps(_serialize(result), indent=2))
+        return 0
+
+    # Human-readable output
+    conf = result["recommendation_confidence"]
+    meta = result["meta"]
+    current_label = f"{current.artist} - {current.title}" if current.artist or current.title else current.track_id
+    print(f"\nRecommendations for '{args.playlist}' | current: {current_label} [{current.track_id}]")
+    print(f"Target: {args.target}  |  Confidence: {conf:.2f}  |  Scored: {meta['scored_candidates']} tracks\n")
+    fallback_note = meta.get("fallback_note")
+    if fallback_note:
+        print(f"  Note: {fallback_note}\n")
+
+    for lane in result["lane_order"]:
+        items = result["lanes"].get(lane, [])
+        if not items:
+            continue
+        print(f"  [{lane.upper()}]")
+        for item in items:
+            cand = item["candidate"]
+            score = item["score"]
+            move = item["move"]
+            risk = item["risk"]
+            bpm_rel = item["transition_features"].get("effective_bpm_distance", 0.0)
+            key_label = item["transition_features"].get("key_compat_label", "—")
+            secondary = " (contrast)" if item.get("secondary_lane") else ""
+            cand_label = f"{cand.artist} - {cand.title}" if cand.artist or cand.title else cand.track_id
+            print(
+                f"    {cand_label} [{cand.track_id}]\n"
+                f"      score={score:.3f}  move={move:<8}  risk={risk:<6}  bpm_dist={bpm_rel:.1f}  key={key_label}{secondary}"
+            )
+        print()
+
+    return 0
+
+
+def handle_score_pair(args: argparse.Namespace) -> int:
+    from cuemate_analysis.config import build_scoring_config
+    from cuemate_analysis.scoring import row_to_scoring_track_context, score_candidate
+
+    settings = load_runtime_settings()
+    config = build_scoring_config(settings, target=args.target)
+
+    with Database(settings.database_path) as db:
+        playlist_row = db.get_playlist(args.playlist)
+        if playlist_row is None:
+            raise SystemExit(f"Playlist '{args.playlist}' was not found.")
+        playlist_id = str(playlist_row["id"])
+
+        playlist_stats = db.get_playlist_stats_for_scoring(playlist_id)
+        _ensure_scoring_relative_freshness(args.playlist, playlist_stats, settings)
+
+        current_row = db.get_track_scoring_context(args.current, playlist_id)
+        if current_row is None:
+            raise SystemExit(f"Track '{args.current}' not found in playlist '{args.playlist}'.")
+        candidate_row = db.get_track_scoring_context(args.candidate, playlist_id)
+        if candidate_row is None:
+            raise SystemExit(f"Track '{args.candidate}' not found in playlist '{args.playlist}'.")
+
+    current = row_to_scoring_track_context(current_row)
+    candidate = row_to_scoring_track_context(candidate_row)
+
+    result = score_candidate(
+        current=current,
+        candidate=candidate,
+        history=[],
+        config=config,
+        playlist_stats=playlist_stats,
+    )
+
+    if args.json:
+        def _serialize(obj):
+            from cuemate_analysis.scoring import ScoringTrackContext
+            if isinstance(obj, ScoringTrackContext):
+                return obj.track_id
+            if isinstance(obj, dict):
+                return {k: _serialize(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [_serialize(i) for i in obj]
+            return obj
+
+        print(json.dumps(_serialize(result), indent=2))
+        return 0
+
+    # Human-readable breakdown
+    def _track_label(t) -> str:
+        if t.artist or t.title:
+            return f"{t.artist} - {t.title} [{t.track_id}]"
+        return t.track_id
+
+    print(f"\nScore pair: {_track_label(current)}  ->  {_track_label(candidate)}")
+    print(f"  Final score:      {result['score']:.4f}  (raw: {result['raw_score']:.4f})")
+    print(f"  Penalty:          {result['penalty_multiplier']:.4f}")
+    print(f"  Move:             {result['move']} (confidence={result['move_confidence']:.2f})")
+    print(f"  Risk:             {result['risk']} (score={result['risk_score']:.3f})")
+    print(f"  Contrast score:   {result['contrast_score']:.3f}")
+
+    print("\n  Transition features:")
+    for k, v in sorted(result["transition_features"].items()):
+        print(f"    {k:<32}  {v}")
+
+    print("\n  Component scores:")
+    for k, v in sorted(result["component_scores"].items()):
+        w = result["weights_used"].get(k, 0.0)
+        c = result["confidences"].get(k, 1.0)
+        if v is None:
+            print(f"    {k:<24}  {'stub':<8}  weight={w:.4f}  (not implemented)")
+        else:
+            print(f"    {k:<24}  {v:.4f}  weight={w:.4f}  conf={c:.4f}")
+
+    if result["penalty_factors"]:
+        print("\n  Penalty factors:")
+        for factor in result["penalty_factors"]:
+            name = factor.get("factor", "unknown")
+            penalty = factor.get("effective_penalty", factor.get("raw_penalty", ""))
+            severity = factor.get("severity", "")
+            print(f"    {name:<28}  penalty={penalty}  severity={severity}")
+
+    if result["risk_factors"]:
+        print("\n  Risk factors:")
+        for note in result["risk_factors"]:
+            print(f"    {note}")
+
+    stub_components = sorted(
+        name for name, value in result["component_scores"].items() if value is None
+    )
+    current_vocals_rel = result["transition_features"].get("current_vocals_rel")
+    candidate_vocals_rel = result["transition_features"].get("candidate_vocals_rel")
+    if stub_components or current_vocals_rel is None or candidate_vocals_rel is None:
+        print("\n  Notes:")
+        if stub_components:
+            joined = ", ".join(stub_components)
+            print(f"    Stubbed and excluded from weighted scoring: {joined}.")
+        if current_vocals_rel is None or candidate_vocals_rel is None:
+            print(
+                "    vocals_abs / vocals_rel are not populated yet; missing vocal fields are unknown, not silence."
+            )
+
+    return 0
+
+
+def handle_inspect_scoring_weights(args: argparse.Namespace) -> int:
+    from cuemate_analysis.config import build_scoring_config
+    from cuemate_analysis.scoring import resolve_effective_weights
+
+    settings = load_runtime_settings()
+    config = build_scoring_config(settings, target="maintain")
+
+    with Database(settings.database_path) as db:
+        playlist_row = db.get_playlist(args.playlist)
+        if playlist_row is None:
+            raise SystemExit(f"Playlist '{args.playlist}' was not found.")
+        playlist_id = str(playlist_row["id"])
+        playlist_stats = db.get_playlist_stats_for_scoring(playlist_id)
+        _ensure_scoring_relative_freshness(args.playlist, playlist_stats, settings)
+
+    static_weights = config["static_weights"]
+    adapted_weights = (playlist_stats or {}).get("adapted_weights") if playlist_stats else None
+    effective_weights = resolve_effective_weights(playlist_stats, config)
+
+    if args.json:
+        print(json.dumps({
+            "playlist": args.playlist,
+            "static_weights": static_weights,
+            "adapted_weights": adapted_weights,
+            "effective_weights": effective_weights,
+            "weight_floors": config["weight_floors"],
+        }, indent=2))
+        return 0
+
+    print(f"\nScoring weights for '{args.playlist}'\n")
+    print(f"  {'Component':<24}  {'Static':>8}  {'Adapted':>8}  {'Effective':>9}")
+    print(f"  {'-'*24}  {'-'*8}  {'-'*8}  {'-'*9}")
+    for key in sorted(static_weights):
+        s = static_weights.get(key, 0.0)
+        a = (adapted_weights or {}).get(key) if adapted_weights else None
+        e = effective_weights.get(key, s)
+        a_str = f"{a:.4f}" if a is not None else "    —   "
+        print(f"  {key:<24}  {s:>8.4f}  {a_str:>8}  {e:>9.4f}")
+
+    if adapted_weights:
+        print("\n  Adaptation is active (playlist has adapted_weights).")
+    else:
+        print("\n  No adaptation — using static weights.")
+
+    return 0
+
+
+def handle_inspect_scoring_metadata(args: argparse.Namespace) -> int:
+    from cuemate_analysis.scoring import check_analysis_compatibility, get_scoring_metadata
+
+    settings = load_runtime_settings()
+    metadata = get_scoring_metadata(settings)
+
+    compatibility = None
+    if (
+        args.analysis_signature is not None
+        or args.config_signature is not None
+        or args.scoring_contract_id_at_analysis is not None
+    ):
+        compatibility = check_analysis_compatibility(
+            args.analysis_signature,
+            args.config_signature,
+            args.scoring_contract_id_at_analysis,
+            scoring_metadata=metadata,
+        )
+
+    if args.json:
+        payload: dict[str, object] = {"metadata": metadata}
+        if compatibility is not None:
+            payload["compatibility"] = compatibility
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    active = metadata["active_signatures"]
+    print("\nScoring metadata\n")
+    print(f"  analysis_signature:   {active['analysis_signature']}")
+    print(f"  config_signature:     {active['config_signature']}")
+    print(f"  scoring_contract_id:  {active['scoring_contract_id']}")
+    print(f"  engine_version:       {metadata['engine_version']}")
+    print(f"  healthy:              {metadata['healthy']}")
+    print(f"  status_note:          {metadata['status_note']}")
+
+    print("\n  Capability flags:")
+    for key, value in sorted(metadata["capability_flags"].items()):
+        print(f"    {key:<32} {value}")
+
+    print("\n  Supported lanes:")
+    for lane in metadata["supported_lane_groups"]:
+        print(f"    {lane['lane_id']:<10} {lane['summary']}")
+
+    print("\n  Components:")
+    for component in metadata["components"]:
+        available = component.get("available")
+        active = component.get("active")
+        if available is False:
+            state = "stubbed"
+        elif active is False:
+            state = "inactive"
+        else:
+            state = "active"
+        print(
+            f"    {component['component_id']:<24} weight={component['weight']:.4f}  state={state:<8}  {component['description']}"
+        )
+
+    if compatibility is not None:
+        print("\n  Compatibility:")
+        print(f"    exact_match:         {compatibility['exact_match']}")
+        print(f"    compatible:          {compatibility['compatible']}")
+        print(f"    requires_reanalysis: {compatibility['requires_reanalysis']}")
+        print(f"    reason:              {compatibility['reason']}")
+        notes = compatibility.get("notes", [])
+        if notes:
+            print("    notes:")
+            for note in notes:
+                print(f"      {note}")
+
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -2703,6 +3134,14 @@ def main(argv: list[str] | None = None) -> int:
             return handle_purge_model_cache(args)
         if args.command == "benchmark-dsp":
             return handle_benchmark_dsp(args)
+        if args.command == "recommend-next":
+            return handle_recommend_next(args)
+        if args.command == "score-pair":
+            return handle_score_pair(args)
+        if args.command == "inspect-scoring-weights":
+            return handle_inspect_scoring_weights(args)
+        if args.command == "inspect-scoring-metadata":
+            return handle_inspect_scoring_metadata(args)
     except sqlite3.OperationalError as exc:
         message = str(exc)
         if "no such table" in message.lower():

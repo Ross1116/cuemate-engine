@@ -692,11 +692,13 @@ class TestGenerateTempoKeySummary:
 
     def test_double_time(self):
         result = generate_tempo_key_summary(64.0, 128.0, "8B", "8B")
-        assert "double" in result["tempo_text"].lower() or "time" in result["tempo_text"]
+        tempo_text = result["tempo_text"].lower()
+        assert "half time" in tempo_text or "half-time" in tempo_text
 
     def test_half_time(self):
         result = generate_tempo_key_summary(128.0, 64.0, "8B", "8B")
-        assert "half" in result["tempo_text"].lower() or "time" in result["tempo_text"]
+        tempo_text = result["tempo_text"].lower()
+        assert "double time" in tempo_text or "double-time" in tempo_text
 
     def test_creative_pivot(self):
         result = generate_tempo_key_summary(128.0, 85.3, "8B", "8B")
@@ -896,7 +898,10 @@ class TestBuildLiveCandidateExplanation:
             None,
             None,
         )
-        assert "both mostly instrumental" not in result["character_shift"]
+        assert not any(
+            "both mostly instrumental" in note.lower()
+            for note in result["character_shift"]
+        )
 
     def test_language_policy(self):
         result = build_live_candidate_explanation(

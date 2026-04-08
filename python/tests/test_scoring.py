@@ -561,6 +561,13 @@ class TestContrastScore:
         s = contrast_score(r_a, r_b)
         assert 0.0 <= s <= 1.0
 
+    def test_preserves_zero_values(self):
+        r_a = {"energy_rel": 0.0, "bass_rel": 0.0, "vocals_rel": 0.0,
+               "groove_rel": 0.0, "role_hints": []}
+        r_b = {"energy_rel": 0.0, "bass_rel": 0.0, "vocals_rel": 0.0,
+               "groove_rel": 0.0, "role_hints": []}
+        assert contrast_score(r_a, r_b) == 0.0
+
 
 # ---------------------------------------------------------------------------
 # Key trust / build_confidence_map
@@ -851,6 +858,12 @@ class TestClassifyMove:
         assert name == "reset"
         assert conf == 0.75
         assert note == "reframe"
+
+    def test_reset_vocal_reframe_path_uses_config_threshold(self):
+        name, conf, note = classify_move(-0.06, 0.0, 0.2, 0.65, None, _DEFAULT_CONFIG)
+        assert name == "reset"
+        assert conf == 0.75
+        assert note == "vocal reframe"
 
     def test_drop(self):
         name, conf, _ = classify_move(-0.08, 0.0, 0.2, 0.2, None, _DEFAULT_CONFIG)

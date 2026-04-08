@@ -35,6 +35,10 @@ EXPANDED_MAX_WATCH = 3
 EXPANDED_MAX_HANDOFF = 1  # one handoff block per candidate
 
 
+def _coalesce_numeric(value: float | None, default: float) -> float:
+    return default if value is None else value
+
+
 # ---------------------------------------------------------------------------
 # 20.4  Core candidate reasons
 # ---------------------------------------------------------------------------
@@ -115,8 +119,8 @@ def generate_window_advisory(
     if window_features is None:
         return None
 
-    clean = window_features.get("cleanliness_abs", 0.5) or 0.5
-    bass = window_features.get("bass_abs", 0.5) or 0.5
+    clean = _coalesce_numeric(window_features.get("cleanliness_abs"), 0.5)
+    bass = _coalesce_numeric(window_features.get("bass_abs"), 0.5)
     vocals = window_features.get("vocals_abs")
     early_vocal = window_features.get("early_vocal_entry_seconds")
 
@@ -175,12 +179,12 @@ def generate_handoff_narrative(
     if current_outro is None or candidate_intro is None:
         return None
 
-    cur_vocal = current_outro.get("vocals_abs") or 0.0
-    cur_clean = current_outro.get("cleanliness_abs", 0.5) or 0.5
-    cur_low = current_outro.get("low_end_occupancy", 0.5) or 0.5
-    cand_bass = candidate_intro.get("bass_abs", 0.5) or 0.5
-    cand_vocal = candidate_intro.get("vocals_abs") or 0.0
-    cand_clean = candidate_intro.get("cleanliness_abs", 0.5) or 0.5
+    cur_vocal = _coalesce_numeric(current_outro.get("vocals_abs"), 0.0)
+    cur_clean = _coalesce_numeric(current_outro.get("cleanliness_abs"), 0.5)
+    cur_low = _coalesce_numeric(current_outro.get("low_end_occupancy"), 0.5)
+    cand_bass = _coalesce_numeric(candidate_intro.get("bass_abs"), 0.5)
+    cand_vocal = _coalesce_numeric(candidate_intro.get("vocals_abs"), 0.0)
+    cand_clean = _coalesce_numeric(candidate_intro.get("cleanliness_abs"), 0.5)
 
     notes: list[str] = []
     level = "green"
@@ -240,9 +244,9 @@ def generate_outro_summary(
         return None
 
     parts: list[str] = []
-    bass = outro_window.get("bass_abs", 0.5) or 0.5
+    bass = _coalesce_numeric(outro_window.get("bass_abs"), 0.5)
     vocals = outro_window.get("vocals_abs")
-    clean = outro_window.get("cleanliness_abs", 0.5) or 0.5
+    clean = _coalesce_numeric(outro_window.get("cleanliness_abs"), 0.5)
 
     if bass > 0.65:
         parts.append("bass heavy")
@@ -286,7 +290,7 @@ def compute_set_trend(history: list[dict[str, Any]]) -> dict[str, str]:
     if len(history) < 2:
         return {"label": "just started", "direction": "unknown"}
 
-    energies = [h.get("energy_rel", 0.5) or 0.5 for h in history]
+    energies = [_coalesce_numeric(h.get("energy_rel"), 0.5) for h in history]
 
     if len(energies) < 3:
         delta = energies[-1] - energies[0]
@@ -625,7 +629,8 @@ def build_live_candidate_explanation(
         current_track / candidate_track: dicts with at minimum bpm, key, role_hints,
             vocals_rel, bass_rel, energy_rel, and a "move" key on candidate_track.
         transition_features: output of compute_transition_features()
-        scores: component_scores dict from score_candidate()
+        scores: score_candidate() result payload or component-score-like dict.
+            Risk notes are read from top-level `risk_factors` when present.
         current_outro_window / candidate_intro_window: windowed feature dicts or None
         history_context: unused in v1 (reserved for session-level notes)
     Output:
@@ -657,12 +662,12 @@ def build_live_candidate_explanation(
         candidate_energy_rel=candidate_track.get("energy_rel"),
     )
 
-    # Watchouts: handoff warnings first, then risk flags
+    # Watchouts: handoff warnings first, then scorer risk factors
     watch: list[str] = []
     if handoff and handoff["level"] in ("yellow", "orange"):
         watch.extend(handoff["notes"][:COMPACT_MAX_WATCHOUTS])
-    risk_flags = scores.get("risk_flags") or []
-    for flag in risk_flags:
+    risk_factors = scores.get("risk_factors") or scores.get("risk_flags") or []
+    for flag in risk_factors:
         if len(watch) >= EXPANDED_MAX_WATCH:
             break
         watch.append(flag)

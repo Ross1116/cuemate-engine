@@ -73,6 +73,12 @@ class ThresholdSettings:
 
 @dataclass(frozen=True)
 class ScoringSettings:
+    """Scoring config payload for build_scoring_config().
+
+    __post_init__ uses object.__setattr__ because this frozen dataclass still needs
+    per-instance mutable defaults for thresholds, move_types, and penalties without
+    sharing a single dict across instances.
+    """
     static_weights: dict[str, float]
     weight_floors: dict[str, float]
     harmonic_confidence_floor: float = 0.15

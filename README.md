@@ -8,6 +8,7 @@ Today, the repository is primarily a **Python-first analysis engine** with:
 - staged BPM/key analysis for fast feedback
 - background enrichment for absolute features
 - persisted relative playlist context
+- live recommendation/scoring lanes and pair diagnostics
 - Docker-backed model workers for BPM, key, and semantic mood/intensity analysis
 
 The Go and protobuf layers are present for the later recommendation/API surfaces, but the current working core lives in the Python analysis plane.
@@ -19,6 +20,12 @@ Implemented today:
 - Milestone 1 absolute analysis
 - Milestone 2 Phase 1 relative-context logic
 - Milestone 2 Phase 2 persisted relative context + refresh/orchestration
+- Milestone 3 recommendation/scoring core:
+  - target-aware candidate scoring
+  - lane organization (`maintain`, `build`, `reset`, `jump`, `contrast`)
+  - recommendation confidence
+  - pair scoring diagnostics
+  - scoring metadata and compatibility checks
 - staged analysis pipeline:
   - `fast_pass`
   - `staged` (default)
@@ -27,15 +34,12 @@ Implemented today:
 Deferred for now:
 
 - windowed intro/outro analysis
-- recommendation/scoring engine implementation
-
-Next major milestone:
-
-- Milestone 3: live recommendation core
+- Go/gRPC runtime wiring
+- recommendation outcome logging / feedback loop
 
 ## Architecture
 
-The current pipeline is split into 4 main layers:
+The current pipeline is split into 5 main layers:
 
 1. Import/catalog
 - imports local playlists or DJ-library playlists from Rekordbox XML, Traktor NML, and Serato crates
@@ -55,6 +59,11 @@ The current pipeline is split into 4 main layers:
 - persists canonical rows into:
   - `track_features_rel`
   - `playlist_stats`
+
+5. Recommendation/scoring
+- ranks next-track candidates from precomputed absolute + relative context
+- organizes results into move lanes
+- exposes CLI inspection surfaces for recommendations, score breakdowns, weights, and scoring metadata
 
 ## Repository Layout
 
@@ -145,6 +154,7 @@ Current important tables:
   - fast-stage BPM/key results for immediate feedback
 - `track_features_abs`
   - canonical absolute analysis rows
+  - includes `analysis_signature`, `config_signature`, and `scoring_contract_id_at_analysis`
 - `track_features_rel`
   - canonical persisted relative playlist rows
 - `playlist_stats`
@@ -199,6 +209,11 @@ Current split:
   - `energy_essentia_fused`
   - `energy_essentia_bucket`
 
+- scoring compatibility metadata:
+  - `analysis_signature`
+  - `config_signature`
+  - `scoring_contract_id_at_analysis`
+
 ### Canonical relative layer
 
 Persisted in:
@@ -207,6 +222,23 @@ Persisted in:
 - `playlist_stats`
 
 The canonical relative read path is persisted-first. Relative rows are refreshed after successful enrichment or via `refresh-relative-playlist`.
+
+### Recommendation/scoring layer
+
+Current recommendation output is lane-based and target-aware:
+
+- `maintain`
+- `build`
+- `reset`
+- `jump`
+- `contrast`
+
+Current scoring metadata also exposes:
+
+- active scoring contract id
+- compatible analysis/config signatures
+- component availability/active state
+- capability flags for known gaps such as unavailable vocals/window features
 
 ## Model Runtime Topology
 
@@ -381,6 +413,16 @@ python -m cuemate_analysis analyze-relative-playlist --playlist "Fred again" --e
 python -m cuemate_analysis refresh-relative-playlist --playlist "Fred again"
 ```
 
+### Recommendation/scoring workflows
+
+```powershell
+python -m cuemate_analysis recommend-next --playlist "Fred again" --current-track trk_example123 --target maintain
+python -m cuemate_analysis score-pair --playlist "Fred again" --current trk_example123 --candidate trk_example456 --target reset
+python -m cuemate_analysis inspect-scoring-weights --playlist "Fred again"
+python -m cuemate_analysis inspect-scoring-metadata
+python -m cuemate_analysis inspect-scoring-metadata --json
+```
+
 ### Essentia semantic workflows
 
 ```powershell
@@ -444,9 +486,10 @@ python -m cuemate_analysis benchmark-dsp --path "D:\Music\track.flac"
 
 ## Known Boundaries
 
-- the recommendation/scoring engine is not implemented yet
 - Go runtime/API surfaces are still placeholders
 - windowed intro/outro analysis is intentionally deferred
+- `transition_support`, `vocal_transition`, and `rhythmic_continuity` are still explicit stubs and are excluded from weighted scoring
+- `vocals_abs` / `vocals_rel` are not populated by the current analysis pipeline yet, so vocal-dependent recommendation logic remains limited
 - some metadata imported from DJ libraries or file tags can still be wrong; the current resolver uses provenance + confidence heuristics rather than treating any source as perfect
 - Essentia semantic calibration infrastructure exists, but semantic validation/tuning is still ongoing
 
@@ -456,10 +499,12 @@ Done:
 
 - Milestone 1 absolute analysis
 - Milestone 2 persisted relative context
+- Milestone 3 Python recommendation/scoring core
 
 Next:
 
-- Milestone 3 recommendation/scoring core
+- Go/gRPC integration on top of the Python scoring contract
+- recommendation outcome logging and tuning loop
 
 Later:
 

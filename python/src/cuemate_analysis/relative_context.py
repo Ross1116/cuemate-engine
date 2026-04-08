@@ -260,6 +260,11 @@ def compute_intensity_membership(
     vocal_rel: float | None,
     drums_rel: float | None,
 ) -> dict[str, float]:
+    """Return soft membership across low/groove/drive/peak bands.
+
+    `drums_rel` is intentionally reserved for future shaping so callers can keep a
+    stable interface while the current heuristic stays energy-led.
+    """
     def gaussian(x: float, center: float, width: float) -> float:
         return math.exp(-0.5 * ((x - center) / max(width, 1e-6)) ** 2)
 

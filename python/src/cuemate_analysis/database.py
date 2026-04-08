@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 import re
 import sqlite3
 from typing import Any, Iterable
 
 from cuemate_analysis.models import AnalysisResult, FastAnalysisResult, ImportedTrack
+
+
+logger = logging.getLogger(__name__)
 
 
 class Database:
@@ -799,7 +803,12 @@ class Database:
         are also excluded (used to remove the current track and history).
         """
         exclusions = list(exclude_track_ids or [])
-        placeholders = ", ".join("?" * len(exclusions)) if exclusions else "'__none__'"
+        exclusion_clause = ""
+        params: list[Any] = [playlist_id]
+        if exclusions:
+            placeholders = ", ".join("?" * len(exclusions))
+            exclusion_clause = f"\n              AND t.id NOT IN ({placeholders})"
+            params.extend(exclusions)
         query = f"""
             SELECT
               t.id          AS track_id,
@@ -832,10 +841,9 @@ class Database:
             LEFT JOIN track_features_rel r
               ON r.track_id = t.id AND r.playlist_id = pt.playlist_id
             WHERE pt.playlist_id = ?
-              AND t.id NOT IN ({placeholders})
+              {exclusion_clause}
             ORDER BY pt.position ASC
         """
-        params: list[Any] = [playlist_id] + exclusions
         return self.connection.execute(query, params).fetchall()
 
     def get_track_scoring_context(
@@ -898,8 +906,18 @@ class Database:
         if isinstance(raw_weights, str):
             try:
                 result["adapted_weights"] = json.loads(raw_weights)
-            except (json.JSONDecodeError, TypeError):
-                result["adapted_weights"] = None
+            except (json.JSONDecodeError, TypeError) as exc:
+                logger.exception(
+                    "Invalid adapted_weights JSON in playlist_stats",
+                    extra={
+                        "playlist_id": result.get("playlist_id"),
+                        "relative_signature": result.get("relative_signature"),
+                        "raw_weights": raw_weights,
+                    },
+                )
+                raise ValueError(
+                    f"Corrupted adapted_weights for playlist '{result.get('playlist_id')}': {raw_weights!r}"
+                ) from exc
         return result
 
     def get_analysis_jobs_by_ids(self, job_ids: Iterable[int]) -> list[sqlite3.Row]:

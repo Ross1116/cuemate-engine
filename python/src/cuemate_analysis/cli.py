@@ -1032,7 +1032,7 @@ def build_parser() -> argparse.ArgumentParser:
     recommend_next_parser.add_argument(
         "--current-track",
         default=None,
-        help="Track ID to recommend from. Omit to use the first track in the playlist.",
+        help="Track ID to recommend from. Omit to use the first analyzed track in the playlist.",
     )
     recommend_next_parser.add_argument(
         "--target",
@@ -2020,6 +2020,39 @@ def _refresh_canonical_relative_preview(
     )
 
 
+def _ensure_scoring_relative_freshness(
+    playlist_name: str,
+    playlist_stats: dict[str, Any] | None,
+    settings: RuntimeSettings,
+) -> None:
+    """Fail fast when canonical relative artifacts are missing or stale for scoring."""
+    from cuemate_analysis.config import build_relative_experiment_signature
+
+    expected_relative_signature = build_relative_experiment_signature(
+        settings,
+        energy_source="canonical",
+    )
+
+    if playlist_stats is None:
+        raise SystemExit(
+            f"Playlist '{playlist_name}' has no persisted relative features. "
+            f"Run `python -m cuemate_analysis refresh-relative-playlist --playlist \"{playlist_name}\"` first."
+        )
+
+    if bool(playlist_stats.get("is_stale")):
+        reason = str(playlist_stats.get("stale_reason") or "stale")
+        raise SystemExit(
+            f"Playlist relative features are stale ({reason}); run "
+            f"`python -m cuemate_analysis refresh-relative-playlist --playlist \"{playlist_name}\"`."
+        )
+
+    if str(playlist_stats.get("relative_signature") or "") != expected_relative_signature:
+        raise SystemExit(
+            f"Playlist relative features are out of date for '{playlist_name}'; run "
+            f"`python -m cuemate_analysis refresh-relative-playlist --playlist \"{playlist_name}\"`."
+        )
+
+
 def handle_analyze_relative_playlist(args: argparse.Namespace) -> int:
     settings = load_runtime_settings()
 
@@ -2767,12 +2800,13 @@ def handle_recommend_next(args: argparse.Namespace) -> int:
             raise SystemExit(f"Track '{current_id}' not found in playlist '{args.playlist}'.")
 
         playlist_stats = db.get_playlist_stats_for_scoring(playlist_id)
+        _ensure_scoring_relative_freshness(args.playlist, playlist_stats, settings)
         current = row_to_scoring_track_context(current_row)
         candidates = [row_to_scoring_track_context(r) for r in candidate_rows]
 
     if args.current_track is None and not args.json:
         current_label = f"{current.artist} - {current.title}" if current.artist or current.title else current.track_id
-        print(f"No --current-track given; using first track: {current_label} [{current.track_id}]")
+        print(f"No --current-track given; using first analyzed track: {current_label} [{current.track_id}]")
 
     result = get_recommendations(
         current,
@@ -2853,6 +2887,7 @@ def handle_score_pair(args: argparse.Namespace) -> int:
             raise SystemExit(f"Track '{args.candidate}' not found in playlist '{args.playlist}'.")
 
         playlist_stats = db.get_playlist_stats_for_scoring(playlist_id)
+        _ensure_scoring_relative_freshness(args.playlist, playlist_stats, settings)
 
     current = row_to_scoring_track_context(current_row)
     candidate = row_to_scoring_track_context(candidate_row)

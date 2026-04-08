@@ -87,7 +87,17 @@ class _FakeDB:
         return {"track_id": track_id}
 
     def get_playlist_stats_for_scoring(self, playlist_id: str):
-        return None
+        return {"is_stale": False, "relative_signature": "sig-current"}
+
+
+class _FakeWeightsDB(_FakeDB):
+    def get_playlist_stats_for_scoring(self, playlist_id: str):
+        return {
+            "adapted_weights": {
+                "target_energy": 0.31,
+                "harmonic": 0.08,
+            }
+        }
 
 
 def test_organize_into_lanes_promotes_best_lane_when_target_missing():
@@ -119,6 +129,10 @@ def test_recommend_next_prints_fallback_note_when_target_lane_is_empty(monkeypat
     monkeypatch.setattr(
         "cuemate_analysis.cli.load_runtime_settings",
         lambda: SimpleNamespace(database_path=Path("fake.db")),
+    )
+    monkeypatch.setattr(
+        "cuemate_analysis.config.build_relative_experiment_signature",
+        lambda settings, energy_source="canonical": "sig-current",
     )
     monkeypatch.setattr("cuemate_analysis.cli.Database", lambda _: _FakeDB())
     monkeypatch.setattr("cuemate_analysis.config.build_scoring_config", lambda settings, target: {"target": target})
@@ -172,6 +186,10 @@ def test_score_pair_prints_stub_and_missing_vocal_notes(monkeypatch, capsys):
     monkeypatch.setattr(
         "cuemate_analysis.cli.load_runtime_settings",
         lambda: SimpleNamespace(database_path=Path("fake.db")),
+    )
+    monkeypatch.setattr(
+        "cuemate_analysis.config.build_relative_experiment_signature",
+        lambda settings, energy_source="canonical": "sig-current",
     )
     monkeypatch.setattr("cuemate_analysis.cli.Database", lambda _: _FakeDB())
     monkeypatch.setattr("cuemate_analysis.config.build_scoring_config", lambda settings, target: {"target": target})
@@ -341,3 +359,77 @@ def test_inspect_scoring_metadata_text_with_compatibility(monkeypatch, capsys):
     assert "state=active" in out
     assert "compatible_but_not_exact" in out
     assert "legacy artifact is still allowed" in out
+
+
+def test_inspect_scoring_weights_json(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "cuemate_analysis.cli.load_runtime_settings",
+        lambda: SimpleNamespace(database_path=Path("fake.db")),
+    )
+    monkeypatch.setattr("cuemate_analysis.cli.Database", lambda _: _FakeWeightsDB())
+    monkeypatch.setattr(
+        "cuemate_analysis.config.build_scoring_config",
+        lambda settings, target: {
+            "static_weights": {"target_energy": 0.22, "harmonic": 0.12},
+            "weight_floors": {"target_energy": 0.08, "harmonic": 0.04},
+        },
+    )
+
+    assert main(["inspect-scoring-weights", "--playlist", "Test Playlist", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["effective_weights"]["target_energy"] == 0.31
+    assert payload["effective_weights"]["harmonic"] == 0.08
+    assert payload["weight_floors"]["target_energy"] == 0.08
+
+
+def test_inspect_scoring_weights_text(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "cuemate_analysis.cli.load_runtime_settings",
+        lambda: SimpleNamespace(database_path=Path("fake.db")),
+    )
+    monkeypatch.setattr("cuemate_analysis.cli.Database", lambda _: _FakeWeightsDB())
+    monkeypatch.setattr(
+        "cuemate_analysis.config.build_scoring_config",
+        lambda settings, target: {
+            "static_weights": {"target_energy": 0.22, "harmonic": 0.12},
+            "weight_floors": {"target_energy": 0.08, "harmonic": 0.04},
+        },
+    )
+
+    assert main(["inspect-scoring-weights", "--playlist", "Test Playlist"]) == 0
+    out = capsys.readouterr().out
+    assert "Scoring weights for 'Test Playlist'" in out
+    assert "target_energy" in out
+    assert "0.3100" in out
+    assert "Adaptation is active" in out
+
+
+def test_recommend_next_requires_fresh_relative_artifacts(monkeypatch, capsys):
+    class _StaleDB(_FakeDB):
+        def get_playlist_stats_for_scoring(self, playlist_id: str):
+            return {
+                "is_stale": True,
+                "stale_reason": "playlist_membership_changed",
+                "relative_signature": "sig-current",
+            }
+
+    monkeypatch.setattr(
+        "cuemate_analysis.cli.load_runtime_settings",
+        lambda: SimpleNamespace(database_path=Path("fake.db")),
+    )
+    monkeypatch.setattr(
+        "cuemate_analysis.config.build_relative_experiment_signature",
+        lambda settings, energy_source="canonical": "sig-current",
+    )
+    monkeypatch.setattr("cuemate_analysis.cli.Database", lambda _: _StaleDB())
+    monkeypatch.setattr(
+        "cuemate_analysis.config.build_scoring_config",
+        lambda settings, target: {"target": target},
+    )
+    monkeypatch.setattr(
+        "cuemate_analysis.scoring.row_to_scoring_track_context",
+        lambda row: _ctx(track_id=row["track_id"], title=row["track_id"]),
+    )
+
+    assert main(["recommend-next", "--playlist", "Test Playlist", "--target", "maintain"]) == 1
+    assert "Playlist relative features are stale" in capsys.readouterr().err

@@ -226,6 +226,10 @@ class TestGenerateWindowAdvisory:
         result = generate_window_advisory(_window(cleanliness_abs=0.20), "intro_32")
         assert result["level"] == "orange"
 
+    def test_zero_cleanliness_is_preserved(self):
+        result = generate_window_advisory(_window(cleanliness_abs=0.0), "intro_32")
+        assert result["level"] == "orange"
+
     def test_bass_carrying_outro_escalates(self):
         result = generate_window_advisory(
             _window(cleanliness_abs=0.90, bass_abs=0.70), "outro_32"
@@ -790,6 +794,17 @@ class TestBuildLiveCandidateExplanation:
             _track(), _track(), _tf(), _scores(), outro, intro
         )
         assert len(result["watch"]) > 0
+
+    def test_risk_factors_are_added_to_watch(self):
+        result = build_live_candidate_explanation(
+            _track(),
+            _track(),
+            _tf(),
+            {**_scores(), "risk_factors": ["Higher harmonic tension"]},
+            None,
+            None,
+        )
+        assert "Higher harmonic tension" in result["watch"]
 
     def test_language_policy(self):
         result = build_live_candidate_explanation(

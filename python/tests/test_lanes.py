@@ -447,3 +447,20 @@ class TestGetRecommendations:
         ]
         assert "trk_A" not in all_ids
         assert "trk_B" in all_ids
+
+    def test_history_accepts_scoring_track_context_items(self):
+        current = self._make_current()
+        history = [
+            _ctx(track_id="trk_hist_1", bpm=128.0, key="8A", energy_rel=0.30),
+            _ctx(track_id="trk_hist_2", bpm=128.0, key="8B", energy_rel=0.35),
+        ]
+        candidates = [
+            _ctx(track_id="trk_A", bpm=128.0, key="9A", energy_rel=0.02),
+        ]
+        out = get_recommendations(current, candidates, history, _default_config())
+        all_ids = [
+            r["candidate"].track_id
+            for lane_items in out["lanes"].values()
+            for r in lane_items
+        ]
+        assert "trk_A" in all_ids

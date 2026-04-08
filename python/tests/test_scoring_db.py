@@ -235,7 +235,11 @@ def fixture_db(tmp_path: Path):
     conn.commit()
     conn.close()
 
-    return Database(db_path)
+    db = Database(db_path)
+    try:
+        yield db
+    finally:
+        db.close()
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +360,25 @@ class TestGetPlaylistStatsForScoring:
         assert stats is not None
         assert stats["adapted_weights"] is None
         db.close()
+
+    def test_malformed_adapted_weights_raises(self, tmp_path):
+        db_path = tmp_path / "bad_weights.db"
+        conn = _bootstrap_db(db_path)
+        _insert_track(conn, track_id="trk_x", position=1)
+        _insert_playlist_stats(conn, adapted_weights=None)
+        conn.execute(
+            "UPDATE playlist_stats SET adapted_weights = ? WHERE playlist_id = ?",
+            ("{not-json", _PLAYLIST_ID),
+        )
+        conn.commit()
+        conn.close()
+
+        db = Database(db_path)
+        try:
+            with pytest.raises(ValueError, match="Corrupted adapted_weights"):
+                db.get_playlist_stats_for_scoring(_PLAYLIST_ID)
+        finally:
+            db.close()
 
 
 # ---------------------------------------------------------------------------

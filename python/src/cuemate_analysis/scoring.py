@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, is_dataclass
 from typing import Any
 
 from cuemate_analysis import __version__
@@ -637,21 +637,21 @@ def contrast_score(
     Will be added to weighted scoring only after v1 ranking is validated.
     """
     dims: list[tuple[str, float, float]] = []
-    energy_delta = abs(
-        (current_rel.get("energy_rel") or 0.5) - (candidate_rel.get("energy_rel") or 0.5)
-    )
+    current_energy = current_rel.get("energy_rel") if current_rel.get("energy_rel") is not None else 0.5
+    candidate_energy = candidate_rel.get("energy_rel") if candidate_rel.get("energy_rel") is not None else 0.5
+    energy_delta = abs(current_energy - candidate_energy)
     dims.append(("energy", energy_delta, 0.30))
-    vocal_delta = abs(
-        (current_rel.get("vocals_rel") or 0.0) - (candidate_rel.get("vocals_rel") or 0.0)
-    )
+    current_vocals = current_rel.get("vocals_rel") if current_rel.get("vocals_rel") is not None else 0.0
+    candidate_vocals = candidate_rel.get("vocals_rel") if candidate_rel.get("vocals_rel") is not None else 0.0
+    vocal_delta = abs(current_vocals - candidate_vocals)
     dims.append(("vocal", vocal_delta, 0.20))
-    bass_delta = abs(
-        (current_rel.get("bass_rel") or 0.5) - (candidate_rel.get("bass_rel") or 0.5)
-    )
+    current_bass = current_rel.get("bass_rel") if current_rel.get("bass_rel") is not None else 0.5
+    candidate_bass = candidate_rel.get("bass_rel") if candidate_rel.get("bass_rel") is not None else 0.5
+    bass_delta = abs(current_bass - candidate_bass)
     dims.append(("bass", bass_delta, 0.20))
-    groove_delta = abs(
-        (current_rel.get("groove_rel") or 0.5) - (candidate_rel.get("groove_rel") or 0.5)
-    )
+    current_groove = current_rel.get("groove_rel") if current_rel.get("groove_rel") is not None else 0.5
+    candidate_groove = candidate_rel.get("groove_rel") if candidate_rel.get("groove_rel") is not None else 0.5
+    groove_delta = abs(current_groove - candidate_groove)
     dims.append(("groove", groove_delta, 0.10))
     cur_roles = set(current_rel.get("role_hints") or [])
     cand_roles = set(candidate_rel.get("role_hints") or [])
@@ -1003,8 +1003,8 @@ def filter_candidates(
 def classify_move(
     delta_energy_rel: float,
     delta_bass_rel: float,
-    vocal_current_rel: float,
-    vocal_candidate_rel: float,
+    vocal_current_rel: float | None,
+    vocal_candidate_rel: float | None,
     energy_spread: float | None,
     config: dict[str, Any] | None,
 ) -> tuple[str, float, str | None]:
@@ -1035,11 +1035,16 @@ def classify_move(
         return "build", 0.85, None
     # Reset = room reframe / pressure drop.  Two paths:
     #   (a) clear energy drop — the classic pressure release
-    #   (b) moderate dip with bass relief — reframe without cliff
+    #   (b) moderate dip with bass relief or vocal reframing
+    candidate_vocal_reset = (
+        vocal_candidate_rel is not None and vocal_candidate_rel >= reset_v_t
+    )
     if delta_energy_rel < reset_e_t:
         return "reset", 0.90, None
     if delta_energy_rel < drop_t and delta_bass_rel < -0.05:
         return "reset", 0.75, "reframe"
+    if delta_energy_rel < drop_t and candidate_vocal_reset:
+        return "reset", 0.75, "vocal reframe"
     if delta_energy_rel < drop_t:
         return "drop", 0.80, None
     if abs(delta_energy_rel) <= maintain_t:
@@ -1162,8 +1167,8 @@ def score_candidate(
     move_name, move_confidence, move_note = classify_move(
         transition_features["delta_energy_rel"],
         transition_features.get("delta_bass_rel", 0.0),
-        current.vocals_rel or 0.0,
-        candidate.vocals_rel or 0.0,
+        current.vocals_rel,
+        candidate.vocals_rel,
         (playlist_stats or {}).get("energy_spread"),
         config,
     )
@@ -1372,7 +1377,7 @@ def compute_recommendation_confidence(
 def get_recommendations(
     current_track: ScoringTrackContext,
     candidates: list[ScoringTrackContext],
-    history: list[ScoringTrackContext],
+    history: list[dict[str, Any] | ScoringTrackContext],
     config: dict[str, Any],
     playlist_stats: dict[str, Any] | None = None,
     target: str = "maintain",
@@ -1396,10 +1401,19 @@ def get_recommendations(
             }
         }
     """
-    cfg = {**config, "max_per_lane": max_per_lane}
+    normalized_history: list[dict[str, Any]] = []
+    for item in history:
+        if isinstance(item, dict):
+            normalized_history.append(item)
+        elif is_dataclass(item):
+            normalized_history.append(asdict(item))
+        else:
+            normalized_history.append(dict(item))
+
+    cfg = {**config, "max_per_lane": max_per_lane, "target": target}
 
     # Filter candidates (removes current track, cooldown, BPM hard limit)
-    filtered = filter_candidates(current_track, candidates, history, cfg, target=target)
+    filtered = filter_candidates(current_track, candidates, normalized_history, cfg, target=target)
 
     # Score each candidate
     scored: list[dict[str, Any]] = []
@@ -1407,7 +1421,7 @@ def get_recommendations(
         result = score_candidate(
             current=current_track,
             candidate=candidate,
-            history=history,
+            history=normalized_history,
             config=cfg,
             playlist_stats=playlist_stats,
         )

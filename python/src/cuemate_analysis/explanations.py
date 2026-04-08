@@ -188,11 +188,11 @@ def generate_handoff_narrative(
     if current_outro is None or candidate_intro is None:
         return None
 
-    cur_vocal = _coalesce_numeric(current_outro.get("vocals_abs"), 0.0)
+    cur_vocal = current_outro.get("vocals_abs")
     cur_clean = _coalesce_numeric(current_outro.get("cleanliness_abs"), 0.5)
     cur_low = _coalesce_numeric(current_outro.get("low_end_occupancy"), 0.5)
     cand_bass = _coalesce_numeric(candidate_intro.get("bass_abs"), 0.5)
-    cand_vocal = _coalesce_numeric(candidate_intro.get("vocals_abs"), 0.0)
+    cand_vocal = candidate_intro.get("vocals_abs")
     cand_clean = _coalesce_numeric(candidate_intro.get("cleanliness_abs"), 0.5)
 
     notes: list[str] = []
@@ -206,14 +206,14 @@ def generate_handoff_narrative(
         notes.append("Some low-end overlap — still manageable")
         level = "yellow"
 
-    vocal_product = cur_vocal * cand_vocal
-    if vocal_product > 0.25:
+    vocal_product = 0.0 if cur_vocal is None or cand_vocal is None else cur_vocal * cand_vocal
+    if cur_vocal is not None and cand_vocal is not None and vocal_product > 0.25:
         notes.append("Both have vocal content in the overlap zone — demanding handoff")
         if level != "orange":
             level = "yellow"
-    elif cur_vocal > 0.5 and cand_vocal < 0.15:
+    elif cur_vocal is not None and cand_vocal is not None and cur_vocal > 0.5 and cand_vocal < 0.15:
         notes.append("Outgoing vocals fade while the incoming intro stays mostly instrumental")
-    elif cur_vocal < 0.15 and cand_vocal > 0.5:
+    elif cur_vocal is not None and cand_vocal is not None and cur_vocal < 0.15 and cand_vocal > 0.5:
         notes.append("Vocal content arrives with the incoming track")
 
     if cur_clean < 0.4 and cand_clean > 0.7:

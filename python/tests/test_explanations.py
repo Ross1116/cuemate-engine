@@ -325,6 +325,13 @@ class TestGenerateHandoffNarrative:
         result = generate_handoff_narrative(outro, intro)
         assert any("vocal content arrives" in n.lower() for n in result["notes"])
 
+    def test_unknown_vocals_do_not_emit_vocal_handoff_notes(self):
+        outro = _window(vocals_abs=None)
+        intro = _window(vocals_abs=0.70)
+        result = generate_handoff_narrative(outro, intro)
+        assert result["vocal_clash"] == 0.0
+        assert not any("vocal" in n.lower() for n in result["notes"])
+
     def test_clean_handoff_both_open(self):
         outro = _window(cleanliness_abs=0.90, low_end_occupancy=0.10, vocals_abs=0.05)
         intro = _window(cleanliness_abs=0.90, bass_abs=0.10, vocals_abs=0.05)

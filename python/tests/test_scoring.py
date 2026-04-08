@@ -531,6 +531,16 @@ class TestHistoryFitScore:
         history = [{"key": "8A", "energy_rel": 0.5}] * 10
         assert history_fit_score(c, history) >= 0.0
 
+    def test_unknown_energies_do_not_trigger_stagnation(self):
+        c = _track(track_id="t6", key="9A")
+        history = [
+            {"key": "5B", "energy_rel": None},
+            {"key": "6A", "energy_rel": None},
+            {"key": "7B", "energy_rel": None},
+            {"key": "8A", "energy_rel": 0.3},
+        ]
+        assert history_fit_score(c, history) == 1.0
+
 
 # ---------------------------------------------------------------------------
 # contrast_score

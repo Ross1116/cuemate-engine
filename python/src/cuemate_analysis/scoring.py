@@ -613,13 +613,10 @@ def history_fit_score(
         for i, h in enumerate(reversed(recent))
         if h.get("key") == candidate.key
     )
-    energies = [
-        h.get("energy_rel") if h.get("energy_rel") is not None else 0.5
-        for h in recent
-    ]
+    measured_energies = [h.get("energy_rel") for h in recent if h.get("energy_rel") is not None]
     stagnation = (
         0.2
-        if len(set(round(e, 1) for e in energies)) <= 2 and len(energies) >= 3
+        if len(set(round(e, 1) for e in measured_energies)) <= 2 and len(measured_energies) >= 3
         else 0.0
     )
     return max(0.0, 1.0 - key_penalty - stagnation)
@@ -1481,8 +1478,11 @@ def get_recommendations(
     if ranked:
         all_confs: list[float] = []
         for r in ranked:
-            for v in (r.get("confidences") or {}).values():
-                all_confs.append(float(v))
+            component_scores = r.get("component_scores") or {}
+            for feature, value in (r.get("confidences") or {}).items():
+                if component_scores.get(feature) is None:
+                    continue
+                all_confs.append(float(value))
         avg_feature_conf = sum(all_confs) / len(all_confs) if all_confs else 1.0
     else:
         avg_feature_conf = 1.0

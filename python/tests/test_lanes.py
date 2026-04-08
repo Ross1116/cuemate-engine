@@ -464,3 +464,61 @@ class TestGetRecommendations:
             for r in lane_items
         ]
         assert "trk_A" in all_ids
+
+    def test_avg_feature_conf_ignores_stubbed_components(self, monkeypatch):
+        current = self._make_current()
+        candidates = [_ctx(track_id="trk_A", bpm=128.0, key="8B", energy_rel=0.02)]
+        captured: dict[str, float] = {}
+
+        def fake_score_candidate(*args, **kwargs):
+            return {
+                "candidate": candidates[0],
+                "score": 0.8,
+                "raw_score": 0.8,
+                "penalty_multiplier": 1.0,
+                "penalty_factors": [],
+                "risk": "low",
+                "risk_score": 0.1,
+                "risk_factors": [],
+                "move": "maintain",
+                "move_confidence": 0.9,
+                "move_note": None,
+                "contrast_score": 0.1,
+                "component_scores": {
+                    "target_energy": 0.9,
+                    "transition_support": None,
+                    "bass_transition": 0.8,
+                    "vocal_transition": None,
+                    "harmonic": 0.9,
+                    "tempo": 1.0,
+                    "history_fit": 1.0,
+                    "rhythmic_continuity": None,
+                },
+                "transition_features": {},
+                "confidences": {
+                    "target_energy": 0.5,
+                    "transition_support": 1.0,
+                    "bass_transition": 0.5,
+                    "vocal_transition": 1.0,
+                    "harmonic": 0.5,
+                    "tempo": 0.5,
+                    "history_fit": 0.5,
+                    "rhythmic_continuity": 1.0,
+                },
+                "weights_used": {},
+                "secondary_lane": False,
+            }
+
+        def fake_recommendation_confidence(ranked_results, analysis_coverage=1.0, avg_feature_conf=1.0):
+            captured["avg_feature_conf"] = avg_feature_conf
+            return 0.42
+
+        monkeypatch.setattr("cuemate_analysis.scoring.score_candidate", fake_score_candidate)
+        monkeypatch.setattr(
+            "cuemate_analysis.scoring.compute_recommendation_confidence",
+            fake_recommendation_confidence,
+        )
+
+        out = get_recommendations(current, candidates, [], _default_config())
+        assert out["recommendation_confidence"] == 0.42
+        assert captured["avg_feature_conf"] == pytest.approx(0.5)

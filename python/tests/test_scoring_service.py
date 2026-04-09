@@ -190,15 +190,20 @@ def test_get_recommendations_matches_direct_scorer(scoring_proto_runtime):
         channel.close()
         server.stop(None)
 
-    assert list(response.lane_order) == direct["lane_order"]
+    assert list(response.lane_order) == ["build", "maintain", "reset", "jump", "contrast"]
     assert response.meta.current_track_id == direct["meta"]["current_track_id"]
     assert response.meta.fallback_note == (direct["meta"]["fallback_note"] or "")
     assert response.recommendation_confidence == pytest.approx(direct["recommendation_confidence"], abs=1e-6)
-    top_lane = response.lanes[0]
+    lane_map = {lane.lane_group.lane_id: lane for lane in response.lanes}
+    assert lane_map["build"].availability == "empty"
+    assert lane_map["build"].empty_reason
     direct_top = direct["lanes"][direct["lane_order"][0]][0]
+    top_lane = lane_map[direct["lane_order"][0]]
     assert top_lane.items[0].candidate.track_id == direct_top["candidate"].track_id
     assert top_lane.items[0].move == direct_top["move"]
     assert top_lane.items[0].final_score == pytest.approx(direct_top["score"], abs=1e-6)
+    assert top_lane.items[0].ranking_strength >= 0.0
+    assert list(top_lane.items[0].reasons)
 
 
 def test_score_candidate_matches_direct_scorer(scoring_proto_runtime):
@@ -279,6 +284,7 @@ def test_get_scoring_metadata_matches_direct_metadata(scoring_proto_runtime):
     assert response.active_signatures.scoring_contract_id == direct["active_signatures"]["scoring_contract_id"]
     assert response.engine_version == direct["engine_version"]
     assert response.status_note == direct["status_note"]
+    assert response.expected_relative_signature == direct["expected_relative_signature"]
     component_states = {item.component_id: item.status for item in response.components}
     assert component_states["transition_support"] == "stubbed"
 

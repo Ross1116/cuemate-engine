@@ -381,9 +381,14 @@ def get_scoring_metadata(
         from cuemate_analysis.config import load_runtime_settings
 
         settings = load_runtime_settings()
+    from cuemate_analysis.config import build_relative_experiment_signature
 
     active_analysis_signature = str(getattr(settings, "analysis_signature"))
     active_config_signature = str(getattr(settings, "config_signature"))
+    expected_relative_signature = build_relative_experiment_signature(
+        settings,
+        energy_source="canonical",
+    )
     active_weights = dict(getattr(settings, "scoring").static_weights)
     metadata_status_note = status_note or (
         "Python scoring core metadata. "
@@ -422,6 +427,7 @@ def get_scoring_metadata(
         "healthy": healthy,
         "engine_version": __version__,
         "status_note": metadata_status_note,
+        "expected_relative_signature": expected_relative_signature,
     }
 
 

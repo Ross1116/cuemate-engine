@@ -34,6 +34,10 @@ Implemented today:
   - Go protobuf/gRPC client bootstrap
   - `scoringctl` smoke CLI for metadata and fixture-driven score calls
   - Go proto/codegen workflow
+- Milestone 4 Go live API slice:
+  - Go HTTP API server for `/recommendations`, `/scoring/metadata`, `/healthz`, and `/readyz`
+  - SQLite hydration of live scoring inputs
+  - scorer readiness/circuit-breaker handling in the decision plane
 - staged analysis pipeline:
   - `fast_pass`
   - `staged` (default)
@@ -101,7 +105,7 @@ The current pipeline is split into 5 main layers:
 |  |- stack-decisions.md
 |
 |- go/
-|  |- cmd/                               # Go smoke/debug entrypoints
+|  |- cmd/                               # Go API + smoke/debug entrypoints
 |  |- internal/                          # Go client/bootstrap packages
 |  |- gen/                               # Generated Go artifacts
 |  |- README.md
@@ -431,8 +435,10 @@ python -m cuemate_analysis inspect-scoring-weights --playlist "Fred again"
 python -m cuemate_analysis inspect-scoring-metadata
 python -m cuemate_analysis inspect-scoring-metadata --json
 python -m cuemate_analysis serve-scoring --host 127.0.0.1 --port 47834
+go run ./go/cmd/apiserver
 go run ./go/cmd/scoringctl metadata
 go run ./go/cmd/scoringctl score --fixture .\go\testdata\score_candidate.json
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8080/recommendations -ContentType "application/json" -Body '{"playlist_name":"Fred again","current_track_id":"trk_example123","target":"build"}'
 ```
 
 ### Essentia semantic workflows
@@ -500,7 +506,7 @@ python -m cuemate_analysis benchmark-dsp --path "D:\Music\track.flac"
 
 ## Known Boundaries
 
-- Go decision-plane transport bootstrap exists, but API/server orchestration is still placeholder-only
+- Go decision plane now serves a read-only live recommendations API, but write/event surfaces are still deferred
 - windowed intro/outro analysis is intentionally deferred
 - `transition_support`, `vocal_transition`, and `rhythmic_continuity` are still explicit stubs and are excluded from weighted scoring
 - `vocals_abs` / `vocals_rel` are not populated by the current analysis pipeline yet, so vocal-dependent recommendation logic remains limited
@@ -517,8 +523,8 @@ Done:
 
 Next:
 
-- Go decision-plane/API wiring on top of the new scoring client bootstrap
 - recommendation outcome logging and tuning loop
+- write/event surfaces on the Go decision plane (`/events/played`, corrections, sync/export)
 
 Later:
 

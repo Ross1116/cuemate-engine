@@ -175,6 +175,33 @@ def test_recommend_next_prints_fallback_note_when_target_lane_is_empty(monkeypat
     assert out.index("[RESET]") < out.index("[JUMP]")
 
 
+def test_serve_scoring_cli_delegates_to_service(monkeypatch):
+    import cuemate_analysis.scoring_service as scoring_service
+
+    called: dict[str, object] = {}
+
+    monkeypatch.setattr("cuemate_analysis.cli.load_runtime_settings", lambda: SimpleNamespace())
+
+    def _fake_serve_scoring_grpc(*, host, port, settings, max_workers):
+        called["host"] = host
+        called["port"] = port
+        called["settings"] = settings
+        called["max_workers"] = max_workers
+        return 0
+
+    monkeypatch.setattr(scoring_service, "serve_scoring_grpc", _fake_serve_scoring_grpc)
+
+    rc = main(["serve-scoring", "--host", "0.0.0.0", "--port", "50051", "--max-workers", "2"])
+
+    assert rc == 0
+    assert called == {
+        "host": "0.0.0.0",
+        "port": 50051,
+        "settings": SimpleNamespace(),
+        "max_workers": 2,
+    }
+
+
 def test_score_pair_prints_stub_and_missing_vocal_notes(monkeypatch, capsys):
     current = _ctx(track_id="trk_current", title="Current", vocals_rel=None)
     candidate = _ctx(track_id="trk_candidate", title="Candidate", vocals_rel=None)

@@ -11,7 +11,7 @@ Today, the repository is primarily a **Python-first analysis engine** with:
 - live recommendation/scoring lanes and pair diagnostics
 - Docker-backed model workers for BPM, key, and semantic mood/intensity analysis
 
-The Go and protobuf layers are present for the later recommendation/API surfaces, but the current working core lives in the Python analysis plane.
+The Go and protobuf layers are now present as the service boundary for the scorer, but the current working core still lives in the Python analysis plane.
 
 ## Current State
 
@@ -26,6 +26,10 @@ Implemented today:
   - recommendation confidence
   - pair scoring diagnostics
   - scoring metadata and compatibility checks
+- Milestone 4 Python scoring service slice:
+  - protobuf scoring contract revised to match the live scorer
+  - local gRPC scoring service runtime
+  - Python proto/codegen workflow
 - staged analysis pipeline:
   - `fast_pass`
   - `staged` (default)
@@ -34,7 +38,7 @@ Implemented today:
 Deferred for now:
 
 - windowed intro/outro analysis
-- Go/gRPC runtime wiring
+- Go client/runtime wiring
 - recommendation outcome logging / feedback loop
 
 ## Architecture
@@ -63,7 +67,7 @@ The current pipeline is split into 5 main layers:
 5. Recommendation/scoring
 - ranks next-track candidates from precomputed absolute + relative context
 - organizes results into move lanes
-- exposes CLI inspection surfaces for recommendations, score breakdowns, weights, and scoring metadata
+- exposes CLI inspection surfaces for recommendations, score breakdowns, weights, scoring metadata, and a local gRPC scoring service
 
 ## Repository Layout
 
@@ -120,6 +124,7 @@ The current pipeline is split into 5 main layers:
 |  |  |- models.py                       # Dataclasses / result shapes
 |  |  |- config.py                       # Runtime config loading + signatures
 |  |  |- dsp_benchmark.py                # DSP benchmark harness
+|  |- src/djengine/                      # Generated Python protobuf/gRPC artifacts
 |  |- tests/                             # Python test suite
 |  |- pyproject.toml
 |  |- README.md
@@ -416,11 +421,13 @@ python -m cuemate_analysis refresh-relative-playlist --playlist "Fred again"
 ### Recommendation/scoring workflows
 
 ```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\compile-proto.ps1
 python -m cuemate_analysis recommend-next --playlist "Fred again" --current-track trk_example123 --target maintain
 python -m cuemate_analysis score-pair --playlist "Fred again" --current trk_example123 --candidate trk_example456 --target reset
 python -m cuemate_analysis inspect-scoring-weights --playlist "Fred again"
 python -m cuemate_analysis inspect-scoring-metadata
 python -m cuemate_analysis inspect-scoring-metadata --json
+python -m cuemate_analysis serve-scoring --host 127.0.0.1 --port 47834
 ```
 
 ### Essentia semantic workflows
@@ -477,6 +484,8 @@ Compile protobuf contract:
 powershell -ExecutionPolicy Bypass -File .\scripts\compile-proto.ps1
 ```
 
+The compile helper runs `buf lint`, writes `data/scoring.pb`, and generates Python gRPC stubs into `python/src/djengine/`.
+
 Benchmark local DSP:
 
 ```powershell
@@ -503,7 +512,7 @@ Done:
 
 Next:
 
-- Go/gRPC integration on top of the Python scoring contract
+- Go client/runtime integration on top of the Python scoring service
 - recommendation outcome logging and tuning loop
 
 Later:

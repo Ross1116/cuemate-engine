@@ -1105,6 +1105,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Emit structured JSON to stdout.",
     )
 
+    serve_scoring_parser = subparsers.add_parser(
+        "serve-scoring",
+        help="Run the Python scoring gRPC service.",
+    )
+    serve_scoring_parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Host interface to bind (default: 127.0.0.1).",
+    )
+    serve_scoring_parser.add_argument(
+        "--port",
+        type=int,
+        default=47834,
+        help="Port to bind (default: 47834).",
+    )
+    serve_scoring_parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=8,
+        help="gRPC worker thread count (default: 8).",
+    )
+
     benchmark_dsp_parser = subparsers.add_parser(
         "benchmark-dsp",
         help="Profile DSP pipeline substep timings for a playlist or explicit file paths.",
@@ -3091,6 +3113,18 @@ def handle_inspect_scoring_metadata(args: argparse.Namespace) -> int:
     return 0
 
 
+def handle_serve_scoring(args: argparse.Namespace) -> int:
+    from cuemate_analysis.scoring_service import serve_scoring_grpc
+
+    settings = load_runtime_settings()
+    return serve_scoring_grpc(
+        host=args.host,
+        port=args.port,
+        settings=settings,
+        max_workers=args.max_workers,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -3142,6 +3176,8 @@ def main(argv: list[str] | None = None) -> int:
             return handle_inspect_scoring_weights(args)
         if args.command == "inspect-scoring-metadata":
             return handle_inspect_scoring_metadata(args)
+        if args.command == "serve-scoring":
+            return handle_serve_scoring(args)
     except sqlite3.OperationalError as exc:
         message = str(exc)
         if "no such table" in message.lower():

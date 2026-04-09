@@ -1,0 +1,449 @@
+from __future__ import annotations
+
+from concurrent import futures
+from typing import Any
+
+import grpc
+
+from cuemate_analysis.config import build_scoring_config, load_runtime_settings
+from cuemate_analysis.scoring import (
+    SUPPORTED_LANE_GROUPS,
+    ScoringTrackContext,
+    check_analysis_compatibility,
+    get_recommendations,
+    get_scoring_metadata,
+    resolve_effective_weights,
+    score_candidate,
+)
+from cuemate_analysis.scoring_proto import load_scoring_proto_modules
+
+
+DEFAULT_SCORING_SERVICE_HOST = "127.0.0.1"
+DEFAULT_SCORING_SERVICE_PORT = 47834
+_VALID_TARGETS = {"maintain", "build", "reset", "jump", "contrast"}
+
+
+def _lane_display(lane_id: str) -> dict[str, str]:
+    for lane in SUPPORTED_LANE_GROUPS:
+        if lane["lane_id"] == lane_id:
+            return lane
+    return {
+        "lane_id": lane_id,
+        "display_name": lane_id.title(),
+        "summary": "",
+    }
+
+
+def _optional_float(message: Any, field_name: str) -> float | None:
+    return float(getattr(message, field_name)) if message.HasField(field_name) else None
+
+
+def _optional_int(message: Any, field_name: str) -> int | None:
+    return int(getattr(message, field_name)) if message.HasField(field_name) else None
+
+
+def _get_track_signatures(message: Any) -> tuple[str | None, str | None, str | None]:
+    if not message.HasField("signatures"):
+        return None, None, None
+    sig = message.signatures
+    return (
+        sig.analysis_signature or None,
+        sig.config_signature or None,
+        sig.scoring_contract_id or None,
+    )
+
+
+def _track_from_proto(message: Any) -> ScoringTrackContext:
+    return ScoringTrackContext(
+        track_id=message.track_id,
+        bpm=float(message.bpm),
+        key=message.musical_key or None,
+        key_confidence=_optional_float(message, "key_confidence"),
+        key_source=message.key_source or None,
+        key_agreement=_optional_int(message, "key_agreement"),
+        energy_rel=_optional_float(message, "energy_rel"),
+        bass_rel=_optional_float(message, "bass_rel"),
+        drums_rel=_optional_float(message, "drums_rel"),
+        vocals_rel=_optional_float(message, "vocals_rel"),
+        groove_rel=_optional_float(message, "groove_rel"),
+        intensity_band=message.intensity_band or None,
+        role_hints=list(message.role_hints),
+        title=message.title or None,
+        artist=message.artist or None,
+    )
+
+
+def _history_from_proto(items: Any) -> list[dict[str, Any]]:
+    history: list[dict[str, Any]] = []
+    for item in items:
+        history.append(
+            {
+                "track_id": item.track_id,
+                "id": item.track_id,
+                "key": item.musical_key or None,
+                "energy_rel": _optional_float(item, "energy_rel"),
+                "relation": item.relation or None,
+                "plays_ago": item.plays_ago or None,
+                "elapsed_since_play_seconds": (
+                    float(item.elapsed_since_play_seconds)
+                    if item.elapsed_since_play_seconds
+                    else None
+                ),
+            }
+        )
+    return history
+
+
+def _playlist_stats_from_proto(message: Any) -> dict[str, Any] | None:
+    if message is None:
+        return None
+    payload: dict[str, Any] = {}
+    if message.HasField("energy_spread"):
+        payload["energy_spread"] = float(message.energy_spread)
+    if message.adapted_weights:
+        payload["adapted_weights"] = dict(message.adapted_weights)
+    return payload or None
+
+
+def _active_signatures_payload(settings: Any) -> dict[str, str]:
+    metadata = get_scoring_metadata(settings)
+    return dict(metadata["active_signatures"])
+
+
+def _aggregate_compatibility(track_messages: list[Any], settings: Any) -> dict[str, Any]:
+    exact_match = True
+    compatible = True
+    requires_reanalysis = False
+    notes: list[str] = []
+    reason = "exact_match"
+
+    for track_message in track_messages:
+        if not track_message.track_id:
+            raise ValueError("track_id is required for all scoring tracks.")
+        analysis_sig, config_sig, scoring_contract_id = _get_track_signatures(track_message)
+        status = check_analysis_compatibility(
+            analysis_sig,
+            config_sig,
+            scoring_contract_id,
+            settings=settings,
+        )
+        if not status["compatible"]:
+            return status
+        exact_match = exact_match and bool(status["exact_match"])
+        compatible = compatible and bool(status["compatible"])
+        requires_reanalysis = requires_reanalysis or bool(status["requires_reanalysis"])
+        if status["reason"] != "exact_match" and reason == "exact_match":
+            reason = status["reason"]
+        notes.extend(status.get("notes", []))
+
+    return {
+        "exact_match": exact_match,
+        "compatible": compatible,
+        "requires_reanalysis": requires_reanalysis,
+        "reason": reason,
+        "notes": notes,
+    }
+
+
+def _set_signature_fields(target: Any, payload: dict[str, Any]) -> None:
+    target.analysis_signature = str(payload.get("analysis_signature", "") or "")
+    target.config_signature = str(payload.get("config_signature", "") or "")
+    target.scoring_contract_id = str(payload.get("scoring_contract_id", "") or "")
+
+
+def _set_track_message(
+    target: Any,
+    candidate: ScoringTrackContext,
+    *,
+    source_message: Any | None = None,
+) -> None:
+    target.track_id = candidate.track_id
+    target.bpm = float(candidate.bpm)
+    if candidate.key is not None:
+        target.musical_key = candidate.key
+    if candidate.key_confidence is not None:
+        target.key_confidence = float(candidate.key_confidence)
+    if candidate.key_source is not None:
+        target.key_source = candidate.key_source
+    if candidate.key_agreement is not None:
+        target.key_agreement = int(candidate.key_agreement)
+    if candidate.energy_rel is not None:
+        target.energy_rel = float(candidate.energy_rel)
+    if candidate.bass_rel is not None:
+        target.bass_rel = float(candidate.bass_rel)
+    if candidate.drums_rel is not None:
+        target.drums_rel = float(candidate.drums_rel)
+    if candidate.vocals_rel is not None:
+        target.vocals_rel = float(candidate.vocals_rel)
+    if candidate.groove_rel is not None:
+        target.groove_rel = float(candidate.groove_rel)
+    if candidate.intensity_band is not None:
+        target.intensity_band = candidate.intensity_band
+    if candidate.role_hints:
+        target.role_hints.extend(candidate.role_hints)
+    if candidate.title is not None:
+        target.title = candidate.title
+    if candidate.artist is not None:
+        target.artist = candidate.artist
+    if source_message is not None and source_message.HasField("signatures"):
+        _set_signature_fields(target.signatures, _signature_payload_from_proto(source_message.signatures))
+
+
+def _signature_payload_from_proto(message: Any) -> dict[str, Any]:
+    return {
+        "analysis_signature": message.analysis_signature,
+        "config_signature": message.config_signature,
+        "scoring_contract_id": message.scoring_contract_id,
+    }
+
+
+def _copy_map(target: Any, payload: dict[str, float | None]) -> None:
+    for key, value in payload.items():
+        if value is None:
+            continue
+        target[key] = float(value)
+
+
+def _set_transition_features(target: Any, payload: dict[str, Any]) -> None:
+    target.effective_bpm_distance = float(payload.get("effective_bpm_distance", 0.0) or 0.0)
+    target.raw_bpm_distance = float(payload.get("raw_bpm_distance", 0.0) or 0.0)
+    target.bpm_relationship = str(payload.get("bpm_relationship", "") or "")
+    target.key_distance = int(payload.get("key_distance", 0) or 0)
+    target.key_compat_label = str(payload.get("key_compat_label", "") or "")
+    target.key_confidence_current = float(payload.get("key_confidence_current", 0.0) or 0.0)
+    target.key_confidence_candidate = float(payload.get("key_confidence_candidate", 0.0) or 0.0)
+    target.delta_energy_rel = float(payload.get("delta_energy_rel", 0.0) or 0.0)
+    target.delta_bass_rel = float(payload.get("delta_bass_rel", 0.0) or 0.0)
+    if payload.get("current_vocals_rel") is not None:
+        target.current_vocals_rel = float(payload["current_vocals_rel"])
+    if payload.get("candidate_vocals_rel") is not None:
+        target.candidate_vocals_rel = float(payload["candidate_vocals_rel"])
+    target.current_outro_low_end = float(payload.get("current_outro_low_end", 0.0) or 0.0)
+    target.candidate_intro_low_end = float(payload.get("candidate_intro_low_end", 0.0) or 0.0)
+
+
+def _set_penalty_factor(target: Any, payload: dict[str, Any]) -> None:
+    target.factor = str(payload.get("factor", "") or "")
+    target.severity = float(payload.get("severity", 0.0) or 0.0)
+    target.raw_penalty = float(payload.get("raw_penalty", 0.0) or 0.0)
+    if payload.get("gate") is not None:
+        target.gate = str(payload["gate"])
+
+
+def _applied_weight_adaptation(
+    playlist_stats: dict[str, Any] | None,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    effective_weights = resolve_effective_weights(playlist_stats, config)
+    if playlist_stats and playlist_stats.get("adapted_weights"):
+        return {
+            "adaptation_id": "adapted_weights",
+            "component_weights": effective_weights,
+            "explanation": "Playlist adapted_weights were applied.",
+        }
+    return {
+        "adaptation_id": "static_weights",
+        "component_weights": effective_weights,
+        "explanation": "Using static scoring weights.",
+    }
+
+
+def _populate_scored_candidate(
+    target: Any,
+    payload: dict[str, Any],
+    *,
+    source_message: Any | None = None,
+) -> None:
+    _set_track_message(target.candidate, payload["candidate"], source_message=source_message)
+    target.raw_score = float(payload.get("raw_score", 0.0) or 0.0)
+    target.final_score = float(payload.get("score", 0.0) or 0.0)
+    target.penalty_multiplier = float(payload.get("penalty_multiplier", 1.0) or 1.0)
+    for factor in payload.get("penalty_factors", []):
+        _set_penalty_factor(target.penalty_factors.add(), factor)
+    target.risk = str(payload.get("risk", "") or "")
+    target.risk_score = float(payload.get("risk_score", 0.0) or 0.0)
+    target.risk_factors.extend(str(item) for item in payload.get("risk_factors", []) if item)
+    target.move = str(payload.get("move", "") or "")
+    target.move_confidence = float(payload.get("move_confidence", 0.0) or 0.0)
+    target.move_note = str(payload.get("move_note", "") or "")
+    target.contrast_score = float(payload.get("contrast_score", 0.0) or 0.0)
+    _copy_map(target.component_scores, payload.get("component_scores", {}))
+    _copy_map(target.component_confidences, payload.get("confidences", {}))
+    _copy_map(target.weights_used, payload.get("weights_used", {}))
+    _set_transition_features(target.transition_features, payload.get("transition_features", {}))
+    target.primary_lane = str(payload.get("primary_lane", "") or "")
+    target.secondary_lane = bool(payload.get("secondary_lane", False))
+
+
+class ScoringServiceServicer:
+    def __init__(self, settings: Any | None = None):
+        self.settings = settings or load_runtime_settings()
+
+    def GetRecommendations(self, request: Any, context: grpc.ServicerContext) -> Any:
+        pb2, _ = load_scoring_proto_modules()
+        if request.target_lane and request.target_lane not in _VALID_TARGETS:
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "target_lane must be a supported lane.")
+        if not request.current_track.track_id:
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "current_track.track_id is required.")
+
+        track_messages = [request.current_track, *list(request.candidates)]
+        compatibility = _aggregate_compatibility(track_messages, self.settings)
+        if not compatibility["compatible"]:
+            context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                compatibility.get("reason", "incompatible_signatures"),
+            )
+
+        target_lane = request.target_lane or "maintain"
+        scoring_config = build_scoring_config(self.settings, target=target_lane)
+        current_track = _track_from_proto(request.current_track)
+        candidates = [_track_from_proto(item) for item in request.candidates]
+        history = _history_from_proto(request.history)
+        playlist_stats = _playlist_stats_from_proto(request.playlist_stats)
+        results = get_recommendations(
+            current_track=current_track,
+            candidates=candidates,
+            history=history,
+            config=scoring_config,
+            playlist_stats=playlist_stats,
+            target=target_lane,
+            max_per_lane=request.max_per_lane or None,
+        )
+
+        response = pb2.GetRecommendationsResponse()
+        response.lane_order.extend(results.get("lane_order", []))
+        response.recommendation_confidence = float(results.get("recommendation_confidence", 0.0) or 0.0)
+        meta = results.get("meta", {})
+        response.meta.target = str(meta.get("target", "") or "")
+        response.meta.total_candidates = int(meta.get("total_candidates", 0) or 0)
+        response.meta.filtered_candidates = int(meta.get("filtered_candidates", 0) or 0)
+        response.meta.scored_candidates = int(meta.get("scored_candidates", 0) or 0)
+        response.meta.current_track_id = str(meta.get("current_track_id", "") or "")
+        response.meta.requested_lane_available = bool(meta.get("requested_lane_available", False))
+        response.meta.best_alternative_lanes.extend(meta.get("best_alternative_lanes", []))
+        response.meta.fallback_note = str(meta.get("fallback_note", "") or "")
+
+        candidate_sources = {item.track_id: item for item in request.candidates}
+        for lane_name in results.get("lane_order", []):
+            items = (results.get("lanes") or {}).get(lane_name, [])
+            lane_message = response.lanes.add()
+            lane_meta = _lane_display(lane_name)
+            lane_message.lane_group.lane_id = lane_meta["lane_id"]
+            lane_message.lane_group.display_name = lane_meta["display_name"]
+            lane_message.lane_group.summary = lane_meta["summary"]
+            for item in items:
+                source_message = candidate_sources.get(item["candidate"].track_id)
+                _populate_scored_candidate(
+                    lane_message.items.add(),
+                    item,
+                    source_message=source_message,
+                )
+
+        _set_signature_fields(response.active_signatures, _active_signatures_payload(self.settings))
+        response.compatibility.exact_match = bool(compatibility["exact_match"])
+        response.compatibility.compatible = bool(compatibility["compatible"])
+        response.compatibility.requires_reanalysis = bool(compatibility["requires_reanalysis"])
+        response.compatibility.reason = str(compatibility["reason"])
+        response.compatibility.notes.extend(compatibility.get("notes", []))
+
+        applied = _applied_weight_adaptation(playlist_stats, scoring_config)
+        response.applied_weight_adaptation.adaptation_id = applied["adaptation_id"]
+        response.applied_weight_adaptation.component_weights.update(applied["component_weights"])
+        response.applied_weight_adaptation.explanation = applied["explanation"]
+        return response
+
+    def ScoreCandidate(self, request: Any, context: grpc.ServicerContext) -> Any:
+        pb2, _ = load_scoring_proto_modules()
+        if request.target_lane and request.target_lane not in _VALID_TARGETS:
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "target_lane must be a supported lane.")
+        if not request.current_track.track_id or not request.candidate.track_id:
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "current_track and candidate track_id are required.")
+
+        track_messages = [request.current_track, request.candidate]
+        compatibility = _aggregate_compatibility(track_messages, self.settings)
+        if not compatibility["compatible"]:
+            context.abort(
+                grpc.StatusCode.FAILED_PRECONDITION,
+                compatibility.get("reason", "incompatible_signatures"),
+            )
+
+        target_lane = request.target_lane or "maintain"
+        scoring_config = build_scoring_config(self.settings, target=target_lane)
+        current_track = _track_from_proto(request.current_track)
+        candidate_track = _track_from_proto(request.candidate)
+        history = _history_from_proto(request.history)
+        playlist_stats = _playlist_stats_from_proto(request.playlist_stats)
+        result = score_candidate(
+            current=current_track,
+            candidate=candidate_track,
+            history=history,
+            config=scoring_config,
+            playlist_stats=playlist_stats,
+        )
+
+        response = pb2.ScoreCandidateResponse()
+        _populate_scored_candidate(
+            response.scored_candidate,
+            result,
+            source_message=request.candidate,
+        )
+        _set_signature_fields(response.active_signatures, _active_signatures_payload(self.settings))
+        response.compatibility.exact_match = bool(compatibility["exact_match"])
+        response.compatibility.compatible = bool(compatibility["compatible"])
+        response.compatibility.requires_reanalysis = bool(compatibility["requires_reanalysis"])
+        response.compatibility.reason = str(compatibility["reason"])
+        response.compatibility.notes.extend(compatibility.get("notes", []))
+
+        applied = _applied_weight_adaptation(playlist_stats, scoring_config)
+        response.applied_weight_adaptation.adaptation_id = applied["adaptation_id"]
+        response.applied_weight_adaptation.component_weights.update(applied["component_weights"])
+        response.applied_weight_adaptation.explanation = applied["explanation"]
+        return response
+
+    def GetScoringMetadata(self, request: Any, context: grpc.ServicerContext) -> Any:
+        pb2, _ = load_scoring_proto_modules()
+        metadata = get_scoring_metadata(self.settings)
+        response = pb2.GetScoringMetadataResponse()
+        _set_signature_fields(response.active_signatures, metadata["active_signatures"])
+        response.compatible_analysis_signatures.extend(metadata.get("compatible_analysis_signatures", []))
+        response.compatible_config_signatures.extend(metadata.get("compatible_config_signatures", []))
+        for item in metadata.get("components", []):
+            component = response.components.add()
+            component.component_id = str(item.get("component_id", "") or "")
+            component.description = str(item.get("description", "") or "")
+            component.weight = float(item.get("weight", 0.0) or 0.0)
+            component.available = bool(item.get("available", False))
+            component.active = bool(item.get("active", False))
+            component.status = str(item.get("status", "") or "")
+        for lane in metadata.get("supported_lane_groups", []):
+            lane_group = response.supported_lane_groups.add()
+            lane_group.lane_id = str(lane.get("lane_id", "") or "")
+            lane_group.display_name = str(lane.get("display_name", "") or "")
+            lane_group.summary = str(lane.get("summary", "") or "")
+        response.capability_flags.update(metadata.get("capability_flags", {}))
+        response.healthy = bool(metadata.get("healthy", False))
+        response.engine_version = str(metadata.get("engine_version", "") or "")
+        response.status_note = str(metadata.get("status_note", "") or "")
+        return response
+
+
+def build_grpc_server(settings: Any | None = None, *, max_workers: int = 8) -> grpc.Server:
+    _, pb2_grpc = load_scoring_proto_modules()
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=max_workers))
+    pb2_grpc.add_ScoringServiceServicer_to_server(ScoringServiceServicer(settings), server)
+    return server
+
+
+def serve_scoring_grpc(
+    *,
+    host: str = DEFAULT_SCORING_SERVICE_HOST,
+    port: int = DEFAULT_SCORING_SERVICE_PORT,
+    settings: Any | None = None,
+    max_workers: int = 8,
+) -> int:
+    server = build_grpc_server(settings, max_workers=max_workers)
+    server.add_insecure_port(f"{host}:{port}")
+    server.start()
+    print(f"Scoring gRPC service listening on {host}:{port}")
+    server.wait_for_termination()
+    return 0

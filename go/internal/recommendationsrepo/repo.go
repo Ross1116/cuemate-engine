@@ -7,14 +7,16 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
 
 var (
-	ErrPlaylistNotFound      = errors.New("playlist not found")
-	ErrTrackNotFound         = errors.New("track not found in playlist")
-	ErrRelativeRefreshNeeded = errors.New("playlist relative artifacts require refresh")
+	ErrPlaylistNotFound            = errors.New("playlist not found")
+	ErrTrackNotFound               = errors.New("track not found in playlist")
+	ErrRecommendationEventNotFound = errors.New("recommendation event not found")
+	ErrRelativeRefreshNeeded       = errors.New("playlist relative artifacts require refresh")
 )
 
 type PlaylistRef struct {
@@ -24,6 +26,8 @@ type PlaylistRef struct {
 
 type TrackContextRecord struct {
 	TrackID                   string
+	FilePath                  string
+	FileHash                  *string
 	Title                     string
 	Artist                    string
 	Position                  int
@@ -60,6 +64,32 @@ type PlaylistStats struct {
 	AdaptedWeights     map[string]float64
 }
 
+type RecommendationEventRecord struct {
+	ID                       string
+	PlaylistID               string
+	CurrentTrackID           string
+	Target                   string
+	CandidateCount           int
+	RecommendationConfidence *float64
+	RecommendationsStatus    string
+	LanesReturnedJSON        string
+	TrackChosen              *string
+	ChosenWasRecommended     *bool
+	SkippedOverJSON          *string
+	AdaptedWeightsJSON       *string
+	ScoringContractID        string
+	Timestamp                string
+}
+
+type ManualCorrectionRecord struct {
+	ID          string
+	TrackID     string
+	Field       string
+	OldValue    string
+	NewValue    string
+	CorrectedAt string
+}
+
 type HydratedRecommendations struct {
 	Playlist   PlaylistRef
 	Current    TrackContextRecord
@@ -67,6 +97,18 @@ type HydratedRecommendations struct {
 	History    []TrackContextRecord
 	HasGaps    bool
 	Stats      *PlaylistStats
+}
+
+type PlaylistTrackSnapshot struct {
+	TrackID       string
+	Title         string
+	Artist        string
+	Position      int
+	BPM           *float64
+	Key           *string
+	IntensityBand *string
+	RoleHints     []string
+	AnalysisState string
 }
 
 type Repository struct {
@@ -158,12 +200,440 @@ func (r *Repository) HydrateRecommendations(
 	}, nil
 }
 
+func (r *Repository) GetPlaylistSnapshotTracks(ctx context.Context, playlistID string) ([]PlaylistTrackSnapshot, error) {
+	rows, err := r.db.QueryContext(
+		ctx,
+		`
+		SELECT
+		  t.id,
+		  COALESCE(t.title, ''),
+		  COALESCE(t.artist, ''),
+		  pt.position,
+		  f.bpm,
+		  f.key,
+		  r.intensity_band,
+		  r.role_hints,
+		  f.analysis_signature,
+		  f.config_signature,
+		  f.scoring_contract_id_at_analysis
+		FROM playlist_tracks pt
+		JOIN tracks t ON t.id = pt.track_id
+		LEFT JOIN track_features_abs f ON f.track_id = t.id
+		LEFT JOIN track_features_rel r ON r.track_id = t.id AND r.playlist_id = pt.playlist_id
+		WHERE pt.playlist_id = ?
+		ORDER BY pt.position ASC
+		`,
+		playlistID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []PlaylistTrackSnapshot
+	for rows.Next() {
+		var track PlaylistTrackSnapshot
+		var bpm sql.NullFloat64
+		var musicalKey sql.NullString
+		var intensityBand sql.NullString
+		var roleHints sql.NullString
+		var analysisSig sql.NullString
+		var configSig sql.NullString
+		var scoringContract sql.NullString
+		if err := rows.Scan(
+			&track.TrackID,
+			&track.Title,
+			&track.Artist,
+			&track.Position,
+			&bpm,
+			&musicalKey,
+			&intensityBand,
+			&roleHints,
+			&analysisSig,
+			&configSig,
+			&scoringContract,
+		); err != nil {
+			return nil, err
+		}
+		if bpm.Valid {
+			track.BPM = &bpm.Float64
+		}
+		if musicalKey.Valid {
+			track.Key = &musicalKey.String
+		}
+		if intensityBand.Valid {
+			track.IntensityBand = &intensityBand.String
+		}
+		if roleHints.Valid && strings.TrimSpace(roleHints.String) != "" {
+			_ = json.Unmarshal([]byte(roleHints.String), &track.RoleHints)
+		}
+		switch {
+		case !analysisSig.Valid || !configSig.Valid || !scoringContract.Valid:
+			track.AnalysisState = "unanalysed"
+		default:
+			track.AnalysisState = "ready"
+		}
+		out = append(out, track)
+	}
+	return out, rows.Err()
+}
+
+func (r *Repository) GetTrackForCorrection(ctx context.Context, trackID string) (TrackContextRecord, error) {
+	row := r.db.QueryRowContext(
+		ctx,
+		`
+		SELECT
+		  t.id,
+		  t.file_path,
+		  t.file_hash,
+		  COALESCE(t.title, ''),
+		  COALESCE(t.artist, ''),
+		  0,
+		  f.bpm,
+		  f.key,
+		  f.key_confidence,
+		  f.key_source,
+		  f.key_agreement,
+		  NULL,
+		  NULL,
+		  NULL,
+		  NULL,
+		  NULL,
+		  NULL,
+		  NULL,
+		  f.analysis_signature,
+		  f.config_signature,
+		  f.scoring_contract_id_at_analysis
+		FROM tracks t
+		LEFT JOIN track_features_abs f ON f.track_id = t.id
+		WHERE t.id = ?
+		`,
+		trackID,
+	)
+	record, err := scanTrackContext(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return TrackContextRecord{}, ErrTrackNotFound
+		}
+		return TrackContextRecord{}, err
+	}
+	return record, nil
+}
+
+func (r *Repository) GetTrackImportedValues(ctx context.Context, trackID string) (*float64, *string, error) {
+	row := r.db.QueryRowContext(ctx, "SELECT imported_bpm, imported_key FROM tracks WHERE id = ?", trackID)
+	var importedBPM sql.NullFloat64
+	var importedKey sql.NullString
+	if err := row.Scan(&importedBPM, &importedKey); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil, ErrTrackNotFound
+		}
+		return nil, nil, err
+	}
+	var bpm *float64
+	var key *string
+	if importedBPM.Valid {
+		bpm = &importedBPM.Float64
+	}
+	if importedKey.Valid {
+		key = &importedKey.String
+	}
+	return bpm, key, nil
+}
+
+func (r *Repository) UpdateTrackImportedBPM(ctx context.Context, trackID string, bpm float64, updatedAt string) error {
+	_, err := r.db.ExecContext(
+		ctx,
+		"UPDATE tracks SET imported_bpm = ?, updated_at = ? WHERE id = ?",
+		bpm,
+		updatedAt,
+		trackID,
+	)
+	return err
+}
+
+func (r *Repository) UpdateTrackImportedKey(ctx context.Context, trackID string, key string, updatedAt string) error {
+	_, err := r.db.ExecContext(
+		ctx,
+		"UPDATE tracks SET imported_key = ?, updated_at = ? WHERE id = ?",
+		key,
+		updatedAt,
+		trackID,
+	)
+	return err
+}
+
+func (r *Repository) GetPlaylistsContainingTrack(ctx context.Context, trackID string) ([]PlaylistRef, error) {
+	rows, err := r.db.QueryContext(
+		ctx,
+		`
+		SELECT p.id, p.name
+		FROM playlist_tracks pt
+		JOIN playlists p ON p.id = pt.playlist_id
+		WHERE pt.track_id = ?
+		ORDER BY p.name ASC
+		`,
+		trackID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []PlaylistRef
+	for rows.Next() {
+		var item PlaylistRef
+		if err := rows.Scan(&item.ID, &item.Name); err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+func (r *Repository) MarkPlaylistsStale(ctx context.Context, playlistIDs []string, reason, markedAt string) error {
+	if len(playlistIDs) == 0 {
+		return nil
+	}
+	for _, playlistID := range playlistIDs {
+		if _, err := r.db.ExecContext(
+			ctx,
+			"UPDATE playlist_stats SET is_stale = 1, stale_reason = ?, stale_marked_at = ? WHERE playlist_id = ?",
+			reason,
+			markedAt,
+			playlistID,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *Repository) CreateAnalysisJobWithKind(
+	ctx context.Context,
+	playlistID *string,
+	trackID string,
+	trackPath string,
+	jobKind string,
+	analysisMode string,
+	analysisSignature string,
+	configSignature string,
+	sourceFileHash *string,
+	priority int,
+	createdAt string,
+) (int64, error) {
+	_, err := r.db.ExecContext(
+		ctx,
+		`
+		DELETE FROM analysis_jobs
+		WHERE track_id = ?
+		  AND job_kind = ?
+		  AND status = 'pending'
+		  AND analysis_signature = ?
+		  AND config_signature = ?
+		`,
+		trackID,
+		jobKind,
+		analysisSignature,
+		configSignature,
+	)
+	if err != nil {
+		return 0, err
+	}
+	result, err := r.db.ExecContext(
+		ctx,
+		`
+		INSERT INTO analysis_jobs (
+		  playlist_id, track_id, track_path, job_kind, status, priority, analysis_mode,
+		  analysis_signature, config_signature, source_file_hash, created_at
+		) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)
+		`,
+		nullStringPtr(playlistID),
+		trackID,
+		trackPath,
+		jobKind,
+		priority,
+		analysisMode,
+		analysisSignature,
+		configSignature,
+		nullStringPtr(sourceFileHash),
+		createdAt,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.LastInsertId()
+}
+
+func (r *Repository) InsertManualCorrection(ctx context.Context, record ManualCorrectionRecord) error {
+	_, err := r.db.ExecContext(
+		ctx,
+		`
+		INSERT INTO manual_corrections (
+		  id, user_id, track_id, field, old_value, new_value, corrected_at
+		) VALUES (?, 'local', ?, ?, ?, ?, ?)
+		`,
+		record.ID,
+		record.TrackID,
+		record.Field,
+		record.OldValue,
+		record.NewValue,
+		record.CorrectedAt,
+	)
+	return err
+}
+
+func (r *Repository) InsertRecommendationEvent(ctx context.Context, record RecommendationEventRecord) error {
+	_, err := r.db.ExecContext(
+		ctx,
+		`
+		INSERT INTO recommendation_events (
+		  id, user_id, playlist_id, current_track_id, target, candidate_count,
+		  recommendation_confidence, recommendations_status, lanes_returned, track_chosen,
+		  chosen_was_recommended, skipped_over, adapted_weights, scoring_contract_id, timestamp
+		) VALUES (?, 'local', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`,
+		record.ID,
+		record.PlaylistID,
+		record.CurrentTrackID,
+		record.Target,
+		record.CandidateCount,
+		nullFloat64(record.RecommendationConfidence),
+		record.RecommendationsStatus,
+		record.LanesReturnedJSON,
+		nullString(record.TrackChosen),
+		nullBool(record.ChosenWasRecommended),
+		nullString(record.SkippedOverJSON),
+		nullString(record.AdaptedWeightsJSON),
+		record.ScoringContractID,
+		record.Timestamp,
+	)
+	return err
+}
+
+func (r *Repository) GetRecommendationEvent(ctx context.Context, eventID string) (*RecommendationEventRecord, error) {
+	row := r.db.QueryRowContext(
+		ctx,
+		`
+		SELECT
+		  id, playlist_id, current_track_id, target, candidate_count,
+		  recommendation_confidence, recommendations_status, lanes_returned, track_chosen,
+		  chosen_was_recommended, skipped_over, adapted_weights, scoring_contract_id, timestamp
+		FROM recommendation_events
+		WHERE id = ?
+		`,
+		eventID,
+	)
+	var record RecommendationEventRecord
+	var recommendationConfidence sql.NullFloat64
+	var trackChosen sql.NullString
+	var chosenWasRecommended sql.NullInt64
+	var skippedOver sql.NullString
+	var adaptedWeights sql.NullString
+	if err := row.Scan(
+		&record.ID,
+		&record.PlaylistID,
+		&record.CurrentTrackID,
+		&record.Target,
+		&record.CandidateCount,
+		&recommendationConfidence,
+		&record.RecommendationsStatus,
+		&record.LanesReturnedJSON,
+		&trackChosen,
+		&chosenWasRecommended,
+		&skippedOver,
+		&adaptedWeights,
+		&record.ScoringContractID,
+		&record.Timestamp,
+	); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrRecommendationEventNotFound
+		}
+		return nil, err
+	}
+	if recommendationConfidence.Valid {
+		record.RecommendationConfidence = &recommendationConfidence.Float64
+	}
+	if trackChosen.Valid {
+		record.TrackChosen = &trackChosen.String
+	}
+	if chosenWasRecommended.Valid {
+		value := chosenWasRecommended.Int64 != 0
+		record.ChosenWasRecommended = &value
+	}
+	if skippedOver.Valid {
+		record.SkippedOverJSON = &skippedOver.String
+	}
+	if adaptedWeights.Valid {
+		record.AdaptedWeightsJSON = &adaptedWeights.String
+	}
+	return &record, nil
+}
+
+func (r *Repository) UpdateRecommendationEventChoice(
+	ctx context.Context,
+	eventID string,
+	chosenTrackID string,
+	chosenWasRecommended bool,
+	skippedOverJSON string,
+) error {
+	value := int64(0)
+	if chosenWasRecommended {
+		value = 1
+	}
+	_, err := r.db.ExecContext(
+		ctx,
+		`
+		UPDATE recommendation_events
+		SET track_chosen = ?, chosen_was_recommended = ?, skipped_over = ?
+		WHERE id = ?
+		`,
+		chosenTrackID,
+		value,
+		skippedOverJSON,
+		eventID,
+	)
+	return err
+}
+
+func (r *Repository) InsertSyncOutbox(
+	ctx context.Context,
+	entityType string,
+	entityID string,
+	action string,
+	payloadJSON string,
+	createdAt string,
+) (int64, error) {
+	result, err := r.db.ExecContext(
+		ctx,
+		`
+		INSERT INTO sync_outbox (entity_type, entity_id, action, payload_json, created_at)
+		VALUES (?, ?, ?, ?, ?)
+		`,
+		entityType,
+		entityID,
+		action,
+		payloadJSON,
+		createdAt,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.LastInsertId()
+}
+
+func NowUTC() string {
+	return time.Now().UTC().Format(time.RFC3339)
+}
+
 func (r *Repository) getTrackContext(ctx context.Context, playlistID, trackID string) (TrackContextRecord, error) {
 	row := r.db.QueryRowContext(
 		ctx,
 		`
 		SELECT
 		  t.id,
+		  t.file_path,
+		  t.file_hash,
 		  COALESCE(t.title, ''),
 		  COALESCE(t.artist, ''),
 		  pt.position,
@@ -207,6 +677,8 @@ func (r *Repository) getScoringCandidates(ctx context.Context, playlistID string
 		`
 		SELECT
 		  t.id,
+		  t.file_path,
+		  t.file_hash,
 		  COALESCE(t.title, ''),
 		  COALESCE(t.artist, ''),
 		  pt.position,
@@ -302,9 +774,14 @@ func (r *Repository) getPlaylistStats(ctx context.Context, playlistID string) (*
 	return &stats, nil
 }
 
+func (r *Repository) GetPlaylistStats(ctx context.Context, playlistID string) (*PlaylistStats, error) {
+	return r.getPlaylistStats(ctx, playlistID)
+}
+
 func scanTrackContext(scanner interface{ Scan(...any) error }) (TrackContextRecord, error) {
 	var record TrackContextRecord
 	var bpm sql.NullFloat64
+	var fileHash sql.NullString
 	var musicalKey sql.NullString
 	var keyConfidence sql.NullFloat64
 	var keySource sql.NullString
@@ -322,6 +799,8 @@ func scanTrackContext(scanner interface{ Scan(...any) error }) (TrackContextReco
 
 	if err := scanner.Scan(
 		&record.TrackID,
+		&record.FilePath,
+		&fileHash,
 		&record.Title,
 		&record.Artist,
 		&record.Position,
@@ -346,6 +825,9 @@ func scanTrackContext(scanner interface{ Scan(...any) error }) (TrackContextReco
 
 	if bpm.Valid {
 		record.BPM = &bpm.Float64
+	}
+	if fileHash.Valid {
+		record.FileHash = &fileHash.String
 	}
 	if musicalKey.Valid {
 		record.Key = &musicalKey.String
@@ -391,4 +873,35 @@ func scanTrackContext(scanner interface{ Scan(...any) error }) (TrackContextReco
 		record.ScoringContractAtAnalysis = &scoringContract.String
 	}
 	return record, nil
+}
+
+func nullString(value *string) any {
+	if value == nil {
+		return nil
+	}
+	return *value
+}
+
+func nullStringPtr(value *string) any {
+	if value == nil {
+		return nil
+	}
+	return *value
+}
+
+func nullFloat64(value *float64) any {
+	if value == nil {
+		return nil
+	}
+	return *value
+}
+
+func nullBool(value *bool) any {
+	if value == nil {
+		return nil
+	}
+	if *value {
+		return 1
+	}
+	return 0
 }

@@ -14,6 +14,7 @@ import (
 	scoringv1 "github.com/Ross1116/cuemate-engine/go/gen/djengine/scoring/v1"
 	"github.com/Ross1116/cuemate-engine/go/internal/recommendationsrepo"
 	"github.com/Ross1116/cuemate-engine/go/internal/scoringruntime"
+	"github.com/google/uuid"
 )
 
 const (
@@ -34,6 +35,24 @@ type recommendationRequest struct {
 	HistoryTrackIDs []string `json:"history_track_ids"`
 	Target          string   `json:"target"`
 	MaxPerLane      int32    `json:"max_per_lane"`
+}
+
+type playedEventRequest struct {
+	RecommendationEventID string `json:"recommendation_event_id"`
+	ChosenTrackID         string `json:"chosen_track_id"`
+	PlayedAt              string `json:"played_at"`
+}
+
+type correctionRequest struct {
+	TrackID     string      `json:"track_id"`
+	Field       string      `json:"field"`
+	NewValue    interface{} `json:"new_value"`
+	CorrectedAt string      `json:"corrected_at"`
+}
+
+type snapshotRequest struct {
+	PlaylistID   string `json:"playlist_id"`
+	PlaylistName string `json:"playlist_name"`
 }
 
 type server struct {
@@ -67,6 +86,9 @@ func run() int {
 	mux.HandleFunc("/readyz", srv.handleReadyz)
 	mux.HandleFunc("/scoring/metadata", srv.handleMetadata)
 	mux.HandleFunc("/recommendations", srv.handleRecommendations)
+	mux.HandleFunc("/events/played", srv.handlePlayedEvent)
+	mux.HandleFunc("/corrections", srv.handleCorrections)
+	mux.HandleFunc("/sync/playlists/snapshot", srv.handleSnapshot)
 
 	log.Printf("Go API server listening on %s", cfg.Addr)
 	if err := http.ListenAndServe(cfg.Addr, mux); err != nil {
@@ -188,7 +210,365 @@ func (s *server) handleRecommendations(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, translateRecommendationsResponse(response))
+	payload := translateRecommendationsResponse(response)
+	eventID, err := s.recordRecommendationEvent(r.Context(), hydrated, response, payload)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	meta := payload["meta"].(map[string]any)
+	meta["recommendation_event_id"] = eventID
+	writeJSON(w, http.StatusOK, payload)
+}
+
+func (s *server) handlePlayedEvent(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	var req playedEventRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON request"})
+		return
+	}
+	if strings.TrimSpace(req.RecommendationEventID) == "" || strings.TrimSpace(req.ChosenTrackID) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "recommendation_event_id and chosen_track_id are required"})
+		return
+	}
+
+	event, err := s.repo.GetRecommendationEvent(r.Context(), req.RecommendationEventID)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, recommendationsrepo.ErrRecommendationEventNotFound) {
+			status = http.StatusNotFound
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+
+	wasRecommended, skippedOver, err := derivePlayedOutcome(event.LanesReturnedJSON, req.ChosenTrackID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	skippedJSONBytes, err := json.Marshal(skippedOver)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if err := s.repo.UpdateRecommendationEventChoice(
+		r.Context(),
+		event.ID,
+		req.ChosenTrackID,
+		wasRecommended,
+		string(skippedJSONBytes),
+	); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	playedAt := req.PlayedAt
+	if strings.TrimSpace(playedAt) == "" {
+		playedAt = recommendationsrepo.NowUTC()
+	}
+	outboxPayload, _ := json.Marshal(map[string]any{
+		"recommendation_event_id": event.ID,
+		"playlist_id":             event.PlaylistID,
+		"current_track_id":        event.CurrentTrackID,
+		"chosen_track_id":         req.ChosenTrackID,
+		"chosen_was_recommended":  wasRecommended,
+		"skipped_over":            skippedOver,
+		"played_at":               playedAt,
+	})
+	_, err = s.repo.InsertSyncOutbox(
+		r.Context(),
+		"recommendation_event",
+		event.ID,
+		"played",
+		string(outboxPayload),
+		playedAt,
+	)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"recommendation_event_id": event.ID,
+		"chosen_track_id":         req.ChosenTrackID,
+		"chosen_was_recommended":  wasRecommended,
+		"skipped_over":            skippedOver,
+	})
+}
+
+func (s *server) handleCorrections(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	var req correctionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON request"})
+		return
+	}
+	if strings.TrimSpace(req.TrackID) == "" || strings.TrimSpace(req.Field) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "track_id and field are required"})
+		return
+	}
+	track, err := s.repo.GetTrackForCorrection(r.Context(), req.TrackID)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, recommendationsrepo.ErrTrackNotFound) {
+			status = http.StatusNotFound
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	metadata, err := s.runtime.RefreshMetadata(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": scoringruntime.DescribeUnavailable(err)})
+		return
+	}
+
+	correctedAt := req.CorrectedAt
+	if strings.TrimSpace(correctedAt) == "" {
+		correctedAt = recommendationsrepo.NowUTC()
+	}
+	importedBPM, importedKey, err := s.repo.GetTrackImportedValues(r.Context(), req.TrackID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	var correction recommendationsrepo.ManualCorrectionRecord
+	changed := false
+	switch req.Field {
+	case "bpm":
+		newValue, ok := parseCorrectionBPM(req.NewValue)
+		if !ok {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "new_value must be a positive number for bpm"})
+			return
+		}
+		oldString := ""
+		if importedBPM != nil {
+			oldString = fmt.Sprintf("%.6f", *importedBPM)
+			changed = *importedBPM != newValue
+		} else {
+			changed = true
+		}
+		if changed {
+			if err := s.repo.UpdateTrackImportedBPM(r.Context(), req.TrackID, newValue, correctedAt); err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+				return
+			}
+			correction = recommendationsrepo.ManualCorrectionRecord{
+				ID:          uuid.NewString(),
+				TrackID:     req.TrackID,
+				Field:       "bpm",
+				OldValue:    oldString,
+				NewValue:    fmt.Sprintf("%.6f", newValue),
+				CorrectedAt: correctedAt,
+			}
+		}
+	case "key":
+		newValue, ok := parseCorrectionKey(req.NewValue)
+		if !ok {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "new_value must be a non-empty string for key"})
+			return
+		}
+		oldString := ""
+		if importedKey != nil {
+			oldString = *importedKey
+			changed = !strings.EqualFold(*importedKey, newValue)
+		} else {
+			changed = true
+		}
+		if changed {
+			if err := s.repo.UpdateTrackImportedKey(r.Context(), req.TrackID, newValue, correctedAt); err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+				return
+			}
+			correction = recommendationsrepo.ManualCorrectionRecord{
+				ID:          uuid.NewString(),
+				TrackID:     req.TrackID,
+				Field:       "key",
+				OldValue:    oldString,
+				NewValue:    newValue,
+				CorrectedAt: correctedAt,
+			}
+		}
+	default:
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "field must be one of: bpm, key"})
+		return
+	}
+
+	if !changed {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"changed":               false,
+			"requires_reanalysis":   false,
+			"correction_id":         nil,
+			"queued_job_id":         nil,
+			"affected_playlist_ids": []string{},
+		})
+		return
+	}
+	if err := s.repo.InsertManualCorrection(r.Context(), correction); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	playlists, err := s.repo.GetPlaylistsContainingTrack(r.Context(), req.TrackID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	playlistIDs := make([]string, 0, len(playlists))
+	for _, playlist := range playlists {
+		playlistIDs = append(playlistIDs, playlist.ID)
+	}
+	if err := s.repo.MarkPlaylistsStale(r.Context(), playlistIDs, "manual_correction", correctedAt); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	active := metadata.GetActiveSignatures()
+	jobID, err := s.repo.CreateAnalysisJobWithKind(
+		r.Context(),
+		nil,
+		req.TrackID,
+		track.FilePath,
+		"full",
+		"full",
+		active.GetAnalysisSignature(),
+		active.GetConfigSignature(),
+		track.FileHash,
+		100,
+		correctedAt,
+	)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	outboxPayload, _ := json.Marshal(map[string]any{
+		"correction_id": correction.ID,
+		"track_id":      req.TrackID,
+		"field":         correction.Field,
+		"new_value":     correction.NewValue,
+		"corrected_at":  correctedAt,
+	})
+	if _, err := s.repo.InsertSyncOutbox(r.Context(), "manual_correction", correction.ID, "upsert", string(outboxPayload), correctedAt); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"changed":               true,
+		"requires_reanalysis":   true,
+		"correction_id":         correction.ID,
+		"queued_job_id":         jobID,
+		"affected_playlist_ids": playlistIDs,
+	})
+}
+
+func (s *server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	var req snapshotRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON request"})
+		return
+	}
+	playlist, err := s.repo.ResolvePlaylist(r.Context(), req.PlaylistID, req.PlaylistName)
+	if err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, recommendationsrepo.ErrPlaylistNotFound) {
+			status = http.StatusNotFound
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	stats, err := s.repo.GetPlaylistStats(r.Context(), playlist.ID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	metadata, err := s.runtime.RefreshMetadata(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": scoringruntime.DescribeUnavailable(err)})
+		return
+	}
+	tracks, err := s.repo.GetPlaylistSnapshotTracks(r.Context(), playlist.ID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	snapshotTracks := make([]any, 0, len(tracks))
+	readyCount := 0
+	for _, track := range tracks {
+		analysisState := track.AnalysisState
+		if analysisState == "ready" {
+			if reason := relativeRefreshReason(stats, metadata.GetExpectedRelativeSignature()); reason != "" {
+				analysisState = "incompatible"
+			}
+		}
+		if analysisState == "ready" {
+			readyCount++
+		}
+		snapshotTracks = append(snapshotTracks, map[string]any{
+			"track_id":       track.TrackID,
+			"title":          track.Title,
+			"artist":         track.Artist,
+			"analysis_state": analysisState,
+			"summary": map[string]any{
+				"bpm":            track.BPM,
+				"key":            stringOrNil(track.Key),
+				"intensity_band": stringOrNil(track.IntensityBand),
+				"outro":          nil,
+			},
+		})
+	}
+	totalTracks := len(tracks)
+	coverageRatio := 0.0
+	if totalTracks > 0 {
+		coverageRatio = float64(readyCount) / float64(totalTracks)
+	}
+	freshnessReason := ""
+	compatibilityState := "exact"
+	requiresReanalysis := false
+	lastSyncedAt := recommendationsrepo.NowUTC()
+	if stats != nil {
+		if reason := relativeRefreshReason(stats, metadata.GetExpectedRelativeSignature()); reason != "" {
+			requiresReanalysis = true
+			compatibilityState = "incompatible"
+			freshnessReason = reason
+		}
+	}
+	payload := map[string]any{
+		"snapshot_id":         uuid.NewString(),
+		"playlist_id":         playlist.ID,
+		"snapshot_source":     "pc",
+		"generated_at":        recommendationsrepo.NowUTC(),
+		"analysis_signature":  metadata.GetActiveSignatures().GetAnalysisSignature(),
+		"config_signature":    metadata.GetActiveSignatures().GetConfigSignature(),
+		"scoring_contract_id": metadata.GetActiveSignatures().GetScoringContractId(),
+		"analysis_coverage": map[string]any{
+			"analyzed_tracks":  readyCount,
+			"total_tracks":     totalTracks,
+			"coverage_ratio":   coverageRatio,
+			"vocals_available": metadata.GetCapabilityFlags()["vocals_available"],
+		},
+		"freshness": map[string]any{
+			"last_synced_at":      lastSyncedAt,
+			"requires_reanalysis": requiresReanalysis,
+			"compatibility_state": compatibilityState,
+			"note":                nullIfEmpty(freshnessReason),
+		},
+		"tracks": snapshotTracks,
+		"precomputed": map[string]any{
+			"live_recommendations": []any{},
+			"playlist_analysis":    nil,
+		},
+	}
+	writeJSON(w, http.StatusOK, payload)
 }
 
 func relativeRefreshReason(stats *recommendationsrepo.PlaylistStats, expectedRelativeSignature string) string {
@@ -333,13 +713,14 @@ func degradedRecommendationsPayload(
 		"lane_order": liveLaneOrderForTarget(target),
 		"lanes":      emptyLaneMap(note),
 		"meta": map[string]any{
-			"analysis_coverage":   analysisCoverage(hydrated),
-			"filters_applied":     []string{},
-			"strict_mode":         false,
-			"assistant_mode":      true,
-			"weight_adaptation":   map[string]any{"mode": "unavailable"},
-			"scoring_contract_id": scoringContractID,
-			"status_note":         note,
+			"analysis_coverage":       analysisCoverage(hydrated),
+			"filters_applied":         []string{},
+			"strict_mode":             false,
+			"assistant_mode":          true,
+			"weight_adaptation":       map[string]any{"mode": "unavailable"},
+			"scoring_contract_id":     scoringContractID,
+			"status_note":             note,
+			"recommendation_event_id": nil,
 		},
 	}
 }
@@ -442,7 +823,141 @@ func translateRecommendationsResponse(resp *scoringv1.GetRecommendationsResponse
 			"requested_lane_available": resp.GetMeta().GetRequestedLaneAvailable(),
 			"best_alternative_lanes":   append([]string{}, resp.GetMeta().GetBestAlternativeLanes()...),
 			"fallback_note":            nullIfEmpty(resp.GetMeta().GetFallbackNote()),
+			"recommendation_event_id":  nil,
 		},
+	}
+}
+
+func (s *server) recordRecommendationEvent(
+	ctx context.Context,
+	hydrated *recommendationsrepo.HydratedRecommendations,
+	resp *scoringv1.GetRecommendationsResponse,
+	payload map[string]any,
+) (*string, error) {
+	if resp.GetRecommendationsStatus() != "available" {
+		return nil, nil
+	}
+
+	lanesSnapshot := make(map[string][]map[string]any)
+	for _, lane := range resp.GetLanes() {
+		items := make([]map[string]any, 0, len(lane.GetItems()))
+		for _, item := range lane.GetItems() {
+			items = append(items, map[string]any{
+				"track_id": item.GetCandidate().GetTrackId(),
+				"score":    item.GetFinalScore(),
+			})
+		}
+		lanesSnapshot[lane.GetLaneGroup().GetLaneId()] = items
+	}
+	compactLanes := map[string]any{
+		"lane_order": payload["lane_order"],
+		"lanes":      lanesSnapshot,
+	}
+	lanesJSON, err := json.Marshal(compactLanes)
+	if err != nil {
+		return nil, err
+	}
+	var adaptedWeightsJSON *string
+	if weights := resp.GetAppliedWeightAdaptation().GetComponentWeights(); len(weights) > 0 {
+		raw, err := json.Marshal(weights)
+		if err != nil {
+			return nil, err
+		}
+		value := string(raw)
+		adaptedWeightsJSON = &value
+	}
+	eventID := uuid.NewString()
+	record := recommendationsrepo.RecommendationEventRecord{
+		ID:                    eventID,
+		PlaylistID:            hydrated.Playlist.ID,
+		CurrentTrackID:        hydrated.Current.TrackID,
+		Target:                resp.GetMeta().GetTarget(),
+		CandidateCount:        int(resp.GetMeta().GetScoredCandidates()),
+		RecommendationsStatus: resp.GetRecommendationsStatus(),
+		LanesReturnedJSON:     string(lanesJSON),
+		AdaptedWeightsJSON:    adaptedWeightsJSON,
+		ScoringContractID:     resp.GetActiveSignatures().GetScoringContractId(),
+		Timestamp:             recommendationsrepo.NowUTC(),
+	}
+	if confidence := resp.GetRecommendationConfidence(); confidence > 0 {
+		record.RecommendationConfidence = &confidence
+	}
+	if err := s.repo.InsertRecommendationEvent(ctx, record); err != nil {
+		return nil, err
+	}
+	return &eventID, nil
+}
+
+func derivePlayedOutcome(lanesJSON string, chosenTrackID string) (bool, []string, error) {
+	var payload struct {
+		LaneOrder []string                    `json:"lane_order"`
+		Lanes     map[string][]map[string]any `json:"lanes"`
+	}
+	if err := json.Unmarshal([]byte(lanesJSON), &payload); err != nil {
+		return false, nil, err
+	}
+	chosenWasRecommended := false
+	chosenScore := 0.0
+	chosenLane := ""
+	for laneName, items := range payload.Lanes {
+		for _, item := range items {
+			if asString(item["track_id"]) == chosenTrackID {
+				chosenWasRecommended = true
+				chosenScore = asFloat(item["score"])
+				chosenLane = laneName
+				break
+			}
+		}
+	}
+	var skipped []string
+	if chosenWasRecommended {
+		for laneName, items := range payload.Lanes {
+			if laneName == chosenLane || len(items) == 0 {
+				continue
+			}
+			if asFloat(items[0]["score"]) > chosenScore {
+				skipped = append(skipped, laneName)
+			}
+		}
+	}
+	return chosenWasRecommended, skipped, nil
+}
+
+func parseCorrectionBPM(value any) (float64, bool) {
+	switch typed := value.(type) {
+	case float64:
+		return typed, typed > 0
+	case int:
+		return float64(typed), typed > 0
+	default:
+		return 0, false
+	}
+}
+
+func parseCorrectionKey(value any) (string, bool) {
+	typed, ok := value.(string)
+	if !ok {
+		return "", false
+	}
+	typed = strings.TrimSpace(typed)
+	return typed, typed != ""
+}
+
+func asString(value any) string {
+	typed, _ := value.(string)
+	return typed
+}
+
+func asFloat(value any) float64 {
+	switch typed := value.(type) {
+	case float64:
+		return typed
+	case float32:
+		return float64(typed)
+	case int:
+		return float64(typed)
+	default:
+		return 0
 	}
 }
 

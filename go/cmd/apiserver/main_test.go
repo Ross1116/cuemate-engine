@@ -165,6 +165,124 @@ func TestRecommendationsTemporarilyUnavailableWhenScorerFails(t *testing.T) {
 	}
 }
 
+func TestRecommendationsCreatesRecommendationEvent(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+		recResp: &scoringv1.GetRecommendationsResponse{
+			RecommendationsStatus: "available",
+			CurrentTrack:          &scoringv1.TrackContext{TrackId: "trk_current"},
+			Meta: &scoringv1.RecommendationMeta{
+				Target:           "maintain",
+				TotalCandidates:  2,
+				ScoredCandidates: 1,
+				CurrentTrackId:   "trk_current",
+			},
+			LaneOrder: []string{"maintain", "build", "reset", "jump", "contrast"},
+			Lanes: []*scoringv1.RecommendationLane{
+				{
+					LaneGroup:    &scoringv1.LaneGroup{LaneId: "maintain"},
+					Availability: "available",
+					Items: []*scoringv1.ScoredCandidate{
+						{Candidate: &scoringv1.TrackContext{TrackId: "trk_candidate"}, FinalScore: 0.9},
+					},
+				},
+			},
+			ActiveSignatures: &scoringv1.SignatureMetadata{ScoringContractId: "m3-v1"},
+		},
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/recommendations", bytes.NewBufferString(`{"playlist_name":"Test Playlist","current_track_id":"trk_current"}`))
+	srv.handleRecommendations(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &payload)
+	meta := payload["meta"].(map[string]any)
+	if meta["recommendation_event_id"] == nil {
+		t.Fatalf("expected recommendation_event_id in response meta: %#v", meta)
+	}
+}
+
+func TestPlayedEventUpdatesRecommendationEvent(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+	ctx := context.Background()
+	eventID := "evt_1"
+	lanesJSON := `{"lane_order":["maintain","build"],"lanes":{"maintain":[{"track_id":"trk_candidate","score":0.9}],"build":[{"track_id":"trk_history","score":0.8}]}}`
+	err := srv.repo.InsertRecommendationEvent(ctx, recommendationsrepo.RecommendationEventRecord{
+		ID:                    eventID,
+		PlaylistID:            "pl_1",
+		CurrentTrackID:        "trk_current",
+		Target:                "maintain",
+		CandidateCount:        2,
+		RecommendationsStatus: "available",
+		LanesReturnedJSON:     lanesJSON,
+		ScoringContractID:     "m3-v1",
+		Timestamp:             "2026-04-09T00:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("InsertRecommendationEvent() error = %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/events/played", bytes.NewBufferString(`{"recommendation_event_id":"evt_1","chosen_track_id":"trk_candidate"}`))
+	srv.handlePlayedEvent(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &payload)
+	if payload["chosen_was_recommended"] != true {
+		t.Fatalf("chosen_was_recommended = %#v", payload["chosen_was_recommended"])
+	}
+}
+
+func TestCorrectionsQueueReanalysisAndOutbox(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/corrections", bytes.NewBufferString(`{"track_id":"trk_current","field":"bpm","new_value":129.0}`))
+	srv.handleCorrections(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &payload)
+	if payload["changed"] != true {
+		t.Fatalf("changed = %#v", payload["changed"])
+	}
+	if payload["queued_job_id"] == nil {
+		t.Fatalf("expected queued_job_id")
+	}
+}
+
+func TestSnapshotExportsPlaylistScopedPayload(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/sync/playlists/snapshot", bytes.NewBufferString(`{"playlist_name":"Test Playlist"}`))
+	srv.handleSnapshot(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &payload)
+	if payload["playlist_id"] != "pl_1" {
+		t.Fatalf("playlist_id = %#v", payload["playlist_id"])
+	}
+	precomputed := payload["precomputed"].(map[string]any)
+	if precomputed["playlist_analysis"] != nil {
+		t.Fatalf("playlist_analysis = %#v", precomputed["playlist_analysis"])
+	}
+}
+
 func newTestServer(t *testing.T, stale bool, relativeSignature string, client *fakeRuntimeClient) *server {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "test.db")
@@ -176,7 +294,16 @@ func newTestServer(t *testing.T, stale bool, relativeSignature string, client *f
 
 	for _, stmt := range []string{
 		`CREATE TABLE playlists (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE);`,
-		`CREATE TABLE tracks (id TEXT PRIMARY KEY, file_path TEXT NOT NULL UNIQUE, title TEXT, artist TEXT);`,
+		`CREATE TABLE tracks (
+			id TEXT PRIMARY KEY,
+			file_path TEXT NOT NULL UNIQUE,
+			file_hash TEXT,
+			title TEXT,
+			artist TEXT,
+			imported_bpm REAL,
+			imported_key TEXT,
+			updated_at TEXT
+		);`,
 		`CREATE TABLE playlist_tracks (playlist_id TEXT NOT NULL, track_id TEXT NOT NULL, position INTEGER NOT NULL);`,
 		`CREATE TABLE track_features_abs (
 			track_id TEXT PRIMARY KEY,
@@ -211,7 +338,57 @@ func newTestServer(t *testing.T, stale bool, relativeSignature string, client *f
 			adapted_weights TEXT,
 			relative_signature TEXT NOT NULL,
 			is_stale INTEGER NOT NULL DEFAULT 0,
-			stale_reason TEXT
+			stale_reason TEXT,
+			stale_marked_at TEXT
+		);`,
+		`CREATE TABLE manual_corrections (
+			id TEXT PRIMARY KEY,
+			user_id TEXT NOT NULL DEFAULT 'local',
+			track_id TEXT NOT NULL,
+			field TEXT NOT NULL,
+			old_value TEXT NOT NULL,
+			new_value TEXT NOT NULL,
+			corrected_at TEXT NOT NULL
+		);`,
+		`CREATE TABLE recommendation_events (
+			id TEXT PRIMARY KEY,
+			user_id TEXT NOT NULL DEFAULT 'local',
+			playlist_id TEXT NOT NULL,
+			current_track_id TEXT NOT NULL,
+			target TEXT NOT NULL,
+			candidate_count INTEGER NOT NULL,
+			recommendation_confidence REAL,
+			recommendations_status TEXT NOT NULL DEFAULT 'available',
+			lanes_returned TEXT NOT NULL,
+			track_chosen TEXT,
+			chosen_was_recommended INTEGER,
+			skipped_over TEXT,
+			adapted_weights TEXT,
+			scoring_contract_id TEXT NOT NULL,
+			timestamp TEXT NOT NULL
+		);`,
+		`CREATE TABLE sync_outbox (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			entity_type TEXT NOT NULL,
+			entity_id TEXT NOT NULL,
+			action TEXT NOT NULL,
+			payload_json TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			synced_at TEXT
+		);`,
+		`CREATE TABLE analysis_jobs (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			playlist_id TEXT,
+			track_id TEXT,
+			track_path TEXT NOT NULL,
+			job_kind TEXT NOT NULL DEFAULT 'full',
+			status TEXT NOT NULL DEFAULT 'pending',
+			priority INTEGER NOT NULL DEFAULT 0,
+			analysis_mode TEXT NOT NULL DEFAULT 'full',
+			analysis_signature TEXT NOT NULL,
+			config_signature TEXT NOT NULL,
+			source_file_hash TEXT,
+			created_at TEXT NOT NULL
 		);`,
 	} {
 		if _, err := db.Exec(stmt); err != nil {
@@ -223,9 +400,9 @@ func newTestServer(t *testing.T, stale bool, relativeSignature string, client *f
 		t.Fatalf("insert playlist: %v", err)
 	}
 	for _, insert := range []string{
-		`INSERT INTO tracks (id, file_path, title, artist) VALUES ('trk_current', '/music/current.flac', 'Current', 'Tester')`,
-		`INSERT INTO tracks (id, file_path, title, artist) VALUES ('trk_candidate', '/music/candidate.flac', 'Candidate', 'Tester')`,
-		`INSERT INTO tracks (id, file_path, title, artist) VALUES ('trk_history', '/music/history.flac', 'History', 'Tester')`,
+		`INSERT INTO tracks (id, file_path, file_hash, title, artist, imported_bpm, imported_key, updated_at) VALUES ('trk_current', '/music/current.flac', 'hash_current', 'Current', 'Tester', 128.0, '8A', '2026-04-09T00:00:00Z')`,
+		`INSERT INTO tracks (id, file_path, file_hash, title, artist, imported_bpm, imported_key, updated_at) VALUES ('trk_candidate', '/music/candidate.flac', 'hash_candidate', 'Candidate', 'Tester', 128.0, '8A', '2026-04-09T00:00:00Z')`,
+		`INSERT INTO tracks (id, file_path, file_hash, title, artist, imported_bpm, imported_key, updated_at) VALUES ('trk_history', '/music/history.flac', 'hash_history', 'History', 'Tester', 127.0, '8A', '2026-04-09T00:00:00Z')`,
 		`INSERT INTO playlist_tracks (playlist_id, track_id, position) VALUES ('pl_1', 'trk_current', 1)`,
 		`INSERT INTO playlist_tracks (playlist_id, track_id, position) VALUES ('pl_1', 'trk_candidate', 2)`,
 		`INSERT INTO playlist_tracks (playlist_id, track_id, position) VALUES ('pl_1', 'trk_history', 3)`,

@@ -2,7 +2,8 @@ param(
   [string]$ProtoRoot = "proto",
   [string]$ProtoFile = "proto/djengine/scoring/v1/scoring.proto",
   [string]$DescriptorOut = "data/scoring.pb",
-  [string]$PythonOut = "python/src"
+  [string]$PythonOut = "python/src",
+  [string]$GoOut = "go"
 )
 
 $buf = Get-Command buf -ErrorAction SilentlyContinue
@@ -14,6 +15,33 @@ $python = Get-Command python -ErrorAction SilentlyContinue
 if (-not $python) {
   throw "Could not find 'python' on PATH."
 }
+
+$protoc = Get-Command protoc -ErrorAction SilentlyContinue
+if (-not $protoc) {
+  throw "Could not find 'protoc' on PATH."
+}
+
+$go = Get-Command go -ErrorAction SilentlyContinue
+if (-not $go) {
+  throw "Could not find 'go' on PATH."
+}
+
+$gopath = (& $go.Source env GOPATH).Trim()
+if (-not $gopath) {
+  throw "Could not determine GOPATH."
+}
+
+$pluginBin = Join-Path $gopath "bin"
+$protocGenGo = Join-Path $pluginBin "protoc-gen-go.exe"
+$protocGenGoGrpc = Join-Path $pluginBin "protoc-gen-go-grpc.exe"
+if (-not (Test-Path $protocGenGo)) {
+  throw "Could not find protoc-gen-go at $protocGenGo. Install it with 'go install google.golang.org/protobuf/cmd/protoc-gen-go@latest'."
+}
+if (-not (Test-Path $protocGenGoGrpc)) {
+  throw "Could not find protoc-gen-go-grpc at $protocGenGoGrpc. Install it with 'go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest'."
+}
+
+$env:Path = "$pluginBin;$env:Path"
 
 & $buf.Source lint
 if ($LASTEXITCODE -ne 0) {
@@ -50,4 +78,15 @@ if ($LASTEXITCODE -ne 0) {
   exit $LASTEXITCODE
 }
 
-Write-Output "Linted $ProtoFile, wrote descriptor set to $DescriptorOut, and generated Python gRPC stubs in $PythonOut"
+& $protoc.Source `
+  "--proto_path=$ProtoRoot" `
+  "--go_out=$GoOut" `
+  "--go_opt=module=github.com/Ross1116/cuemate-engine/go" `
+  "--go-grpc_out=$GoOut" `
+  "--go-grpc_opt=module=github.com/Ross1116/cuemate-engine/go" `
+  $ProtoFile
+if ($LASTEXITCODE -ne 0) {
+  exit $LASTEXITCODE
+}
+
+Write-Output "Linted $ProtoFile, wrote descriptor set to $DescriptorOut, generated Python gRPC stubs in $PythonOut, and generated Go gRPC stubs in $GoOut\\gen"

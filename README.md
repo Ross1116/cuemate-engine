@@ -30,6 +30,10 @@ Implemented today:
   - protobuf scoring contract revised to match the live scorer
   - local gRPC scoring service runtime
   - Python proto/codegen workflow
+- Milestone 4 Go bootstrap slice:
+  - Go protobuf/gRPC client bootstrap
+  - `scoringctl` smoke CLI for metadata and fixture-driven score calls
+  - Go proto/codegen workflow
 - staged analysis pipeline:
   - `fast_pass`
   - `staged` (default)
@@ -38,7 +42,6 @@ Implemented today:
 Deferred for now:
 
 - windowed intro/outro analysis
-- Go client/runtime wiring
 - recommendation outcome logging / feedback loop
 
 ## Architecture
@@ -98,8 +101,8 @@ The current pipeline is split into 5 main layers:
 |  |- stack-decisions.md
 |
 |- go/
-|  |- cmd/                               # Placeholder for future Go entrypoints
-|  |- internal/                          # Placeholder for future Go packages
+|  |- cmd/                               # Go smoke/debug entrypoints
+|  |- internal/                          # Go client/bootstrap packages
 |  |- gen/                               # Generated Go artifacts
 |  |- README.md
 |
@@ -428,6 +431,8 @@ python -m cuemate_analysis inspect-scoring-weights --playlist "Fred again"
 python -m cuemate_analysis inspect-scoring-metadata
 python -m cuemate_analysis inspect-scoring-metadata --json
 python -m cuemate_analysis serve-scoring --host 127.0.0.1 --port 47834
+go run ./go/cmd/scoringctl metadata
+go run ./go/cmd/scoringctl score --fixture .\go\testdata\score_candidate.json
 ```
 
 ### Essentia semantic workflows
@@ -484,7 +489,7 @@ Compile protobuf contract:
 powershell -ExecutionPolicy Bypass -File .\scripts\compile-proto.ps1
 ```
 
-The compile helper runs `buf lint`, writes `data/scoring.pb`, and generates Python gRPC stubs into `python/src/djengine/`.
+The compile helper runs `buf lint`, writes `data/scoring.pb`, and generates Python and Go gRPC stubs into `python/src/djengine/` and `go/gen/`.
 
 Benchmark local DSP:
 
@@ -495,7 +500,7 @@ python -m cuemate_analysis benchmark-dsp --path "D:\Music\track.flac"
 
 ## Known Boundaries
 
-- Go runtime/API surfaces are still placeholders
+- Go decision-plane transport bootstrap exists, but API/server orchestration is still placeholder-only
 - windowed intro/outro analysis is intentionally deferred
 - `transition_support`, `vocal_transition`, and `rhythmic_continuity` are still explicit stubs and are excluded from weighted scoring
 - `vocals_abs` / `vocals_rel` are not populated by the current analysis pipeline yet, so vocal-dependent recommendation logic remains limited
@@ -512,7 +517,7 @@ Done:
 
 Next:
 
-- Go client/runtime integration on top of the Python scoring service
+- Go decision-plane/API wiring on top of the new scoring client bootstrap
 - recommendation outcome logging and tuning loop
 
 Later:

@@ -20,4 +20,5 @@ The schema is intentionally committed before application code so both planes can
 - `djengine.scoring.v1` now reflects the live Python scorer input/output model
 - Python owns the authoritative implementation of the contract through the local gRPC scoring service
 - generated Python stubs are produced locally into `python/src/djengine/` via `scripts/compile-proto.ps1`
+- generated Go stubs are produced locally into `go/gen/` via `scripts/compile-proto.ps1`
 - Go client/runtime integration is the next consumer of this contract

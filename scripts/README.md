@@ -5,7 +5,7 @@ This directory holds setup and contract-maintenance helpers. No product logic li
 ## Available helpers
 
 - `check-prereqs.ps1`: checks whether the core local tools are available from the current shell and whether Docker/Tailscale look reachable
-- `compile-proto.ps1`: runs `buf lint`, writes a descriptor set to `data/scoring.pb`, and generates Python protobuf/gRPC stubs into `python/src/djengine/`
+- `compile-proto.ps1`: runs `buf lint`, writes a descriptor set to `data/scoring.pb`, and generates Python/Go protobuf+gRPC stubs into `python/src/djengine/` and `go/gen/`
 - `build-tempocnn-image.ps1`: compatibility alias that builds the shared TensorFlow/Essentia image used by TempoCNN and Essentia semantics
 - `build-essentia-semantics-image.ps1`: builds the shared TensorFlow/Essentia image directly (same image as `build-tempocnn-image.ps1`)
 - `build-musicalkeycnn-image.ps1`: builds the local Docker image that backs the primary MusicalKeyCNN key analyzer

@@ -957,19 +957,19 @@ def build_parser() -> argparse.ArgumentParser:
 
     analyze_energy_playlist_parser = subparsers.add_parser(
         "analyze-energy-playlist",
-        help="Compare experimental absolute-energy candidates for a playlist without persisting results.",
+        help="Compare absolute-energy diagnostics for a playlist without persisting results.",
     )
     analyze_energy_playlist_parser.add_argument("--playlist", required=True, help="Playlist name to analyze.")
     analyze_energy_playlist_parser.add_argument(
         "--limit",
         type=int,
         default=0,
-        help="Optional track limit for a faster experimental subset pass.",
+        help="Optional track limit for a faster subset pass.",
     )
     analyze_energy_playlist_parser.add_argument(
         "--json",
         action="store_true",
-        help="Emit the energy-workbench payload as JSON.",
+        help="Emit the energy diagnostics payload as JSON.",
     )
     analyze_energy_playlist_parser.add_argument(
         "--output",
@@ -2296,7 +2296,7 @@ def handle_analyze_energy_playlist(args: argparse.Namespace) -> int:
     total = len(rows)
 
     if not args.json:
-        print(f"Playlist '{args.playlist}' energy workbench :: experimental absolute-energy candidates")
+        print(f"Playlist '{args.playlist}' energy diagnostics :: absolute-energy comparisons")
 
     for row in rows:
         index = int(row["position"])

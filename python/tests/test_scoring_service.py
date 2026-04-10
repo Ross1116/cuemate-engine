@@ -188,9 +188,9 @@ def test_get_recommendations_matches_direct_scorer(scoring_proto_runtime):
         response = stub.GetRecommendations(request, timeout=5)
     finally:
         channel.close()
-        server.stop(None)
+        server.stop(0.5)
 
-    assert list(response.lane_order) == ["build", "maintain", "reset", "jump", "contrast"]
+    assert list(response.lane_order) == list(direct["lane_order"])
     assert response.meta.current_track_id == direct["meta"]["current_track_id"]
     assert response.meta.fallback_note == (direct["meta"]["fallback_note"] or "")
     assert response.recommendation_confidence == pytest.approx(direct["recommendation_confidence"], abs=1e-6)
@@ -251,7 +251,7 @@ def test_score_candidate_matches_direct_scorer(scoring_proto_runtime):
         response = stub.ScoreCandidate(request, timeout=5)
     finally:
         channel.close()
-        server.stop(None)
+        server.stop(0.5)
 
     scored = response.scored_candidate
     assert scored.candidate.track_id == direct["candidate"].track_id
@@ -277,7 +277,7 @@ def test_get_scoring_metadata_matches_direct_metadata(scoring_proto_runtime):
         response = stub.GetScoringMetadata(pb2.GetScoringMetadataRequest(), timeout=5)
     finally:
         channel.close()
-        server.stop(None)
+        server.stop(0.5)
 
     assert response.active_signatures.analysis_signature == direct["active_signatures"]["analysis_signature"]
     assert response.active_signatures.config_signature == direct["active_signatures"]["config_signature"]
@@ -328,6 +328,6 @@ def test_service_rejects_missing_signatures(scoring_proto_runtime):
             stub.ScoreCandidate(request, timeout=5)
     finally:
         channel.close()
-        server.stop(None)
+        server.stop(0.5)
 
     assert exc_info.value.code() == grpc.StatusCode.FAILED_PRECONDITION

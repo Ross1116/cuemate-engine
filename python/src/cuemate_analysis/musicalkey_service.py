@@ -22,6 +22,15 @@ logger = logging.getLogger(__name__)
 _ALLOWED_SERVICE_ROOTS_ENV = "CUEMATE_SERVICE_ALLOWED_ROOTS"
 
 
+def build_track_artifact_identity(track_path: Path) -> tuple[str, int, int]:
+    stat_result = track_path.stat()
+    return (
+        track_path.as_posix(),
+        int(stat_result.st_mtime_ns),
+        int(stat_result.st_size),
+    )
+
+
 class MusicalKeyHandler(BaseHTTPRequestHandler):
     server_version = "CueMateMusicalKeyCNN/0.1"
 
@@ -119,13 +128,17 @@ class MusicalKeyHandler(BaseHTTPRequestHandler):
         try:
             cached_results: dict[str, dict[str, object]] = {}
             missing_track_paths: list[Path] = []
+            track_identities = {
+                track_path.as_posix(): build_track_artifact_identity(track_path)
+                for track_path in resolved_track_paths
+            }
             for track_path in resolved_track_paths:
                 track_key = track_path.as_posix()
                 cache_key = build_cache_key(
                     resolved_model_path,
                     normalized_policy,
                     str(runner_device),
-                    track_path,
+                    track_identities[track_key],
                 )
                 cached = RESULT_CACHE.get(cache_key)
                 if cached is None:
@@ -141,13 +154,15 @@ class MusicalKeyHandler(BaseHTTPRequestHandler):
                     item = {**item, "track_path": track_path} if track_path else item
                     computed_results[track_path] = item
                     if "error" not in item and track_path:
-                        resolved_track_path = Path(track_path)
+                        track_identity = track_identities.get(track_path)
+                        if track_identity is None:
+                            continue
                         RESULT_CACHE[
                             build_cache_key(
                                 resolved_model_path,
                                 normalized_policy,
                                 str(runner_device),
-                                resolved_track_path,
+                                track_identity,
                             )
                         ] = dict(item)
 
@@ -178,7 +193,7 @@ class MusicalKeyHandler(BaseHTTPRequestHandler):
         )
 
 
-RESULT_CACHE: dict[tuple[str, str, str, str, int, int], dict[str, object]] = {}
+RESULT_CACHE: dict[tuple[str, str, str, str, str, int, int], dict[str, object]] = {}
 
 
 def build_model_artifact_identity(model_path: Path) -> str:
@@ -191,17 +206,17 @@ def build_cache_key(
     model_path: Path,
     policy: str,
     runner_device: str,
-    track_path: Path,
-) -> tuple[str, str, str, str, int, int]:
-    stat_result = track_path.stat()
+    track_identity: tuple[str, int, int],
+) -> tuple[str, str, str, str, str, int, int]:
+    track_path, track_mtime_ns, track_size = track_identity
     return (
         model_path.as_posix(),
         build_model_artifact_identity(model_path),
         policy,
         runner_device,
-        track_path.as_posix(),
-        int(stat_result.st_mtime_ns),
-        int(stat_result.st_size),
+        track_path,
+        track_mtime_ns,
+        track_size,
     )
 
 

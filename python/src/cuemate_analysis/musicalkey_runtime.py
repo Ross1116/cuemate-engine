@@ -1,3 +1,13 @@
+"""MusicalKeyCNN runtime helpers.
+
+This module is internal runtime code. It validates that referenced files exist,
+but it intentionally does not enforce allowed-root policies itself. Service
+layers are responsible for path allowlisting before calling into this module.
+Because path_safety skips allowlist enforcement when allowed_roots is None,
+direct calls into these helpers are unsafe unless the caller has already
+validated the paths.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -355,7 +365,7 @@ def build_prediction_payload(
     top_info = CLASS_TO_KEY_INFO[top_index]
     second_info = CLASS_TO_KEY_INFO[second_index]
     return {
-        "track_path": Path(track_path).as_posix(),
+        "track_path": Path(track_path).resolve(strict=False).as_posix(),
         "key": top_info.key,
         "key_number": top_info.key_number,
         "key_letter": top_info.key_letter,

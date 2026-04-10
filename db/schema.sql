@@ -211,6 +211,10 @@ CREATE TABLE playlist_sync_state (
   last_snapshot_acked_at TEXT,
   updated_at TEXT NOT NULL
 );
+CREATE INDEX idx_manual_corrections_track_id ON manual_corrections (track_id);
+CREATE INDEX idx_recommendation_events_playlist_id ON recommendation_events (playlist_id);
+CREATE INDEX idx_recommendation_events_timestamp ON recommendation_events (timestamp);
+CREATE INDEX idx_recommendation_events_status ON recommendation_events (recommendations_status);
 CREATE INDEX idx_sync_outbox_unsynced ON sync_outbox (synced_at, id);
 -- Dbmate schema migrations
 INSERT INTO "schema_migrations" (version) VALUES
@@ -223,4 +227,5 @@ INSERT INTO "schema_migrations" (version) VALUES
   ('20260404220000'),
   ('20260404230000'),
   ('20260405093000'),
-  ('20260409183000');
+  ('20260409183000'),
+  ('20260410030000');

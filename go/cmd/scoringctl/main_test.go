@@ -14,10 +14,10 @@ func TestLoadScoreFixture(t *testing.T) {
 	}
 
 	if got := request.GetCurrentTrack().GetTrackId(); got != "trk_current" {
-		t.Fatalf("current track = %q", got)
+		t.Fatalf("current track: expected %q, got %q", "trk_current", got)
 	}
 	if got := request.GetCandidate().GetTrackId(); got != "trk_candidate" {
-		t.Fatalf("candidate track = %q", got)
+		t.Fatalf("candidate track: expected %q, got %q", "trk_candidate", got)
 	}
 }
 

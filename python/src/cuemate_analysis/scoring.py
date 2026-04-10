@@ -283,7 +283,7 @@ def camelot_compatibility(
         return 2, "cross_adjacent"
     if wheel_dist == 2 and same_mode:
         return 2, "energy_boost"
-    if wheel_dist == 7 and same_mode:
+    if wheel_dist == 5 and same_mode:
         return 2, "energy_key_change"
     return 3, "mismatch"
 
@@ -817,6 +817,7 @@ def compute_weighted_score(
 def compute_transition_features(
     current: ScoringTrackContext,
     candidate: ScoringTrackContext,
+    config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Canonical per-pair feature bundle used by penalties, risk, and explanations.
 
@@ -833,14 +834,17 @@ def compute_transition_features(
         c_num, c_mode = parse_camelot(current.key)
         d_num, d_mode = parse_camelot(candidate.key)
         key_distance, key_compat_label = camelot_compatibility(c_num, c_mode, d_num, d_mode)
+    harmonic_floor = None if config is None else config.get("harmonic_confidence_floor")
+    trusted_current_key_conf = _harmonic_confidence(current, harmonic_floor)
+    trusted_candidate_key_conf = _harmonic_confidence(candidate, harmonic_floor)
     return {
         "effective_bpm_distance": bpm_dist,
         "raw_bpm_distance": raw_bpm_dist,
         "bpm_relationship": bpm_relationship,
         "key_distance": key_distance,
         "key_compat_label": key_compat_label,
-        "key_confidence_current": current.key_confidence or 0.0,
-        "key_confidence_candidate": candidate.key_confidence or 0.0,
+        "key_confidence_current": trusted_current_key_conf,
+        "key_confidence_candidate": trusted_candidate_key_conf,
         "delta_energy_rel": (
             (candidate.energy_rel if candidate.energy_rel is not None else 0.5)
             - (current.energy_rel if current.energy_rel is not None else 0.5)
@@ -1180,7 +1184,7 @@ def score_candidate(
     if confidences is None:
         confidences = build_confidence_map(current, candidate, config)
 
-    transition_features = compute_transition_features(current, candidate)
+    transition_features = compute_transition_features(current, candidate, config)
 
     target = config.get("target", "maintain")
     feature_scores: dict[str, float] = {

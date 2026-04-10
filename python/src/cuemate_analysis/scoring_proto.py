@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import importlib
+from types import ModuleType
 
 
-def load_scoring_proto_modules():
+def load_scoring_proto_modules() -> tuple[ModuleType, ModuleType]:
     """Return generated scoring protobuf modules or raise a clear runtime error."""
     try:
         pb2 = importlib.import_module("djengine.scoring.v1.scoring_pb2")

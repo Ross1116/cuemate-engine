@@ -1,10 +1,10 @@
 """
-Milestone 3 — Phase 5: Explanation and Deterministic Text Generation Layer
+Milestone 3 - Phase 5: Explanation and Deterministic Text Generation Layer
 
 All functions are deterministic. No LLMs, no UI logic, no formatting.
 Reads only from precomputed features, scores, and live session state.
 
-Language policy (§0.4):
+Language policy (section 0.4):
   Preferred: "harmonically friendly," "higher clash risk," "easy tempo match,"
              "strong contrast option," "cleaner intro," "heavier low end,"
              "trust your ears."
@@ -25,7 +25,7 @@ from cuemate_analysis.scoring import (
 )
 
 # ---------------------------------------------------------------------------
-# Budget constants (§20.3.1)
+# Budget constants (section 20.3.1)
 # ---------------------------------------------------------------------------
 
 COMPACT_MAX_REASONS = 3
@@ -65,11 +65,11 @@ def generate_reasons(
         label_text = f" ({key_label})" if key_label else ""
         reasons.append(f"Harmonically friendly{label_text}")
     elif harmonic <= 0.30:
-        reasons.append("Higher harmonic tension — trust your ears on the blend")
+        reasons.append("Higher harmonic tension - trust your ears on the blend")
 
     delta_e = transition_features.get("delta_energy_rel", 0.0) or 0.0
     if delta_e > 0.12:
-        reasons.append(f"Big energy uplift (+{delta_e:.0%}) — bold move")
+        reasons.append(f"Big energy uplift (+{delta_e:.0%}) - bold move")
     elif delta_e > 0.05:
         reasons.append("Builds momentum")
     elif delta_e < -0.08:
@@ -80,26 +80,26 @@ def generate_reasons(
     vocal_score = scores.get("vocal_transition", None)
     if vocal_score is not None:
         if vocal_score < 0.3:
-            reasons.append("Both tracks carry strong vocal content — watch the overlap")
+            reasons.append("Both tracks carry strong vocal content - watch the overlap")
         elif vocal_score > 0.85:
-            reasons.append("Good vocal contrast — cleaner blend space")
+            reasons.append("Good vocal contrast - cleaner blend space")
 
     delta_b = transition_features.get("delta_bass_rel", 0.0) or 0.0
     if delta_b > 0.15:
         reasons.append("Heavier low end incoming")
     elif delta_b < -0.15:
-        reasons.append("Lighter bass — opens space")
+        reasons.append("Lighter bass - opens space")
 
     ts = scores.get("transition_support", None)
     if ts is not None:
         if ts > 0.75:
             reasons.append("Cleaner incoming intro profile")
         elif ts < 0.3:
-            reasons.append("Denser handoff — more demanding overlap")
+            reasons.append("Denser handoff - more demanding overlap")
 
     bpm_rel = transition_features.get("bpm_relationship", "direct")
     if bpm_rel not in ("direct", "double", "half"):
-        reasons.append(f"Creative tempo pivot ({bpm_rel}) — trust your ears")
+        reasons.append(f"Creative tempo pivot ({bpm_rel}) - trust your ears")
 
     return reasons
 
@@ -132,18 +132,18 @@ def generate_window_advisory(
     is_long = "64" in window_name
 
     if clean > 0.75:
-        notes.append("Open section — plenty of space")
+        notes.append("Open section - plenty of space")
     elif clean > 0.55:
         notes.append("Reasonably open section")
     elif clean > 0.35:
         level = "yellow"
-        notes.append("Denser section — more going on here")
+        notes.append("Denser section - more going on here")
     else:
         level = "orange"
-        notes.append("Crowded section — lots happening early")
+        notes.append("Crowded section - lots happening early")
 
-    if level == "orange" and notes and notes[-1] == "Crowded section â€” lots happening early" and not is_intro:
-        notes[-1] = "Crowded section â€” lots happening late" if is_outro else "Crowded section â€” many events"
+    if level == "orange" and notes and notes[-1] == "Crowded section - lots happening early" and not is_intro:
+        notes[-1] = "Crowded section - lots happening late" if is_outro else "Crowded section - many events"
 
     if level == "orange" and notes and not is_intro:
         if is_outro:
@@ -153,11 +153,11 @@ def generate_window_advisory(
 
     if level == "orange" and notes and notes[-1].startswith("Crowded section"):
         if is_intro:
-            notes[-1] = "Crowded section â€” lots happening early"
+            notes[-1] = "Crowded section - lots happening early"
         elif is_outro:
-            notes[-1] = "Crowded section â€” lots happening late"
+            notes[-1] = "Crowded section - lots happening late"
         else:
-            notes[-1] = "Crowded section â€” many events"
+            notes[-1] = "Crowded section - many events"
 
     if bass > 0.6 and is_outro:
         notes.append("Bass still carrying")
@@ -168,7 +168,7 @@ def generate_window_advisory(
         if level == "green":
             level = "yellow"
     elif bass < 0.2 and is_intro:
-        notes.append("Light bass — more overlap space")
+        notes.append("Light bass - more overlap space")
 
     if vocals is not None and vocals > 0.5 and is_intro:
         if early_vocal is not None:
@@ -179,7 +179,7 @@ def generate_window_advisory(
             level = "yellow"
 
     if is_long and is_intro and bass > 0.3:
-        notes.append("Bass arrives deeper into the intro — watch extended overlap")
+        notes.append("Bass arrives deeper into the intro - watch extended overlap")
 
     return {"level": level, "notes": notes}
 
@@ -208,15 +208,15 @@ def generate_handoff_narrative(
 
     low_end_product = cur_low * cand_bass
     if low_end_product > 0.4:
-        notes.append("Both carry heavy low end — watch the stacking")
+        notes.append("Both carry heavy low end - watch the stacking")
         level = "orange"
     elif low_end_product > 0.2:
-        notes.append("Some low-end overlap — still manageable")
+        notes.append("Some low-end overlap - still manageable")
         level = "yellow"
 
     vocal_product = 0.0 if cur_vocal is None or cand_vocal is None else cur_vocal * cand_vocal
     if cur_vocal is not None and cand_vocal is not None and vocal_product > 0.25:
-        notes.append("Both have vocal content in the overlap zone — demanding handoff")
+        notes.append("Both have vocal content in the overlap zone - demanding handoff")
         if level != "orange":
             level = "yellow"
     elif cur_vocal is not None and cand_vocal is not None and cur_vocal > 0.5 and cand_vocal < 0.15:
@@ -229,16 +229,16 @@ def generate_handoff_narrative(
     elif cur_clean > 0.7 and cand_clean < 0.4:
         notes.append("Incoming track is busy from the start over an open current outro")
     elif cur_clean < 0.4 and cand_clean < 0.4:
-        notes.append("Both sections are busy — denser overlap")
+        notes.append("Both sections are busy - denser overlap")
         if level == "green":
             level = "yellow"
     elif cur_clean > 0.7 and cand_clean > 0.7:
-        notes.append("Both sections are open — plenty of space")
+        notes.append("Both sections are open - plenty of space")
 
     if level == "green" and not notes:
         notes.append("Clean handoff conditions")
     elif level == "orange" and len(notes) > 1:
-        notes.append("More demanding overlap — trust your ears")
+        notes.append("More demanding overlap - trust your ears")
 
     return {
         "level": level,
@@ -358,7 +358,7 @@ def describe_character_shift(
     """Return character-shift notes comparing current and candidate track roles.
 
     Input: role_hints lists and _rel features for both tracks.
-    Output: list of str — each is a character shift note.
+    Output: list of str - each is a character shift note.
     """
     notes: list[str] = []
     cur = set(current_roles or [])
@@ -399,12 +399,12 @@ def describe_character_shift(
     cand_opener = "opener" in cand or "relief_track" in cand
     cur_opener = "opener" in cur or "relief_track" in cur
 
-    if not cur_peak and cand_peak:
+    if cur_opener and cand_peak:
+        notes.append("big jump from low to peak")
+    elif not cur_peak and cand_peak:
         notes.append("stepping up to peak pressure")
     elif cur_peak and cand_opener:
         notes.append("peak → breather shift")
-    elif cur_opener and cand_peak:
-        notes.append("big jump from low to peak")
 
     return notes
 
@@ -439,9 +439,9 @@ def generate_relative_context_notes(track_rel_features: dict[str, Any]) -> list[
     vocals_rel = track_rel_features.get("vocals_rel")
     if vocals_rel is not None:
         if vocals_rel < 0.15:
-            notes.append("Mostly instrumental — helpful contrast against vocal-heavy material")
+            notes.append("Mostly instrumental - helpful contrast against vocal-heavy material")
         elif vocals_rel > 0.80:
-            notes.append("Vocal-heavy — watch overlap with other vocal tracks")
+            notes.append("Vocal-heavy - watch overlap with other vocal tracks")
 
     return notes
 
@@ -457,13 +457,13 @@ def generate_key_neighborhood_text(
     Output: {"short": str, "direction": str}
     """
     SHORT: dict[str, str] = {
-        "perfect": "Same key — tonally matched",
-        "relative_key": "Relative major/minor — harmonically friendly",
-        "adjacent": "Adjacent on the wheel — harmonically friendly",
-        "cross_adjacent": "Cross-adjacent — usually works well",
-        "energy_boost": "Energy-boost key change — two steps on the wheel",
-        "energy_key_change": "Dominant key change — can work for energy shifts",
-        "mismatch": "Higher harmonic tension — trust your ears on the blend",
+        "perfect": "Same key - tonally matched",
+        "relative_key": "Relative major/minor - harmonically friendly",
+        "adjacent": "Adjacent on the wheel - harmonically friendly",
+        "cross_adjacent": "Cross-adjacent - usually works well",
+        "energy_boost": "Energy-boost key change - two steps on the wheel",
+        "energy_key_change": "Dominant key change - can work for energy shifts",
+        "mismatch": "Higher harmonic tension - trust your ears on the blend",
     }
     DIRECTION: dict[str, str] = {
         "perfect": "Same position on the Camelot wheel",
@@ -493,12 +493,12 @@ def generate_session_notes(
 
     if history_length == 0:
         notes.append(
-            "No history yet — recommendations are based on this track and playlist character only"
+            "No history yet - recommendations are based on this track and playlist character only"
         )
     elif history_length == 1:
         notes.append("First track of the set")
     elif has_gaps:
-        notes.append("History has gaps — cooldown and trend are less certain")
+        notes.append("History has gaps - cooldown and trend are less certain")
 
     if last_recommendation_outcome is not None:
         was_rec = last_recommendation_outcome.get("was_recommended", False)
@@ -730,7 +730,7 @@ def build_track_detail_explanation(
     """Compose the full-analysis explanation block for a single track.
 
     Input:
-        track_abs: absolute feature dict (unused directly — reserved for future fields)
+        track_abs: absolute feature dict (unused directly - reserved for future fields)
         track_rel: relative feature dict with energy_rel, bass_rel, etc.
         windows: dict of window_name → feature dict (e.g. "intro_32", "outro_32")
     Output:

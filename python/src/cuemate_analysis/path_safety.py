@@ -34,10 +34,11 @@ def resolve_existing_file_path(
     *,
     allowed_roots: Iterable[Path] | None = None,
 ) -> Path:
-    resolved = _resolve_path(raw_path, label)
+    roots = list(allowed_roots or [])
+    resolved = _resolve_path(raw_path, label, roots)
+    _ensure_allowed_root(resolved, label, roots)
     if not resolved.is_file():
         raise FileNotFoundError(f"{label} is not a readable file: {resolved}")
-    _ensure_allowed_root(resolved, label, allowed_roots)
     return resolved
 
 
@@ -47,18 +48,32 @@ def resolve_existing_directory_path(
     *,
     allowed_roots: Iterable[Path] | None = None,
 ) -> Path:
-    resolved = _resolve_path(raw_path, label)
+    roots = list(allowed_roots or [])
+    resolved = _resolve_path(raw_path, label, roots)
+    _ensure_allowed_root(resolved, label, roots)
     if not resolved.is_dir():
         raise FileNotFoundError(f"{label} is not a readable directory: {resolved}")
-    _ensure_allowed_root(resolved, label, allowed_roots)
     return resolved
 
 
-def _resolve_path(raw_path: str | Path, label: str) -> Path:
+# Backward-compatible alias for service modules that still use the shorter name.
+resolve_existing_dir_path = resolve_existing_directory_path
+
+
+def _resolve_path(raw_path: str | Path, label: str, allowed_roots: Iterable[Path]) -> Path:
     text = str(raw_path).strip()
     if not text:
         raise ValueError(f"{label} is required.")
-    return Path(text).expanduser().resolve()
+    candidate = Path(text).expanduser()
+    roots = list(allowed_roots)
+    if candidate.is_absolute() or not roots:
+        return candidate.resolve()
+    for root in roots:
+        resolved = (root / candidate).resolve()
+        if resolved.is_relative_to(root):
+            return resolved
+    allowed = ", ".join(root.as_posix() for root in roots)
+    raise ValueError(f"{label} must stay within allowed roots: {allowed}")
 
 
 def _ensure_allowed_root(
@@ -69,11 +84,7 @@ def _ensure_allowed_root(
     roots = list(allowed_roots or [])
     if not roots:
         return
-    if any(_is_relative_to(resolved_path, root) for root in roots):
+    if any(resolved_path.is_relative_to(root) for root in roots):
         return
     allowed = ", ".join(root.as_posix() for root in roots)
     raise ValueError(f"{label} must stay within allowed roots: {allowed}")
-
-
-def _is_relative_to(path: Path, root: Path) -> bool:
-    return path.is_relative_to(root)

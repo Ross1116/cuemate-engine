@@ -37,10 +37,14 @@ if ($gobin -and $gobin.Trim()) {
 } else {
   $pluginBin = Join-Path $gopath "bin"
 }
-$protocGenGo = Join-Path $pluginBin "protoc-gen-go.exe"
-$protocGenGoGrpc = Join-Path $pluginBin "protoc-gen-go-grpc.exe"
+$exeSuffix = ""
+if ($env:OS -eq "Windows_NT") {
+  $exeSuffix = ".exe"
+}
+$protocGenGo = Join-Path $pluginBin "protoc-gen-go$exeSuffix"
+$protocGenGoGrpc = Join-Path $pluginBin "protoc-gen-go-grpc$exeSuffix"
 if (-not (Test-Path $protocGenGo)) {
-  throw "Could not find protoc-gen-go at $protocGenGo. Install it with 'go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.5'."
+  throw "Could not find protoc-gen-go at $protocGenGo. Install it with 'go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11'."
 }
 if (-not (Test-Path $protocGenGoGrpc)) {
   throw "Could not find protoc-gen-go-grpc at $protocGenGoGrpc. Install it with 'go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1'."

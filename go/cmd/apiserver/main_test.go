@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -439,134 +440,31 @@ func newTestServer(t *testing.T, stale bool, relativeSignature string, client *f
 	}
 	defer db.Close()
 
-	for _, stmt := range []string{
-		`CREATE TABLE playlists (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE);`,
-		`CREATE TABLE tracks (
-			id TEXT PRIMARY KEY,
-			file_path TEXT NOT NULL UNIQUE,
-			file_hash TEXT,
-			title TEXT,
-			artist TEXT,
-			imported_bpm REAL,
-			imported_key TEXT,
-			updated_at TEXT
-		);`,
-		`CREATE TABLE playlist_tracks (playlist_id TEXT NOT NULL, track_id TEXT NOT NULL, position INTEGER NOT NULL);`,
-		`CREATE TABLE track_features_abs (
-			track_id TEXT PRIMARY KEY,
-			bpm REAL NOT NULL,
-			key TEXT NOT NULL,
-			key_confidence REAL NOT NULL,
-			key_source TEXT NOT NULL,
-			key_agreement INTEGER,
-			analysis_signature TEXT NOT NULL,
-			config_signature TEXT NOT NULL,
-			scoring_contract_id_at_analysis TEXT
-		);`,
-		`CREATE TABLE track_features_rel (
-			playlist_id TEXT NOT NULL,
-			track_id TEXT NOT NULL,
-			position INTEGER NOT NULL,
-			energy_rel REAL NOT NULL,
-			bass_rel REAL NOT NULL,
-			drums_rel REAL NOT NULL,
-			vocals_rel REAL,
-			groove_rel REAL NOT NULL,
-			intensity_band TEXT NOT NULL,
-			role_hints TEXT NOT NULL,
-			relative_signature TEXT NOT NULL
-		);`,
-		`CREATE TABLE playlist_stats (
-			playlist_id TEXT PRIMARY KEY,
-			track_count_total INTEGER NOT NULL,
-			track_count_analyzed INTEGER NOT NULL,
-			eligible_track_count INTEGER NOT NULL,
-			energy_spread REAL,
-			adapted_weights TEXT,
-			relative_signature TEXT NOT NULL,
-			is_stale INTEGER NOT NULL DEFAULT 0,
-			stale_reason TEXT,
-			stale_marked_at TEXT
-		);`,
-		`CREATE TABLE manual_corrections (
-			id TEXT PRIMARY KEY,
-			user_id TEXT NOT NULL DEFAULT 'local',
-			track_id TEXT NOT NULL,
-			field TEXT NOT NULL,
-			old_value TEXT NOT NULL,
-			new_value TEXT NOT NULL,
-			corrected_at TEXT NOT NULL
-		);`,
-		`CREATE TABLE recommendation_events (
-			id TEXT PRIMARY KEY,
-			user_id TEXT NOT NULL DEFAULT 'local',
-			playlist_id TEXT NOT NULL,
-			current_track_id TEXT NOT NULL,
-			target TEXT NOT NULL,
-			candidate_count INTEGER NOT NULL,
-			recommendation_confidence REAL,
-			recommendations_status TEXT NOT NULL DEFAULT 'available',
-			lanes_returned TEXT NOT NULL,
-			track_chosen TEXT,
-			chosen_was_recommended INTEGER,
-			skipped_over TEXT,
-			adapted_weights TEXT,
-			scoring_contract_id TEXT NOT NULL,
-			timestamp TEXT NOT NULL
-		);`,
-		`CREATE TABLE sync_outbox (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			entity_type TEXT NOT NULL,
-			entity_id TEXT NOT NULL,
-			action TEXT NOT NULL,
-			payload_json TEXT NOT NULL,
-			created_at TEXT NOT NULL,
-			synced_at TEXT
-		);`,
-		`CREATE TABLE playlist_sync_state (
-			playlist_id TEXT PRIMARY KEY,
-			last_snapshot_id TEXT NOT NULL UNIQUE,
-			last_snapshot_generated_at TEXT NOT NULL,
-			last_snapshot_acked_at TEXT,
-			updated_at TEXT NOT NULL
-		);`,
-		`CREATE INDEX idx_sync_outbox_unsynced ON sync_outbox (synced_at, id);`,
-		`CREATE TABLE analysis_jobs (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			playlist_id TEXT,
-			track_id TEXT,
-			track_path TEXT NOT NULL,
-			job_kind TEXT NOT NULL DEFAULT 'full',
-			status TEXT NOT NULL DEFAULT 'pending',
-			priority INTEGER NOT NULL DEFAULT 0,
-			analysis_mode TEXT NOT NULL DEFAULT 'full',
-			analysis_signature TEXT NOT NULL,
-			config_signature TEXT NOT NULL,
-			source_file_hash TEXT,
-			created_at TEXT NOT NULL
-		);`,
-	} {
-		if _, err := db.Exec(stmt); err != nil {
-			t.Fatalf("exec schema: %v", err)
-		}
+	schemaPath := filepath.Join("..", "..", "..", "db", "schema.sql")
+	schemaSQL, err := os.ReadFile(schemaPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%s): %v", schemaPath, err)
+	}
+	if _, err := db.Exec(string(schemaSQL)); err != nil {
+		t.Fatalf("exec schema: %v", err)
 	}
 
-	if _, err := db.Exec(`INSERT INTO playlists (id, name) VALUES ('pl_1', 'Test Playlist')`); err != nil {
+	if _, err := db.Exec(`INSERT INTO playlists (id, name, track_count, created_at, updated_at) VALUES ('pl_1', 'Test Playlist', 3, '2026-04-09T00:00:00Z', '2026-04-09T00:00:00Z')`); err != nil {
 		t.Fatalf("insert playlist: %v", err)
 	}
 	for _, insert := range []string{
-		`INSERT INTO tracks (id, file_path, file_hash, title, artist, imported_bpm, imported_key, updated_at) VALUES ('trk_current', '/music/current.flac', 'hash_current', 'Current', 'Tester', 128.0, '8A', '2026-04-09T00:00:00Z')`,
-		`INSERT INTO tracks (id, file_path, file_hash, title, artist, imported_bpm, imported_key, updated_at) VALUES ('trk_candidate', '/music/candidate.flac', 'hash_candidate', 'Candidate', 'Tester', 128.0, '8A', '2026-04-09T00:00:00Z')`,
-		`INSERT INTO tracks (id, file_path, file_hash, title, artist, imported_bpm, imported_key, updated_at) VALUES ('trk_history', '/music/history.flac', 'hash_history', 'History', 'Tester', 127.0, '8A', '2026-04-09T00:00:00Z')`,
-		`INSERT INTO playlist_tracks (playlist_id, track_id, position) VALUES ('pl_1', 'trk_current', 1)`,
-		`INSERT INTO playlist_tracks (playlist_id, track_id, position) VALUES ('pl_1', 'trk_candidate', 2)`,
-		`INSERT INTO playlist_tracks (playlist_id, track_id, position) VALUES ('pl_1', 'trk_history', 3)`,
-		`INSERT INTO track_features_abs (track_id, bpm, key, key_confidence, key_source, key_agreement, analysis_signature, config_signature, scoring_contract_id_at_analysis) VALUES ('trk_current', 128.0, '8A', 0.9, 'musicalkeycnn', 1, 'm1-ebd25381ebad', 'default', 'm3-v1')`,
-		`INSERT INTO track_features_abs (track_id, bpm, key, key_confidence, key_source, key_agreement, analysis_signature, config_signature, scoring_contract_id_at_analysis) VALUES ('trk_candidate', 128.0, '8A', 0.9, 'musicalkeycnn', 1, 'm1-ebd25381ebad', 'default', 'm3-v1')`,
-		`INSERT INTO track_features_abs (track_id, bpm, key, key_confidence, key_source, key_agreement, analysis_signature, config_signature, scoring_contract_id_at_analysis) VALUES ('trk_history', 127.0, '8A', 0.9, 'musicalkeycnn', 1, 'm1-ebd25381ebad', 'default', 'm3-v1')`,
-		`INSERT INTO track_features_rel (playlist_id, track_id, position, energy_rel, bass_rel, drums_rel, vocals_rel, groove_rel, intensity_band, role_hints, relative_signature) VALUES ('pl_1', 'trk_current', 1, 0.5, 0.5, 0.5, 0.1, 0.5, 'Drive', '["groove"]', '` + relativeSignature + `')`,
-		`INSERT INTO track_features_rel (playlist_id, track_id, position, energy_rel, bass_rel, drums_rel, vocals_rel, groove_rel, intensity_band, role_hints, relative_signature) VALUES ('pl_1', 'trk_candidate', 2, 0.6, 0.6, 0.5, 0.2, 0.5, 'Drive', '["groove"]', '` + relativeSignature + `')`,
-		`INSERT INTO track_features_rel (playlist_id, track_id, position, energy_rel, bass_rel, drums_rel, vocals_rel, groove_rel, intensity_band, role_hints, relative_signature) VALUES ('pl_1', 'trk_history', 3, 0.45, 0.4, 0.5, 0.1, 0.5, 'Drive', '["groove"]', '` + relativeSignature + `')`,
+		`INSERT INTO tracks (id, file_path, file_hash, title, artist, imported_at, updated_at, imported_bpm, imported_key) VALUES ('trk_current', '/music/current.flac', 'hash_current', 'Current', 'Tester', '2026-04-09T00:00:00Z', '2026-04-09T00:00:00Z', 128.0, '8A')`,
+		`INSERT INTO tracks (id, file_path, file_hash, title, artist, imported_at, updated_at, imported_bpm, imported_key) VALUES ('trk_candidate', '/music/candidate.flac', 'hash_candidate', 'Candidate', 'Tester', '2026-04-09T00:00:00Z', '2026-04-09T00:00:00Z', 128.0, '8A')`,
+		`INSERT INTO tracks (id, file_path, file_hash, title, artist, imported_at, updated_at, imported_bpm, imported_key) VALUES ('trk_history', '/music/history.flac', 'hash_history', 'History', 'Tester', '2026-04-09T00:00:00Z', '2026-04-09T00:00:00Z', 127.0, '8A')`,
+		`INSERT INTO playlist_tracks (playlist_id, track_id, position, added_at) VALUES ('pl_1', 'trk_current', 1, '2026-04-09T00:00:00Z')`,
+		`INSERT INTO playlist_tracks (playlist_id, track_id, position, added_at) VALUES ('pl_1', 'trk_candidate', 2, '2026-04-09T00:00:00Z')`,
+		`INSERT INTO playlist_tracks (playlist_id, track_id, position, added_at) VALUES ('pl_1', 'trk_history', 3, '2026-04-09T00:00:00Z')`,
+		`INSERT INTO track_features_abs (track_id, source_file_hash, bpm, bpm_confidence, bpm_source, time_signature, time_signature_confidence, key, key_number, key_letter, key_confidence, key_source, key_agreement, energy_abs, loudness_lufs, loudness_norm, bass_abs, analyzed_at, analysis_signature, config_signature, scoring_contract_id_at_analysis) VALUES ('trk_current', 'hash_current', 128.0, 0.98, 'tempocnn', '4/4', 0.6, '8A', 8, 'A', 0.9, 'musicalkeycnn', 1, 0.60, -10.0, 0.70, 0.50, '2026-04-09T00:00:00Z', 'm1-ebd25381ebad', 'default', 'm3-v1')`,
+		`INSERT INTO track_features_abs (track_id, source_file_hash, bpm, bpm_confidence, bpm_source, time_signature, time_signature_confidence, key, key_number, key_letter, key_confidence, key_source, key_agreement, energy_abs, loudness_lufs, loudness_norm, bass_abs, analyzed_at, analysis_signature, config_signature, scoring_contract_id_at_analysis) VALUES ('trk_candidate', 'hash_candidate', 128.0, 0.98, 'tempocnn', '4/4', 0.6, '8A', 8, 'A', 0.9, 'musicalkeycnn', 1, 0.62, -10.0, 0.70, 0.60, '2026-04-09T00:00:00Z', 'm1-ebd25381ebad', 'default', 'm3-v1')`,
+		`INSERT INTO track_features_abs (track_id, source_file_hash, bpm, bpm_confidence, bpm_source, time_signature, time_signature_confidence, key, key_number, key_letter, key_confidence, key_source, key_agreement, energy_abs, loudness_lufs, loudness_norm, bass_abs, analyzed_at, analysis_signature, config_signature, scoring_contract_id_at_analysis) VALUES ('trk_history', 'hash_history', 127.0, 0.98, 'tempocnn', '4/4', 0.6, '8A', 8, 'A', 0.9, 'musicalkeycnn', 1, 0.50, -10.0, 0.70, 0.40, '2026-04-09T00:00:00Z', 'm1-ebd25381ebad', 'default', 'm3-v1')`,
+		`INSERT INTO track_features_rel (playlist_id, track_id, position, energy_rel, bass_rel, drums_rel, vocals_rel, groove_rel, energy_spread, bass_spread, drums_spread, vocals_spread, groove_spread, intensity_band, intensity_membership, role_hints, valid_as_of_track_count, relative_signature, analysis_signature, config_signature, refreshed_at) VALUES ('pl_1', 'trk_current', 1, 0.5, 0.5, 0.5, 0.1, 0.5, 0.2, 0.2, 0.2, 0.2, 0.2, 'Drive', '{"drive":1.0}', '["groove"]', 3, '` + relativeSignature + `', 'm1-ebd25381ebad', 'default', '2026-04-09T00:00:00Z')`,
+		`INSERT INTO track_features_rel (playlist_id, track_id, position, energy_rel, bass_rel, drums_rel, vocals_rel, groove_rel, energy_spread, bass_spread, drums_spread, vocals_spread, groove_spread, intensity_band, intensity_membership, role_hints, valid_as_of_track_count, relative_signature, analysis_signature, config_signature, refreshed_at) VALUES ('pl_1', 'trk_candidate', 2, 0.6, 0.6, 0.5, 0.2, 0.5, 0.2, 0.2, 0.2, 0.2, 0.2, 'Drive', '{"drive":1.0}', '["groove"]', 3, '` + relativeSignature + `', 'm1-ebd25381ebad', 'default', '2026-04-09T00:00:00Z')`,
+		`INSERT INTO track_features_rel (playlist_id, track_id, position, energy_rel, bass_rel, drums_rel, vocals_rel, groove_rel, energy_spread, bass_spread, drums_spread, vocals_spread, groove_spread, intensity_band, intensity_membership, role_hints, valid_as_of_track_count, relative_signature, analysis_signature, config_signature, refreshed_at) VALUES ('pl_1', 'trk_history', 3, 0.45, 0.4, 0.5, 0.1, 0.5, 0.2, 0.2, 0.2, 0.2, 0.2, 'Drive', '{"drive":1.0}', '["groove"]', 3, '` + relativeSignature + `', 'm1-ebd25381ebad', 'default', '2026-04-09T00:00:00Z')`,
 	} {
 		if _, err := db.Exec(insert); err != nil {
 			t.Fatalf("seed insert: %v", err)
@@ -578,7 +476,7 @@ func newTestServer(t *testing.T, stale bool, relativeSignature string, client *f
 		staleInt = 1
 		staleReason = "absolute_track_changed"
 	}
-	if _, err := db.Exec(`INSERT INTO playlist_stats (playlist_id, track_count_total, track_count_analyzed, eligible_track_count, energy_spread, adapted_weights, relative_signature, is_stale, stale_reason) VALUES ('pl_1', 3, 3, 3, 0.2, '{"harmonic":0.12}', ?, ?, ?)`, relativeSignature, staleInt, staleReason); err != nil {
+	if _, err := db.Exec(`INSERT INTO playlist_stats (playlist_id, track_count_total, track_count_analyzed, eligible_track_count, energy_spread, bass_spread, drums_spread, vocals_spread, harmonic_spread, groove_spread, avg_harmonic, key_diversity, bpm_range, adapted_weights, adaptation_strength, weight_adaptation_notes, status, energy_source_used, relative_signature, refreshed_at, is_stale, stale_reason, stale_marked_at) VALUES ('pl_1', 3, 3, 3, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.5, 0.3, 2.0, '{"harmonic":0.12}', 0.7, '[]', 'ok', 'canonical', ?, '2026-04-09T00:00:00Z', ?, ?, NULL)`, relativeSignature, staleInt, staleReason); err != nil {
 		t.Fatalf("insert playlist_stats: %v", err)
 	}
 

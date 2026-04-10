@@ -109,9 +109,9 @@ class RelativeTrackPreview:
     energy_source_used: str
     energy_rel: float
     bass_rel: float
-    drums_rel: float | None
+    drums_rel: float | None  # Persisted rows coalesce None to 0.5, so DB-loaded values are effectively non-null.
     vocals_rel: float | None
-    groove_rel: float | None
+    groove_rel: float | None  # Persisted rows coalesce None to 0.5, so DB-loaded values are effectively non-null.
     energy_spread: float
     bass_spread: float
     drums_spread: float

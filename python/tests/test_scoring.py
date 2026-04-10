@@ -298,16 +298,9 @@ class TestCamelotCompatibility:
         assert label == "energy_boost"
 
     def test_energy_key_change(self):
-        # wheel_dist(5, 12) = min(7, 5) = 5 — wrong pair. Use 1A → 8A with correct math:
-        # min(abs(1-8), 12-abs(1-8)) = min(7, 5) = 5 → mismatch.
-        # Correct pair for energy_key_change (wheel_dist=7): e.g. 1 and 8 don't work.
-        # 1 to 8: min(7, 5) = 5. Need pairs where min distance = 7: impossible since max = 6.
-        # The spec says "wheel_dist == 7 and same_mode" but wheel is 12-tone: max min-dist = 6.
-        # This means energy_key_change (as written) is unreachable. Test the actual reachable
-        # special cases instead — energy_boost covers wheel_dist=2, same_mode.
-        dist, label = camelot_compatibility(8, "A", 10, "A")
+        dist, label = camelot_compatibility(1, "A", 6, "A")
         assert dist == 2
-        assert label == "energy_boost"
+        assert label == "energy_key_change"
 
     def test_mismatch(self):
         dist, label = camelot_compatibility(1, "A", 6, "B")

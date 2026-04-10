@@ -17,9 +17,9 @@ import (
 )
 
 const (
-	DefaultScoringGRPCAddr      = "127.0.0.1:47834"
-	DefaultScoringRPCTimeout    = 250 * time.Millisecond
-	defaultDialTimeout          = 2 * time.Second
+	DefaultScoringGRPCAddr   = "127.0.0.1:47834"
+	DefaultScoringRPCTimeout = 250 * time.Millisecond
+	defaultDialTimeout       = 2 * time.Second
 )
 
 var (
@@ -78,6 +78,7 @@ func New(cfg Config, dialOptions ...grpc.DialOption) (Client, error) {
 		cfg.RPCTimeout = DefaultScoringRPCTimeout
 	}
 
+	// This timeout matters when a caller opts into grpc.WithBlock().
 	dialCtx, cancel := context.WithTimeout(context.Background(), defaultDialTimeout)
 	defer cancel()
 

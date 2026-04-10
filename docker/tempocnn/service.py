@@ -38,12 +38,24 @@ def resolve_existing_file_path(
     text = str(raw_path).strip()
     if not text:
         raise ValueError(f"{label} is required.")
-    resolved = Path(text).expanduser().resolve()
-    if not resolved.is_file():
-        raise FileNotFoundError(f"{label} is not a readable file: {resolved}")
+    candidate = Path(text).expanduser()
+    if candidate.is_absolute() or not allowed_roots:
+        resolved = candidate.resolve()
+    else:
+        resolved = None
+        for root in allowed_roots:
+            candidate_under_root = (root / candidate).resolve()
+            if _is_relative_to(candidate_under_root, root):
+                resolved = candidate_under_root
+                break
+        if resolved is None:
+            allowed = ", ".join(root.as_posix() for root in allowed_roots)
+            raise ValueError(f"{label} must stay within allowed roots: {allowed}")
     if allowed_roots and not any(_is_relative_to(resolved, root) for root in allowed_roots):
         allowed = ", ".join(root.as_posix() for root in allowed_roots)
         raise ValueError(f"{label} must stay within allowed roots: {allowed}")
+    if not resolved.is_file():
+        raise FileNotFoundError(f"{label} is not a readable file: {resolved}")
     return resolved
 
 

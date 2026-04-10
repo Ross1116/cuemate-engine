@@ -117,8 +117,8 @@ Important notes:
 - Serato crate imports currently provide playlist membership and file-path discovery only; BPM/key metadata is not available from the current parser
 - `analyze-bpm` and `analyze-bpm-playlist` are the intended BPM-only commands
 - `analyze-bpm-key` and `analyze-bpm-key-playlist` are the intended fast paths when you only want BPM + key
-- `analyze-relative-playlist` is the experimental read-only Milestone 2 Phase 1 surface for playlist-relative context and playlist stats previews
-- `analyze-energy-playlist` is the experimental read-only workbench for comparing absolute-energy formulas before promoting one into the production analyzer
+- `analyze-relative-playlist` is the read-only inspection surface for playlist-relative context and playlist stats previews
+- `analyze-energy-playlist` is the read-only diagnostics surface for comparing absolute-energy formulas against the current production analyzer
 - `download-essentia-semantic-models` and `analyze-essentia-playlist` are the model-acquisition and read-only inspection surfaces for Essentia semantic absolute features
 - `recommend-next` organizes scored suggestions into `maintain`, `build`, `reset`, `jump`, and `contrast` lanes
 - `score-pair` is the main diagnostics surface for auditing one current->candidate transition

@@ -12,7 +12,7 @@ go/
 |- go.mod
 ```
 
-Current scope in this slice:
+Current scope:
 
 - a thin Go gRPC client for the Python scoring service
 - a local HTTP API server for live recommendations and scorer metadata

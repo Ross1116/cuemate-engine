@@ -96,12 +96,24 @@ def resolve_existing_file_path(
     text = str(raw_path).strip()
     if not text:
         raise ValueError(f"{label} is required.")
-    resolved = Path(text).expanduser().resolve()
-    if not resolved.is_file():
-        raise FileNotFoundError(f"{label} is not a readable file: {resolved}")
+    candidate = Path(text).expanduser()
+    if candidate.is_absolute() or not allowed_roots:
+        resolved = candidate.resolve()
+    else:
+        resolved = None
+        for root in allowed_roots:
+            candidate_under_root = (root / candidate).resolve()
+            if _is_relative_to(candidate_under_root, root):
+                resolved = candidate_under_root
+                break
+        if resolved is None:
+            allowed = ", ".join(root.as_posix() for root in allowed_roots)
+            raise ValueError(f"{label} must stay within allowed roots: {allowed}")
     if allowed_roots and not any(_is_relative_to(resolved, root) for root in allowed_roots):
         allowed = ", ".join(root.as_posix() for root in allowed_roots)
         raise ValueError(f"{label} must stay within allowed roots: {allowed}")
+    if not resolved.is_file():
+        raise FileNotFoundError(f"{label} is not a readable file: {resolved}")
     return resolved
 
 
@@ -114,12 +126,24 @@ def resolve_existing_dir_path(
     text = str(raw_path).strip()
     if not text:
         raise ValueError(f"{label} is required.")
-    resolved = Path(text).expanduser().resolve()
-    if not resolved.is_dir():
-        raise FileNotFoundError(f"{label} is not a readable directory: {resolved}")
+    candidate = Path(text).expanduser()
+    if candidate.is_absolute() or not allowed_roots:
+        resolved = candidate.resolve()
+    else:
+        resolved = None
+        for root in allowed_roots:
+            candidate_under_root = (root / candidate).resolve()
+            if _is_relative_to(candidate_under_root, root):
+                resolved = candidate_under_root
+                break
+        if resolved is None:
+            allowed = ", ".join(root.as_posix() for root in allowed_roots)
+            raise ValueError(f"{label} must stay within allowed roots: {allowed}")
     if allowed_roots and not any(_is_relative_to(resolved, root) for root in allowed_roots):
         allowed = ", ".join(root.as_posix() for root in allowed_roots)
         raise ValueError(f"{label} must stay within allowed roots: {allowed}")
+    if not resolved.is_dir():
+        raise FileNotFoundError(f"{label} is not a readable directory: {resolved}")
     return resolved
 
 
@@ -413,7 +437,8 @@ def analyze_tempo_audio(model, track_path: str, tempo_audio) -> dict[str, object
     }
 
 
-def analyze_semantic_segment(bundle, track_path: str, semantic_audio) -> dict[str, float]:
+def analyze_semantic_segment(bundle, track_path: Path | str, semantic_audio) -> dict[str, float]:
+    track_path = str(track_path)
     embeddings = bundle["embedding_model"](semantic_audio)
     deam_prediction = bundle["deam_head"](embeddings)
 

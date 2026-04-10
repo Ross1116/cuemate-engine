@@ -120,6 +120,10 @@ type PlaylistSyncState struct {
 	UpdatedAt               string
 }
 
+type execContexter interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
 type SyncOutboxItem struct {
 	ID          int64
 	EntityType  string
@@ -144,6 +148,20 @@ func Open(path string) (*Repository, error) {
 
 func (r *Repository) Close() error {
 	return r.db.Close()
+}
+
+func (r *Repository) RunInTx(ctx context.Context, fn func(*sql.Tx) error) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (r *Repository) ResolvePlaylist(ctx context.Context, playlistID, playlistName string) (PlaylistRef, error) {
@@ -363,7 +381,23 @@ func (r *Repository) GetTrackImportedValues(ctx context.Context, trackID string)
 }
 
 func (r *Repository) UpdateTrackImportedBPM(ctx context.Context, trackID string, bpm float64, updatedAt string) error {
-	_, err := r.db.ExecContext(
+	return r.updateTrackImportedBPM(ctx, r.db, trackID, bpm, updatedAt)
+}
+
+func (r *Repository) UpdateTrackImportedBPMTx(ctx context.Context, tx *sql.Tx, trackID string, bpm float64, updatedAt string) error {
+	return r.updateTrackImportedBPM(ctx, tx, trackID, bpm, updatedAt)
+}
+
+func (r *Repository) UpdateTrackImportedKey(ctx context.Context, trackID string, key string, updatedAt string) error {
+	return r.updateTrackImportedKey(ctx, r.db, trackID, key, updatedAt)
+}
+
+func (r *Repository) UpdateTrackImportedKeyTx(ctx context.Context, tx *sql.Tx, trackID string, key string, updatedAt string) error {
+	return r.updateTrackImportedKey(ctx, tx, trackID, key, updatedAt)
+}
+
+func (r *Repository) updateTrackImportedBPM(ctx context.Context, exec execContexter, trackID string, bpm float64, updatedAt string) error {
+	_, err := exec.ExecContext(
 		ctx,
 		"UPDATE tracks SET imported_bpm = ?, updated_at = ? WHERE id = ?",
 		bpm,
@@ -373,8 +407,8 @@ func (r *Repository) UpdateTrackImportedBPM(ctx context.Context, trackID string,
 	return err
 }
 
-func (r *Repository) UpdateTrackImportedKey(ctx context.Context, trackID string, key string, updatedAt string) error {
-	_, err := r.db.ExecContext(
+func (r *Repository) updateTrackImportedKey(ctx context.Context, exec execContexter, trackID string, key string, updatedAt string) error {
+	_, err := exec.ExecContext(
 		ctx,
 		"UPDATE tracks SET imported_key = ?, updated_at = ? WHERE id = ?",
 		key,
@@ -413,11 +447,19 @@ func (r *Repository) GetPlaylistsContainingTrack(ctx context.Context, trackID st
 }
 
 func (r *Repository) MarkPlaylistsStale(ctx context.Context, playlistIDs []string, reason, markedAt string) error {
+	return r.markPlaylistsStale(ctx, r.db, playlistIDs, reason, markedAt)
+}
+
+func (r *Repository) MarkPlaylistsStaleTx(ctx context.Context, tx *sql.Tx, playlistIDs []string, reason, markedAt string) error {
+	return r.markPlaylistsStale(ctx, tx, playlistIDs, reason, markedAt)
+}
+
+func (r *Repository) markPlaylistsStale(ctx context.Context, exec execContexter, playlistIDs []string, reason, markedAt string) error {
 	if len(playlistIDs) == 0 {
 		return nil
 	}
 	for _, playlistID := range playlistIDs {
-		if _, err := r.db.ExecContext(
+		if _, err := exec.ExecContext(
 			ctx,
 			"UPDATE playlist_stats SET is_stale = 1, stale_reason = ?, stale_marked_at = ? WHERE playlist_id = ?",
 			reason,
@@ -443,15 +485,76 @@ func (r *Repository) CreateAnalysisJobWithKind(
 	priority int,
 	createdAt string,
 ) (int64, error) {
-	tx, err := r.db.BeginTx(ctx, nil)
+	var jobID int64
+	err := r.RunInTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		jobID, err = r.createAnalysisJobWithKindTx(
+			ctx,
+			tx,
+			playlistID,
+			trackID,
+			trackPath,
+			jobKind,
+			analysisMode,
+			analysisSignature,
+			configSignature,
+			sourceFileHash,
+			priority,
+			createdAt,
+		)
+		return err
+	})
 	if err != nil {
 		return 0, err
 	}
-	defer func() {
-		_ = tx.Rollback()
-	}()
+	return jobID, nil
+}
 
-	_, err = tx.ExecContext(
+func (r *Repository) CreateAnalysisJobWithKindTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	playlistID *string,
+	trackID string,
+	trackPath string,
+	jobKind string,
+	analysisMode string,
+	analysisSignature string,
+	configSignature string,
+	sourceFileHash *string,
+	priority int,
+	createdAt string,
+) (int64, error) {
+	return r.createAnalysisJobWithKindTx(
+		ctx,
+		tx,
+		playlistID,
+		trackID,
+		trackPath,
+		jobKind,
+		analysisMode,
+		analysisSignature,
+		configSignature,
+		sourceFileHash,
+		priority,
+		createdAt,
+	)
+}
+
+func (r *Repository) createAnalysisJobWithKindTx(
+	ctx context.Context,
+	exec execContexter,
+	playlistID *string,
+	trackID string,
+	trackPath string,
+	jobKind string,
+	analysisMode string,
+	analysisSignature string,
+	configSignature string,
+	sourceFileHash *string,
+	priority int,
+	createdAt string,
+) (int64, error) {
+	_, err := exec.ExecContext(
 		ctx,
 		`
 		DELETE FROM analysis_jobs
@@ -469,7 +572,7 @@ func (r *Repository) CreateAnalysisJobWithKind(
 	if err != nil {
 		return 0, err
 	}
-	result, err := tx.ExecContext(
+	result, err := exec.ExecContext(
 		ctx,
 		`
 		INSERT INTO analysis_jobs (
@@ -491,18 +594,19 @@ func (r *Repository) CreateAnalysisJobWithKind(
 	if err != nil {
 		return 0, err
 	}
-	jobID, err := result.LastInsertId()
-	if err != nil {
-		return 0, err
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, err
-	}
-	return jobID, nil
+	return result.LastInsertId()
 }
 
 func (r *Repository) InsertManualCorrection(ctx context.Context, record ManualCorrectionRecord) error {
-	_, err := r.db.ExecContext(
+	return r.insertManualCorrection(ctx, r.db, record)
+}
+
+func (r *Repository) InsertManualCorrectionTx(ctx context.Context, tx *sql.Tx, record ManualCorrectionRecord) error {
+	return r.insertManualCorrection(ctx, tx, record)
+}
+
+func (r *Repository) insertManualCorrection(ctx context.Context, exec execContexter, record ManualCorrectionRecord) error {
+	_, err := exec.ExecContext(
 		ctx,
 		`
 		INSERT INTO manual_corrections (
@@ -613,11 +717,33 @@ func (r *Repository) UpdateRecommendationEventChoice(
 	chosenWasRecommended bool,
 	skippedOverJSON string,
 ) error {
+	return r.updateRecommendationEventChoice(ctx, r.db, eventID, chosenTrackID, chosenWasRecommended, skippedOverJSON)
+}
+
+func (r *Repository) UpdateRecommendationEventChoiceTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	eventID string,
+	chosenTrackID string,
+	chosenWasRecommended bool,
+	skippedOverJSON string,
+) error {
+	return r.updateRecommendationEventChoice(ctx, tx, eventID, chosenTrackID, chosenWasRecommended, skippedOverJSON)
+}
+
+func (r *Repository) updateRecommendationEventChoice(
+	ctx context.Context,
+	exec execContexter,
+	eventID string,
+	chosenTrackID string,
+	chosenWasRecommended bool,
+	skippedOverJSON string,
+) error {
 	value := int64(0)
 	if chosenWasRecommended {
 		value = 1
 	}
-	_, err := r.db.ExecContext(
+	_, err := exec.ExecContext(
 		ctx,
 		`
 		UPDATE recommendation_events
@@ -640,7 +766,31 @@ func (r *Repository) InsertSyncOutbox(
 	payloadJSON string,
 	createdAt string,
 ) (int64, error) {
-	result, err := r.db.ExecContext(
+	return r.insertSyncOutbox(ctx, r.db, entityType, entityID, action, payloadJSON, createdAt)
+}
+
+func (r *Repository) InsertSyncOutboxTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	entityType string,
+	entityID string,
+	action string,
+	payloadJSON string,
+	createdAt string,
+) (int64, error) {
+	return r.insertSyncOutbox(ctx, tx, entityType, entityID, action, payloadJSON, createdAt)
+}
+
+func (r *Repository) insertSyncOutbox(
+	ctx context.Context,
+	exec execContexter,
+	entityType string,
+	entityID string,
+	action string,
+	payloadJSON string,
+	createdAt string,
+) (int64, error) {
+	result, err := exec.ExecContext(
 		ctx,
 		`
 		INSERT INTO sync_outbox (entity_type, entity_id, action, payload_json, created_at)

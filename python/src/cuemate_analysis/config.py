@@ -33,6 +33,13 @@ DEFAULT_WEIGHT_FLOORS = {
 
 DEFAULT_SCORING_THRESHOLDS = {
     "bpm_hard": 8.0,
+    "bpm_hard_by_target": {
+        "maintain": 8.0,
+        "build": 12.0,
+        "jump": 20.0,
+        "reset": 20.0,
+    },
+    "bpm_ratio_pass": ["half", "double", "three_two", "two_three"],
     "bpm_soft": 3.0,
     "cooldown_window": 5,
 }

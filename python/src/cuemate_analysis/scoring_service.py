@@ -396,7 +396,15 @@ class ScoringServiceServicer:
         response = pb2.GetRecommendationsResponse()
         response.recommendations_status = "available"
         response.status_note = "Scoring available."
-        response.lane_order.extend(_lane_order_for_response(target_lane))
+        lane_order = results.get("lane_order")
+        if isinstance(lane_order, list) and lane_order:
+            response.lane_order.extend(str(item) for item in lane_order if str(item))
+        else:
+            response.lane_order.extend(_lane_order_for_response(target_lane))
+        lane_iteration_order = list(response.lane_order)
+        for lane_name in _lane_order_for_response(target_lane):
+            if lane_name not in lane_iteration_order:
+                lane_iteration_order.append(lane_name)
         response.recommendation_confidence = float(results.get("recommendation_confidence", 0.0) or 0.0)
         _set_track_message(response.current_track, current_track, source_message=request.current_track)
         meta = results.get("meta", {})
@@ -425,7 +433,7 @@ class ScoringServiceServicer:
         response.capabilities.flags.update(metadata.get("capability_flags", {}))
         candidate_sources = {item.track_id: item for item in request.candidates}
         lane_payloads = results.get("lanes") or {}
-        for lane_name in _lane_order_for_response(target_lane):
+        for lane_name in lane_iteration_order:
             items = lane_payloads.get(lane_name, [])
             lane_message = response.lanes.add()
             lane_meta = _lane_display(lane_name)

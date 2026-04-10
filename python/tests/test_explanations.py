@@ -524,11 +524,9 @@ class TestDescribeCharacterShift:
         notes = self._shift(["peak_tool"], ["opener"])
         assert any("peak → breather" in n for n in notes)
 
-    def test_opener_to_peak_stepping_up(self):
-        # opener → peak_tool: cur_peak=False, cand_peak=True → "stepping up to peak pressure"
-        # (the "big jump" branch is unreachable because the prior elif fires first)
+    def test_opener_to_peak_big_jump(self):
         notes = self._shift(["opener"], ["peak_tool"])
-        assert any("stepping up to peak pressure" in n for n in notes)
+        assert any("big jump from low to peak" in n for n in notes)
 
     def test_empty_roles_no_crash(self):
         notes = self._shift([], [])

@@ -46,7 +46,10 @@ Implemented today:
 Deferred for now:
 
 - windowed intro/outro analysis
-- recommendation outcome logging / feedback loop
+
+Follow-on work:
+
+- recommendation outcome analytics and tuning loops built on top of the captured event data
 
 ## Architecture
 
@@ -506,12 +509,12 @@ python -m cuemate_analysis benchmark-dsp --path "D:\Music\track.flac"
 
 ## Known Boundaries
 
-- Go decision plane now serves the live recommendations API plus single-consumer snapshot/outbox sync primitives, but richer feedback loops and actual mobile consumption are still deferred
+- Go decision plane now serves the live recommendations API plus single-consumer snapshot/outbox sync primitives; richer outcome analytics and actual mobile consumption are follow-on work
 - windowed intro/outro analysis is intentionally deferred
 - `transition_support`, `vocal_transition`, and `rhythmic_continuity` are still explicit stubs and are excluded from weighted scoring
 - `vocals_abs` / `vocals_rel` are not populated by the current analysis pipeline yet, so vocal-dependent recommendation logic remains limited
 - some metadata imported from DJ libraries or file tags can still be wrong; the current resolver uses provenance + confidence heuristics rather than treating any source as perfect
-- Essentia semantic calibration infrastructure exists, but semantic validation/tuning is still ongoing
+- Essentia semantic calibration infrastructure exists, and the current semantic lane is live; future listening-test calibration can still refine those heuristics
 
 ## Roadmap
 
@@ -524,10 +527,10 @@ Done:
 
 Next:
 
-- recommendation outcome logging and tuning loop
 - mobile/API integration
+- recommendation outcome analytics and tuning loop
 
 Later:
 
-- operational sync surfaces
+- multi-device/authenticated sync surfaces
 - optional advanced enrichments

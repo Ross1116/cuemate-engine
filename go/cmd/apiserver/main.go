@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -307,43 +308,45 @@ func (s *server) handlePlayedEvent(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	if err := s.repo.UpdateRecommendationEventChoice(
-		r.Context(),
-		event.ID,
-		req.ChosenTrackID,
-		wasRecommended,
-		string(skippedJSONBytes),
-	); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
-
 	playedAt := req.PlayedAt
 	if strings.TrimSpace(playedAt) == "" {
 		playedAt = recommendationsrepo.NowUTC()
 	}
-	outboxPayload, err := json.Marshal(map[string]any{
-		"recommendation_event_id": event.ID,
-		"playlist_id":             event.PlaylistID,
-		"current_track_id":        event.CurrentTrackID,
-		"chosen_track_id":         req.ChosenTrackID,
-		"chosen_was_recommended":  wasRecommended,
-		"skipped_over":            skippedOver,
-		"played_at":               playedAt,
+	err = s.repo.RunInTx(r.Context(), func(tx *sql.Tx) error {
+		if err := s.repo.UpdateRecommendationEventChoiceTx(
+			r.Context(),
+			tx,
+			event.ID,
+			req.ChosenTrackID,
+			wasRecommended,
+			string(skippedJSONBytes),
+		); err != nil {
+			return err
+		}
+		outboxPayload, err := json.Marshal(map[string]any{
+			"recommendation_event_id": event.ID,
+			"playlist_id":             event.PlaylistID,
+			"current_track_id":        event.CurrentTrackID,
+			"chosen_track_id":         req.ChosenTrackID,
+			"chosen_was_recommended":  wasRecommended,
+			"skipped_over":            skippedOver,
+			"played_at":               playedAt,
+		})
+		if err != nil {
+			log.Printf("failed to marshal recommendation event outbox payload for %s: %v", event.ID, err)
+			return fmt.Errorf("failed to encode sync payload: %w", err)
+		}
+		_, err = s.repo.InsertSyncOutboxTx(
+			r.Context(),
+			tx,
+			"recommendation_event",
+			event.ID,
+			"played",
+			string(outboxPayload),
+			playedAt,
+		)
+		return err
 	})
-	if err != nil {
-		log.Printf("failed to marshal recommendation event outbox payload for %s: %v", event.ID, err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to encode sync payload"})
-		return
-	}
-	_, err = s.repo.InsertSyncOutbox(
-		r.Context(),
-		"recommendation_event",
-		event.ID,
-		"played",
-		string(outboxPayload),
-		playedAt,
-	)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -413,10 +416,6 @@ func (s *server) handleCorrections(w http.ResponseWriter, r *http.Request) {
 			changed = true
 		}
 		if changed {
-			if err := s.repo.UpdateTrackImportedBPM(r.Context(), req.TrackID, newValue, correctedAt); err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-				return
-			}
 			correction = recommendationsrepo.ManualCorrectionRecord{
 				ID:          uuid.NewString(),
 				TrackID:     req.TrackID,
@@ -440,10 +439,6 @@ func (s *server) handleCorrections(w http.ResponseWriter, r *http.Request) {
 			changed = true
 		}
 		if changed {
-			if err := s.repo.UpdateTrackImportedKey(r.Context(), req.TrackID, newValue, correctedAt); err != nil {
-				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-				return
-			}
 			correction = recommendationsrepo.ManualCorrectionRecord{
 				ID:          uuid.NewString(),
 				TrackID:     req.TrackID,
@@ -468,10 +463,6 @@ func (s *server) handleCorrections(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	if err := s.repo.InsertManualCorrection(r.Context(), correction); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
 	playlists, err := s.repo.GetPlaylistsContainingTrack(r.Context(), req.TrackID)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -481,28 +472,7 @@ func (s *server) handleCorrections(w http.ResponseWriter, r *http.Request) {
 	for _, playlist := range playlists {
 		playlistIDs = append(playlistIDs, playlist.ID)
 	}
-	if err := s.repo.MarkPlaylistsStale(r.Context(), playlistIDs, "manual_correction", correctedAt); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
 	active := metadata.GetActiveSignatures()
-	jobID, err := s.repo.CreateAnalysisJobWithKind(
-		r.Context(),
-		nil,
-		req.TrackID,
-		track.FilePath,
-		"full",
-		"full",
-		active.GetAnalysisSignature(),
-		active.GetConfigSignature(),
-		track.FileHash,
-		100,
-		correctedAt,
-	)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
 	outboxPayload, err := json.Marshal(map[string]any{
 		"correction_id":             correction.ID,
 		"track_id":                  req.TrackID,
@@ -517,7 +487,48 @@ func (s *server) handleCorrections(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to encode sync payload"})
 		return
 	}
-	if _, err := s.repo.InsertSyncOutbox(r.Context(), "manual_correction", correction.ID, "upsert", string(outboxPayload), correctedAt); err != nil {
+	var jobID int64
+	err = s.repo.RunInTx(r.Context(), func(tx *sql.Tx) error {
+		switch correction.Field {
+		case "bpm":
+			newValue, _ := parseCorrectionBPM(req.NewValue)
+			if err := s.repo.UpdateTrackImportedBPMTx(r.Context(), tx, req.TrackID, newValue, correctedAt); err != nil {
+				return err
+			}
+		case "key":
+			newValue, _ := parseCorrectionKey(req.NewValue)
+			if err := s.repo.UpdateTrackImportedKeyTx(r.Context(), tx, req.TrackID, newValue, correctedAt); err != nil {
+				return err
+			}
+		}
+		if err := s.repo.InsertManualCorrectionTx(r.Context(), tx, correction); err != nil {
+			return err
+		}
+		if err := s.repo.MarkPlaylistsStaleTx(r.Context(), tx, playlistIDs, "manual_correction", correctedAt); err != nil {
+			return err
+		}
+		var err error
+		jobID, err = s.repo.CreateAnalysisJobWithKindTx(
+			r.Context(),
+			tx,
+			nil,
+			req.TrackID,
+			track.FilePath,
+			"full",
+			"full",
+			active.GetAnalysisSignature(),
+			active.GetConfigSignature(),
+			track.FileHash,
+			100,
+			correctedAt,
+		)
+		if err != nil {
+			return err
+		}
+		_, err = s.repo.InsertSyncOutboxTx(r.Context(), tx, "manual_correction", correction.ID, "upsert", string(outboxPayload), correctedAt)
+		return err
+	})
+	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
@@ -1046,8 +1057,10 @@ func (s *server) recordRecommendationEvent(
 		items := make([]map[string]any, 0, len(lane.GetItems()))
 		for _, item := range lane.GetItems() {
 			items = append(items, map[string]any{
-				"track_id": item.GetCandidate().GetTrackId(),
-				"score":    item.GetFinalScore(),
+				"track_id":       item.GetCandidate().GetTrackId(),
+				"score":          item.GetFinalScore(),
+				"primary_lane":   item.GetPrimaryLane(),
+				"secondary_lane": item.GetSecondaryLane(),
 			})
 		}
 		lanesSnapshot[lane.GetLaneGroup().GetLaneId()] = items
@@ -1102,19 +1115,24 @@ func derivePlayedOutcome(lanesJSON string, chosenTrackID string) (bool, []string
 	chosenWasRecommended := false
 	chosenScore := 0.0
 	chosenLane := ""
-	for laneName, items := range payload.Lanes {
+	for _, laneName := range payload.LaneOrder {
+		items := payload.Lanes[laneName]
 		for _, item := range items {
 			if asString(item["track_id"]) == chosenTrackID {
 				chosenWasRecommended = true
 				chosenScore = asFloat(item["score"])
-				chosenLane = laneName
+				chosenLane = firstNonEmpty(asString(item["primary_lane"]), laneName)
 				break
 			}
+		}
+		if chosenWasRecommended {
+			break
 		}
 	}
 	var skipped []string
 	if chosenWasRecommended {
-		for laneName, items := range payload.Lanes {
+		for _, laneName := range payload.LaneOrder {
+			items := payload.Lanes[laneName]
 			if laneName == chosenLane || len(items) == 0 {
 				continue
 			}
@@ -1162,6 +1180,15 @@ func asFloat(value any) float64 {
 	default:
 		return 0
 	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func currentTrackPayload(record recommendationsrepo.TrackContextRecord) map[string]any {

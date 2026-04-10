@@ -293,11 +293,16 @@ def preprocess_audio_excerpts(
     excerpt_seconds: float = MUSICALKEYCNN_EXCERPT_SECONDS,
     max_excerpts: int = MUSICALKEYCNN_MAX_EXCERPTS,
 ) -> torch.Tensor:
-    starts = select_excerpt_starts(track_path, excerpt_seconds=excerpt_seconds, max_excerpts=max_excerpts)
+    resolved_track_path = _coerce_existing_track_path(track_path)
+    starts = select_excerpt_starts(
+        resolved_track_path,
+        excerpt_seconds=excerpt_seconds,
+        max_excerpts=max_excerpts,
+    )
     excerpt_tensors: list[torch.Tensor] = []
     for start_seconds in starts:
         waveform = load_audio_excerpt(
-            track_path,
+            resolved_track_path,
             start_seconds=start_seconds,
             duration_seconds=excerpt_seconds,
             sample_rate=sample_rate,
@@ -312,7 +317,7 @@ def preprocess_audio_excerpts(
         )
 
     if not excerpt_tensors:
-        raise ValueError(f"No excerpts prepared for {track_path}")
+        raise ValueError(f"No excerpts prepared for {resolved_track_path}")
     return torch.stack(excerpt_tensors, dim=0)
 
 

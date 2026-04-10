@@ -506,7 +506,7 @@ python -m cuemate_analysis benchmark-dsp --path "D:\Music\track.flac"
 
 ## Known Boundaries
 
-- Go decision plane now serves the live recommendations API plus basic write-side event/correction/snapshot surfaces, but active sync processing and richer feedback loops are still deferred
+- Go decision plane now serves the live recommendations API plus single-consumer snapshot/outbox sync primitives, but richer feedback loops and actual mobile consumption are still deferred
 - windowed intro/outro analysis is intentionally deferred
 - `transition_support`, `vocal_transition`, and `rhythmic_continuity` are still explicit stubs and are excluded from weighted scoring
 - `vocals_abs` / `vocals_rel` are not populated by the current analysis pipeline yet, so vocal-dependent recommendation logic remains limited
@@ -520,15 +520,14 @@ Done:
 - Milestone 1 absolute analysis
 - Milestone 2 persisted relative context
 - Milestone 3 Python recommendation/scoring core
-- Milestone 4 local service/API bootstrap and write-side cleanup
+- Milestone 4 local service/API bootstrap, write-side cleanup, and explicit-ack sync protocol
 
 Next:
 
 - recommendation outcome logging and tuning loop
-- active sync-outbox processing / replica push-pull workflow
+- mobile/API integration
 
 Later:
 
-- mobile/API integration
 - operational sync surfaces
 - optional advanced enrichments

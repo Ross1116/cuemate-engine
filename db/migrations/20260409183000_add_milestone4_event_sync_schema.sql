@@ -37,7 +37,19 @@ CREATE TABLE IF NOT EXISTS sync_outbox (
   synced_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS playlist_sync_state (
+  playlist_id TEXT PRIMARY KEY REFERENCES playlists(id) ON DELETE CASCADE,
+  last_snapshot_id TEXT NOT NULL UNIQUE,
+  last_snapshot_generated_at TEXT NOT NULL,
+  last_snapshot_acked_at TEXT,
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_sync_outbox_unsynced ON sync_outbox (synced_at, id);
+
 -- migrate:down
+DROP INDEX IF EXISTS idx_sync_outbox_unsynced;
+DROP TABLE IF EXISTS playlist_sync_state;
 DROP TABLE IF EXISTS sync_outbox;
 DROP TABLE IF EXISTS recommendation_events;
 DROP TABLE IF EXISTS manual_corrections;

@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -259,6 +260,26 @@ func TestCorrectionsQueueReanalysisAndOutbox(t *testing.T) {
 	if payload["queued_job_id"] == nil {
 		t.Fatalf("expected queued_job_id")
 	}
+
+	outboxRec := httptest.NewRecorder()
+	outboxReq := httptest.NewRequest(http.MethodPost, "/sync/outbox/pull", bytes.NewBufferString(`{}`))
+	srv.handleOutboxPull(outboxRec, outboxReq)
+	if outboxRec.Code != http.StatusOK {
+		t.Fatalf("outbox pull status = %d body=%s", outboxRec.Code, outboxRec.Body.String())
+	}
+	var outboxPayload map[string]any
+	_ = json.Unmarshal(outboxRec.Body.Bytes(), &outboxPayload)
+	items := outboxPayload["items"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("outbox items = %#v", items)
+	}
+	itemPayload := items[0].(map[string]any)["payload"].(map[string]any)
+	if itemPayload["requires_snapshot_refresh"] != true {
+		t.Fatalf("requires_snapshot_refresh = %#v", itemPayload["requires_snapshot_refresh"])
+	}
+	if _, ok := itemPayload["affected_playlist_ids"]; !ok {
+		t.Fatalf("affected_playlist_ids missing from payload: %#v", itemPayload)
+	}
 }
 
 func TestSnapshotExportsPlaylistScopedPayload(t *testing.T) {
@@ -277,9 +298,135 @@ func TestSnapshotExportsPlaylistScopedPayload(t *testing.T) {
 	if payload["playlist_id"] != "pl_1" {
 		t.Fatalf("playlist_id = %#v", payload["playlist_id"])
 	}
+	freshness := payload["freshness"].(map[string]any)
+	if freshness["delivery_state"] != "never_synced" {
+		t.Fatalf("delivery_state = %#v", freshness["delivery_state"])
+	}
+	if freshness["last_synced_at"] != nil {
+		t.Fatalf("last_synced_at = %#v", freshness["last_synced_at"])
+	}
 	precomputed := payload["precomputed"].(map[string]any)
 	if precomputed["playlist_analysis"] != nil {
 		t.Fatalf("playlist_analysis = %#v", precomputed["playlist_analysis"])
+	}
+}
+
+func TestSnapshotAckUpdatesDeliveryState(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+
+	firstRec := httptest.NewRecorder()
+	firstReq := httptest.NewRequest(http.MethodPost, "/sync/playlists/snapshot", bytes.NewBufferString(`{"playlist_name":"Test Playlist"}`))
+	srv.handleSnapshot(firstRec, firstReq)
+	if firstRec.Code != http.StatusOK {
+		t.Fatalf("snapshot status = %d body=%s", firstRec.Code, firstRec.Body.String())
+	}
+	var firstPayload map[string]any
+	_ = json.Unmarshal(firstRec.Body.Bytes(), &firstPayload)
+	snapshotID := firstPayload["snapshot_id"].(string)
+
+	ackRec := httptest.NewRecorder()
+	ackReq := httptest.NewRequest(http.MethodPost, "/sync/playlists/snapshot/ack", bytes.NewBufferString(`{"snapshot_id":"`+snapshotID+`","acked_at":"2026-04-09T01:00:00Z"}`))
+	srv.handleSnapshotAck(ackRec, ackReq)
+	if ackRec.Code != http.StatusOK {
+		t.Fatalf("snapshot ack status = %d body=%s", ackRec.Code, ackRec.Body.String())
+	}
+
+	secondRec := httptest.NewRecorder()
+	secondReq := httptest.NewRequest(http.MethodPost, "/sync/playlists/snapshot", bytes.NewBufferString(`{"playlist_name":"Test Playlist"}`))
+	srv.handleSnapshot(secondRec, secondReq)
+	if secondRec.Code != http.StatusOK {
+		t.Fatalf("snapshot status = %d body=%s", secondRec.Code, secondRec.Body.String())
+	}
+	var secondPayload map[string]any
+	_ = json.Unmarshal(secondRec.Body.Bytes(), &secondPayload)
+	freshness := secondPayload["freshness"].(map[string]any)
+	if freshness["delivery_state"] != "pending_ack" {
+		t.Fatalf("delivery_state = %#v", freshness["delivery_state"])
+	}
+	if freshness["last_synced_at"] != "2026-04-09T01:00:00Z" {
+		t.Fatalf("last_synced_at = %#v", freshness["last_synced_at"])
+	}
+
+	thirdRec := httptest.NewRecorder()
+	thirdReq := httptest.NewRequest(http.MethodPost, "/sync/playlists/snapshot/ack", bytes.NewBufferString(`{"snapshot_id":"`+secondPayload["snapshot_id"].(string)+`","acked_at":"2026-04-09T02:00:00Z"}`))
+	srv.handleSnapshotAck(thirdRec, thirdReq)
+	if thirdRec.Code != http.StatusOK {
+		t.Fatalf("snapshot ack status = %d body=%s", thirdRec.Code, thirdRec.Body.String())
+	}
+
+	state, err := srv.repo.GetPlaylistSyncState(context.Background(), "pl_1")
+	if err != nil {
+		t.Fatalf("GetPlaylistSyncState() error = %v", err)
+	}
+	if state == nil || state.LastSnapshotAckedAt == nil || *state.LastSnapshotAckedAt != "2026-04-09T02:00:00Z" {
+		t.Fatalf("sync state = %#v", state)
+	}
+}
+
+func TestSnapshotAckUnknownIDReturns404(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/sync/playlists/snapshot/ack", bytes.NewBufferString(`{"snapshot_id":"missing"}`))
+	srv.handleSnapshotAck(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestOutboxPullAndAckLifecycle(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+	ctx := context.Background()
+	if _, err := srv.repo.InsertSyncOutbox(ctx, "recommendation_event", "evt_1", "played", `{"foo":"bar1"}`, "2026-04-09T00:00:00Z"); err != nil {
+		t.Fatalf("InsertSyncOutbox() error = %v", err)
+	}
+	if _, err := srv.repo.InsertSyncOutbox(ctx, "manual_correction", "corr_1", "upsert", `{"foo":"bar2"}`, "2026-04-09T00:01:00Z"); err != nil {
+		t.Fatalf("InsertSyncOutbox() error = %v", err)
+	}
+
+	pullRec := httptest.NewRecorder()
+	pullReq := httptest.NewRequest(http.MethodPost, "/sync/outbox/pull", bytes.NewBufferString(`{"limit":1}`))
+	srv.handleOutboxPull(pullRec, pullReq)
+	if pullRec.Code != http.StatusOK {
+		t.Fatalf("pull status = %d body=%s", pullRec.Code, pullRec.Body.String())
+	}
+	var pullPayload map[string]any
+	_ = json.Unmarshal(pullRec.Body.Bytes(), &pullPayload)
+	if pullPayload["has_more"] != true {
+		t.Fatalf("has_more = %#v", pullPayload["has_more"])
+	}
+	items := pullPayload["items"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("items = %#v", items)
+	}
+	nextAckID := int64(pullPayload["next_ack_id"].(float64))
+
+	ackRec := httptest.NewRecorder()
+	ackReq := httptest.NewRequest(http.MethodPost, "/sync/outbox/ack", bytes.NewBufferString(`{"ack_through_id":`+jsonNumber(nextAckID)+`,"acked_at":"2026-04-09T03:00:00Z"}`))
+	srv.handleOutboxAck(ackRec, ackReq)
+	if ackRec.Code != http.StatusOK {
+		t.Fatalf("ack status = %d body=%s", ackRec.Code, ackRec.Body.String())
+	}
+
+	secondPullRec := httptest.NewRecorder()
+	secondPullReq := httptest.NewRequest(http.MethodPost, "/sync/outbox/pull", bytes.NewBufferString(`{"limit":10}`))
+	srv.handleOutboxPull(secondPullRec, secondPullReq)
+	if secondPullRec.Code != http.StatusOK {
+		t.Fatalf("pull status = %d body=%s", secondPullRec.Code, secondPullRec.Body.String())
+	}
+	var secondPullPayload map[string]any
+	_ = json.Unmarshal(secondPullRec.Body.Bytes(), &secondPullPayload)
+	secondItems := secondPullPayload["items"].([]any)
+	if len(secondItems) != 1 {
+		t.Fatalf("items after ack = %#v", secondItems)
+	}
+	if secondItems[0].(map[string]any)["entity_id"] != "corr_1" {
+		t.Fatalf("remaining item = %#v", secondItems[0])
 	}
 }
 
@@ -376,6 +523,14 @@ func newTestServer(t *testing.T, stale bool, relativeSignature string, client *f
 			created_at TEXT NOT NULL,
 			synced_at TEXT
 		);`,
+		`CREATE TABLE playlist_sync_state (
+			playlist_id TEXT PRIMARY KEY,
+			last_snapshot_id TEXT NOT NULL UNIQUE,
+			last_snapshot_generated_at TEXT NOT NULL,
+			last_snapshot_acked_at TEXT,
+			updated_at TEXT NOT NULL
+		);`,
+		`CREATE INDEX idx_sync_outbox_unsynced ON sync_outbox (synced_at, id);`,
 		`CREATE TABLE analysis_jobs (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			playlist_id TEXT,
@@ -448,4 +603,8 @@ func fakeMetadata(relativeSignature string) *scoringv1.GetScoringMetadataRespons
 		CapabilityFlags:           map[string]bool{"explanations_available": true},
 		ExpectedRelativeSignature: relativeSignature,
 	}
+}
+
+func jsonNumber(value int64) string {
+	return fmt.Sprintf("%d", value)
 }

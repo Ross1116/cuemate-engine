@@ -111,6 +111,24 @@ type PlaylistTrackSnapshot struct {
 	AnalysisState string
 }
 
+type PlaylistSyncState struct {
+	PlaylistID              string
+	LastSnapshotID          string
+	LastSnapshotGeneratedAt string
+	LastSnapshotAckedAt     *string
+	UpdatedAt               string
+}
+
+type SyncOutboxItem struct {
+	ID          int64
+	EntityType  string
+	EntityID    string
+	Action      string
+	PayloadJSON string
+	CreatedAt   string
+	SyncedAt    *string
+}
+
 type Repository struct {
 	db *sql.DB
 }
@@ -622,8 +640,171 @@ func (r *Repository) InsertSyncOutbox(
 	return result.LastInsertId()
 }
 
+func (r *Repository) UpsertPlaylistSyncState(
+	ctx context.Context,
+	playlistID string,
+	snapshotID string,
+	generatedAt string,
+	updatedAt string,
+) error {
+	_, err := r.db.ExecContext(
+		ctx,
+		`
+		INSERT INTO playlist_sync_state (
+		  playlist_id, last_snapshot_id, last_snapshot_generated_at, last_snapshot_acked_at, updated_at
+		) VALUES (?, ?, ?, NULL, ?)
+		ON CONFLICT(playlist_id) DO UPDATE SET
+		  last_snapshot_id = excluded.last_snapshot_id,
+		  last_snapshot_generated_at = excluded.last_snapshot_generated_at,
+		  last_snapshot_acked_at = NULL,
+		  updated_at = excluded.updated_at
+		`,
+		playlistID,
+		snapshotID,
+		generatedAt,
+		updatedAt,
+	)
+	return err
+}
+
+func (r *Repository) GetPlaylistSyncState(ctx context.Context, playlistID string) (*PlaylistSyncState, error) {
+	row := r.db.QueryRowContext(
+		ctx,
+		`
+		SELECT playlist_id, last_snapshot_id, last_snapshot_generated_at, last_snapshot_acked_at, updated_at
+		FROM playlist_sync_state
+		WHERE playlist_id = ?
+		`,
+		playlistID,
+	)
+	return scanPlaylistSyncState(row)
+}
+
+func (r *Repository) GetPlaylistSyncStateBySnapshotID(ctx context.Context, snapshotID string) (*PlaylistSyncState, error) {
+	row := r.db.QueryRowContext(
+		ctx,
+		`
+		SELECT playlist_id, last_snapshot_id, last_snapshot_generated_at, last_snapshot_acked_at, updated_at
+		FROM playlist_sync_state
+		WHERE last_snapshot_id = ?
+		`,
+		snapshotID,
+	)
+	return scanPlaylistSyncState(row)
+}
+
+func (r *Repository) AckPlaylistSnapshot(ctx context.Context, snapshotID string, ackedAt string) (*PlaylistSyncState, error) {
+	state, err := r.GetPlaylistSyncStateBySnapshotID(ctx, snapshotID)
+	if err != nil {
+		return nil, err
+	}
+	if state == nil {
+		return nil, nil
+	}
+	_, err = r.db.ExecContext(
+		ctx,
+		`
+		UPDATE playlist_sync_state
+		SET last_snapshot_acked_at = ?, updated_at = ?
+		WHERE playlist_id = ?
+		`,
+		ackedAt,
+		ackedAt,
+		state.PlaylistID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return r.GetPlaylistSyncState(ctx, state.PlaylistID)
+}
+
+func (r *Repository) PullUnsyncedOutbox(ctx context.Context, limit int) ([]SyncOutboxItem, bool, error) {
+	rows, err := r.db.QueryContext(
+		ctx,
+		`
+		SELECT id, entity_type, entity_id, action, payload_json, created_at, synced_at
+		FROM sync_outbox
+		WHERE synced_at IS NULL
+		ORDER BY id ASC
+		LIMIT ?
+		`,
+		limit+1,
+	)
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close()
+
+	items := make([]SyncOutboxItem, 0, limit+1)
+	for rows.Next() {
+		var item SyncOutboxItem
+		var syncedAt sql.NullString
+		if err := rows.Scan(
+			&item.ID,
+			&item.EntityType,
+			&item.EntityID,
+			&item.Action,
+			&item.PayloadJSON,
+			&item.CreatedAt,
+			&syncedAt,
+		); err != nil {
+			return nil, false, err
+		}
+		if syncedAt.Valid {
+			item.SyncedAt = &syncedAt.String
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	hasMore := len(items) > limit
+	if hasMore {
+		items = items[:limit]
+	}
+	return items, hasMore, nil
+}
+
+func (r *Repository) AckOutboxThroughID(ctx context.Context, ackThroughID int64, ackedAt string) (int64, error) {
+	result, err := r.db.ExecContext(
+		ctx,
+		`
+		UPDATE sync_outbox
+		SET synced_at = ?
+		WHERE id <= ? AND synced_at IS NULL
+		`,
+		ackedAt,
+		ackThroughID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 func NowUTC() string {
 	return time.Now().UTC().Format(time.RFC3339)
+}
+
+func scanPlaylistSyncState(scanner interface{ Scan(...any) error }) (*PlaylistSyncState, error) {
+	var state PlaylistSyncState
+	var ackedAt sql.NullString
+	if err := scanner.Scan(
+		&state.PlaylistID,
+		&state.LastSnapshotID,
+		&state.LastSnapshotGeneratedAt,
+		&ackedAt,
+		&state.UpdatedAt,
+	); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if ackedAt.Valid {
+		state.LastSnapshotAckedAt = &ackedAt.String
+	}
+	return &state, nil
 }
 
 func (r *Repository) getTrackContext(ctx context.Context, playlistID, trackID string) (TrackContextRecord, error) {

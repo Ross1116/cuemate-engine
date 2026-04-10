@@ -21,7 +21,8 @@ Current scope in this slice:
 - recommendation event capture for successful `/recommendations` responses
 - manual BPM/key corrections that mark playlists stale and queue full reanalysis
 - playlist-scoped JSON snapshot export for sync/bootstrap scenarios
-- append-only `sync_outbox` writes for played events and corrections
+- explicit-ack snapshot delivery state via `playlist_sync_state`
+- pull/ack `sync_outbox` processing for played events and corrections
 - generated Go protobuf/grpc artifacts under `go/gen/`
 - a small `scoringctl` smoke CLI for metadata and fixture-driven score calls
 
@@ -51,6 +52,9 @@ Additional write/snapshot surfaces:
 Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8080/events/played -ContentType "application/json" -Body '{"recommendation_event_id":"evt_123","chosen_track_id":"trk_next"}'
 Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8080/corrections -ContentType "application/json" -Body '{"track_id":"trk_example123","field":"bpm","new_value":128.0}'
 Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8080/sync/playlists/snapshot -ContentType "application/json" -Body '{"playlist_name":"Fred again"}'
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8080/sync/playlists/snapshot/ack -ContentType "application/json" -Body '{"snapshot_id":"snap_123"}'
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8080/sync/outbox/pull -ContentType "application/json" -Body '{"limit":100}'
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8080/sync/outbox/ack -ContentType "application/json" -Body '{"ack_through_id":42}'
 ```
 
 Configuration defaults:

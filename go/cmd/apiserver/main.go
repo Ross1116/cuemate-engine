@@ -55,6 +55,20 @@ type snapshotRequest struct {
 	PlaylistName string `json:"playlist_name"`
 }
 
+type snapshotAckRequest struct {
+	SnapshotID string `json:"snapshot_id"`
+	AckedAt    string `json:"acked_at"`
+}
+
+type outboxPullRequest struct {
+	Limit int `json:"limit"`
+}
+
+type outboxAckRequest struct {
+	AckThroughID int64  `json:"ack_through_id"`
+	AckedAt      string `json:"acked_at"`
+}
+
 type server struct {
 	repo    *recommendationsrepo.Repository
 	runtime *scoringruntime.Runtime
@@ -89,6 +103,9 @@ func run() int {
 	mux.HandleFunc("/events/played", srv.handlePlayedEvent)
 	mux.HandleFunc("/corrections", srv.handleCorrections)
 	mux.HandleFunc("/sync/playlists/snapshot", srv.handleSnapshot)
+	mux.HandleFunc("/sync/playlists/snapshot/ack", srv.handleSnapshotAck)
+	mux.HandleFunc("/sync/outbox/pull", srv.handleOutboxPull)
+	mux.HandleFunc("/sync/outbox/ack", srv.handleOutboxAck)
 
 	log.Printf("Go API server listening on %s", cfg.Addr)
 	if err := http.ListenAndServe(cfg.Addr, mux); err != nil {
@@ -448,11 +465,13 @@ func (s *server) handleCorrections(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	outboxPayload, _ := json.Marshal(map[string]any{
-		"correction_id": correction.ID,
-		"track_id":      req.TrackID,
-		"field":         correction.Field,
-		"new_value":     correction.NewValue,
-		"corrected_at":  correctedAt,
+		"correction_id":             correction.ID,
+		"track_id":                  req.TrackID,
+		"field":                     correction.Field,
+		"new_value":                 correction.NewValue,
+		"corrected_at":              correctedAt,
+		"affected_playlist_ids":     playlistIDs,
+		"requires_snapshot_refresh": true,
 	})
 	if _, err := s.repo.InsertSyncOutbox(r.Context(), "manual_correction", correction.ID, "upsert", string(outboxPayload), correctedAt); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -501,6 +520,22 @@ func (s *server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
+	previousSyncState, err := s.repo.GetPlaylistSyncState(r.Context(), playlist.ID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	generatedAt := recommendationsrepo.NowUTC()
+	snapshotID := uuid.NewString()
+	if err := s.repo.UpsertPlaylistSyncState(r.Context(), playlist.ID, snapshotID, generatedAt, generatedAt); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	syncState, err := s.repo.GetPlaylistSyncState(r.Context(), playlist.ID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
 	snapshotTracks := make([]any, 0, len(tracks))
 	readyCount := 0
 	for _, track := range tracks {
@@ -534,7 +569,20 @@ func (s *server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 	freshnessReason := ""
 	compatibilityState := "exact"
 	requiresReanalysis := false
-	lastSyncedAt := recommendationsrepo.NowUTC()
+	lastSyncedAt := any(nil)
+	deliveryState := "never_synced"
+	if syncState != nil {
+		switch {
+		case syncState.LastSnapshotAckedAt == nil:
+			if previousSyncState != nil && previousSyncState.LastSnapshotAckedAt != nil {
+				deliveryState = "pending_ack"
+				lastSyncedAt = *previousSyncState.LastSnapshotAckedAt
+			}
+		default:
+			deliveryState = "acked"
+			lastSyncedAt = *syncState.LastSnapshotAckedAt
+		}
+	}
 	if stats != nil {
 		if reason := relativeRefreshReason(stats, metadata.GetExpectedRelativeSignature()); reason != "" {
 			requiresReanalysis = true
@@ -543,10 +591,10 @@ func (s *server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	payload := map[string]any{
-		"snapshot_id":         uuid.NewString(),
+		"snapshot_id":         snapshotID,
 		"playlist_id":         playlist.ID,
 		"snapshot_source":     "pc",
-		"generated_at":        recommendationsrepo.NowUTC(),
+		"generated_at":        generatedAt,
 		"analysis_signature":  metadata.GetActiveSignatures().GetAnalysisSignature(),
 		"config_signature":    metadata.GetActiveSignatures().GetConfigSignature(),
 		"scoring_contract_id": metadata.GetActiveSignatures().GetScoringContractId(),
@@ -558,6 +606,7 @@ func (s *server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 		},
 		"freshness": map[string]any{
 			"last_synced_at":      lastSyncedAt,
+			"delivery_state":      deliveryState,
 			"requires_reanalysis": requiresReanalysis,
 			"compatibility_state": compatibilityState,
 			"note":                nullIfEmpty(freshnessReason),
@@ -569,6 +618,115 @@ func (s *server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 	writeJSON(w, http.StatusOK, payload)
+}
+
+func (s *server) handleSnapshotAck(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	var req snapshotAckRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON request"})
+		return
+	}
+	if strings.TrimSpace(req.SnapshotID) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "snapshot_id is required"})
+		return
+	}
+	ackedAt := req.AckedAt
+	if strings.TrimSpace(ackedAt) == "" {
+		ackedAt = recommendationsrepo.NowUTC()
+	}
+	state, err := s.repo.AckPlaylistSnapshot(r.Context(), req.SnapshotID, ackedAt)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if state == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "snapshot not found"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"snapshot_id": state.LastSnapshotID,
+		"playlist_id": state.PlaylistID,
+		"acked_at":    stringOrNil(state.LastSnapshotAckedAt),
+	})
+}
+
+func (s *server) handleOutboxPull(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	var req outboxPullRequest
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+	limit := req.Limit
+	switch {
+	case limit <= 0:
+		limit = 100
+	case limit > 500:
+		limit = 500
+	}
+	items, hasMore, err := s.repo.PullUnsyncedOutbox(r.Context(), limit)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	responseItems := make([]any, 0, len(items))
+	var nextAckID any = nil
+	for _, item := range items {
+		var payload any
+		if err := json.Unmarshal([]byte(item.PayloadJSON), &payload); err != nil {
+			payload = item.PayloadJSON
+		}
+		responseItems = append(responseItems, map[string]any{
+			"id":          item.ID,
+			"entity_type": item.EntityType,
+			"entity_id":   item.EntityID,
+			"action":      item.Action,
+			"payload":     payload,
+			"created_at":  item.CreatedAt,
+		})
+		nextAckID = item.ID
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"items":       responseItems,
+		"has_more":    hasMore,
+		"next_ack_id": nextAckID,
+	})
+}
+
+func (s *server) handleOutboxAck(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	var req outboxAckRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON request"})
+		return
+	}
+	if req.AckThroughID <= 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "ack_through_id must be a positive integer"})
+		return
+	}
+	ackedAt := req.AckedAt
+	if strings.TrimSpace(ackedAt) == "" {
+		ackedAt = recommendationsrepo.NowUTC()
+	}
+	ackedCount, err := s.repo.AckOutboxThroughID(r.Context(), req.AckThroughID, ackedAt)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ack_through_id": req.AckThroughID,
+		"acked_count":    ackedCount,
+		"acked_at":       ackedAt,
+	})
 }
 
 func relativeRefreshReason(stats *recommendationsrepo.PlaylistStats, expectedRelativeSignature string) string {

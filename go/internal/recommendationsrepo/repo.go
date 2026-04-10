@@ -18,6 +18,7 @@ var (
 	ErrTrackNotFound               = errors.New("track not found in playlist")
 	ErrRecommendationEventNotFound = errors.New("recommendation event not found")
 	ErrRelativeRefreshNeeded       = errors.New("playlist relative artifacts require refresh")
+	ErrSnapshotNotFound            = errors.New("snapshot not found")
 )
 
 type PlaylistRef struct {
@@ -458,18 +459,19 @@ func (r *Repository) markPlaylistsStale(ctx context.Context, exec execContexter,
 	if len(playlistIDs) == 0 {
 		return nil
 	}
-	for _, playlistID := range playlistIDs {
-		if _, err := exec.ExecContext(
-			ctx,
-			"UPDATE playlist_stats SET is_stale = 1, stale_reason = ?, stale_marked_at = ? WHERE playlist_id = ?",
-			reason,
-			markedAt,
-			playlistID,
-		); err != nil {
-			return err
-		}
+	placeholders := make([]string, len(playlistIDs))
+	args := make([]any, 0, len(playlistIDs)+2)
+	args = append(args, reason, markedAt)
+	for i, playlistID := range playlistIDs {
+		placeholders[i] = "?"
+		args = append(args, playlistID)
 	}
-	return nil
+	query := fmt.Sprintf(
+		"UPDATE playlist_stats SET is_stale = 1, stale_reason = ?, stale_marked_at = ? WHERE playlist_id IN (%s)",
+		strings.Join(placeholders, ", "),
+	)
+	_, err := exec.ExecContext(ctx, query, args...)
+	return err
 }
 
 func (r *Repository) CreateAnalysisJobWithKind(
@@ -580,7 +582,7 @@ func (r *Repository) createAnalysisJobWithKindTx(
 		  analysis_signature, config_signature, source_file_hash, created_at
 		) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)
 		`,
-		nullStringPtr(playlistID),
+		nullString(playlistID),
 		trackID,
 		trackPath,
 		jobKind,
@@ -588,7 +590,7 @@ func (r *Repository) createAnalysisJobWithKindTx(
 		analysisMode,
 		analysisSignature,
 		configSignature,
-		nullStringPtr(sourceFileHash),
+		nullString(sourceFileHash),
 		createdAt,
 	)
 	if err != nil {
@@ -867,7 +869,7 @@ func (r *Repository) AckPlaylistSnapshot(ctx context.Context, snapshotID string,
 		return nil, err
 	}
 	if state == nil {
-		return nil, nil
+		return nil, ErrSnapshotNotFound
 	}
 	_, err = r.db.ExecContext(
 		ctx,
@@ -1227,13 +1229,6 @@ func scanTrackContext(scanner interface{ Scan(...any) error }) (TrackContextReco
 }
 
 func nullString(value *string) any {
-	if value == nil {
-		return nil
-	}
-	return *value
-}
-
-func nullStringPtr(value *string) any {
 	if value == nil {
 		return nil
 	}

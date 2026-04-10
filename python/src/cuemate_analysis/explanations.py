@@ -16,6 +16,7 @@ window is unavailable. Callers must handle None gracefully.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from cuemate_analysis.scoring import (
@@ -605,7 +606,11 @@ def track_recommendation_outcome(
             return str(rec["track_id"])
         cand = rec.get("candidate")
         if cand is not None:
-            return str(getattr(cand, "track_id", "") or rec.get("candidate", ""))
+            if isinstance(cand, Mapping):
+                track_id = cand.get("track_id")
+            else:
+                track_id = getattr(cand, "track_id", "") or rec.get("candidate", "")
+            return str(track_id or "")
         return ""
 
     for lane_name, lane_tracks in lanes.items():
@@ -617,6 +622,7 @@ def track_recommendation_outcome(
                         continue
                     if other_tracks and other_tracks[0].get("score", 0.0) > rec.get("score", 0.0):
                         higher_scored_lanes.append(other_lane)
+                higher_scored_lanes.sort()
                 return {
                     "chosen_track_id": chosen_track_id,
                     "was_recommended": True,
@@ -702,7 +708,13 @@ def build_live_candidate_explanation(
     watch: list[str] = []
     if handoff and handoff["level"] in ("yellow", "orange"):
         watch.extend(handoff["notes"][:COMPACT_MAX_WATCHOUTS])
-    risk_factors = scores.get("risk_factors") or scores.get("risk_flags") or []
+    risk_factors = scores.get("risk_factors")
+    if not risk_factors:
+        risk_factors = scores.get("risk_flags")
+    if isinstance(risk_factors, str):
+        risk_factors = [risk_factors]
+    elif not isinstance(risk_factors, (list, tuple)):
+        risk_factors = []
     for flag in risk_factors:
         if len(watch) >= EXPANDED_MAX_WATCH:
             break

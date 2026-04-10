@@ -669,9 +669,9 @@ class TestComputeWeightedScore:
         result_low = compute_weighted_score(scores, STATIC_WEIGHTS, confs)
         confs["harmonic"] = 1.0
         result_high = compute_weighted_score(scores, STATIC_WEIGHTS, confs)
-        # With all scores=1.0 both should be 1.0, but floors ensure harmonic still contributes
-        assert result_low > 0.0
-        assert result_low <= result_high
+        assert 0.0 <= result_low <= 1.0
+        assert 0.0 <= result_high <= 1.0
+        assert result_low < result_high
 
     def test_harmonic_weight_reduced_for_weak_key(self):
         scores = {k: 0.5 for k in STATIC_WEIGHTS}
@@ -688,8 +688,23 @@ class TestComputeWeightedScore:
     def test_output_between_0_and_1(self):
         scores = {k: 0.8 for k in STATIC_WEIGHTS}
         confs = {k: 0.5 for k in STATIC_WEIGHTS}
-        result = compute_weighted_score(scores, STATIC_WEIGHTS, confs)
-        assert 0.0 <= result <= 1.0
+        weaker = compute_weighted_score(
+            scores,
+            STATIC_WEIGHTS,
+            confs,
+            weight_floors={"harmonic": 0.05},
+            harmonic_confidence_floor=0.05,
+        )
+        stronger = compute_weighted_score(
+            scores,
+            STATIC_WEIGHTS,
+            confs,
+            weight_floors={"harmonic": 0.35},
+            harmonic_confidence_floor=0.35,
+        )
+        assert 0.0 <= weaker <= 1.0
+        assert 0.0 <= stronger <= 1.0
+        assert weaker != stronger
 
     def test_uses_configured_weight_floors_and_confidence_floor(self):
         scores = {k: 0.5 for k in STATIC_WEIGHTS}

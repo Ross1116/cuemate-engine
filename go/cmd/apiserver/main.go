@@ -695,11 +695,11 @@ func (s *server) handleSnapshotAck(w http.ResponseWriter, r *http.Request) {
 	}
 	state, err := s.repo.AckPlaylistSnapshot(r.Context(), req.SnapshotID, ackedAt)
 	if err != nil {
+		if errors.Is(err, recommendationsrepo.ErrSnapshotNotFound) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "snapshot not found"})
+			return
+		}
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
-	if state == nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "snapshot not found"})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{

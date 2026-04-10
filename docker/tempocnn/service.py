@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import json
+import logging
 import os
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -10,61 +11,15 @@ from pathlib import Path
 import numpy as np
 
 import essentia.standard as es
+from cuemate_analysis.path_safety import resolve_allowed_roots, resolve_existing_file_path
 
+
+logger = logging.getLogger(__name__)
 
 MODEL_CACHE: dict[str, object] = {}
 RESULT_CACHE: dict[tuple[str, str, int, int], dict[str, object]] = {}
 TEMPOCNN_AUDIO_WORKERS = max(1, min(4, os.cpu_count() or 1))
 ALLOWED_SERVICE_ROOTS_ENV = "CUEMATE_SERVICE_ALLOWED_ROOTS"
-
-
-def resolve_allowed_roots() -> list[Path]:
-    raw_roots = os.getenv(ALLOWED_SERVICE_ROOTS_ENV)
-    if raw_roots:
-        parts = [item.strip() for item in raw_roots.split(os.pathsep) if item.strip()]
-    elif os.name != "nt":
-        parts = ["/workspace", "/host"]
-    else:
-        parts = []
-    return [Path(item).expanduser().resolve() for item in parts]
-
-
-def resolve_existing_file_path(
-    raw_path: str | Path,
-    label: str,
-    *,
-    allowed_roots: list[Path],
-) -> Path:
-    text = str(raw_path).strip()
-    if not text:
-        raise ValueError(f"{label} is required.")
-    candidate = Path(text).expanduser()
-    if candidate.is_absolute() or not allowed_roots:
-        resolved = candidate.resolve()
-    else:
-        resolved = None
-        for root in allowed_roots:
-            candidate_under_root = (root / candidate).resolve()
-            if _is_relative_to(candidate_under_root, root):
-                resolved = candidate_under_root
-                break
-        if resolved is None:
-            allowed = ", ".join(root.as_posix() for root in allowed_roots)
-            raise ValueError(f"{label} must stay within allowed roots: {allowed}")
-    if allowed_roots and not any(_is_relative_to(resolved, root) for root in allowed_roots):
-        allowed = ", ".join(root.as_posix() for root in allowed_roots)
-        raise ValueError(f"{label} must stay within allowed roots: {allowed}")
-    if not resolved.is_file():
-        raise FileNotFoundError(f"{label} is not a readable file: {resolved}")
-    return resolved
-
-
-def _is_relative_to(path: Path, root: Path) -> bool:
-    try:
-        path.relative_to(root)
-        return True
-    except ValueError:
-        return False
 
 
 def detect_gpu_counts() -> tuple[int | None, int | None]:
@@ -210,7 +165,7 @@ class TempoCNNHandler(BaseHTTPRequestHandler):
             )
             return
 
-        allowed_roots = resolve_allowed_roots()
+        allowed_roots = resolve_allowed_roots(os.getenv(ALLOWED_SERVICE_ROOTS_ENV))
         try:
             resolved_model_path = resolve_existing_file_path(
                 model_path,
@@ -301,11 +256,11 @@ def main() -> int:
                 resolve_existing_file_path(
                     default_model,
                     "CUEMATE_TEMPOCNN_DEFAULT_MODEL",
-                    allowed_roots=resolve_allowed_roots(),
+                    allowed_roots=resolve_allowed_roots(os.getenv(ALLOWED_SERVICE_ROOTS_ENV)),
                 )
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Failed to preload default tempo model '%s': %s", default_model, exc, exc_info=exc)
     server = ThreadingHTTPServer(("0.0.0.0", port), TempoCNNHandler)
     server.serve_forever()
     return 0

@@ -365,7 +365,7 @@ def build_prediction_payload(
     top_info = CLASS_TO_KEY_INFO[top_index]
     second_info = CLASS_TO_KEY_INFO[second_index]
     return {
-        "track_path": Path(track_path).resolve(strict=False).as_posix(),
+        "track_path": str(track_path),
         "key": top_info.key,
         "key_number": top_info.key_number,
         "key_letter": top_info.key_letter,

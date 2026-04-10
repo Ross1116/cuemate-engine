@@ -662,31 +662,41 @@ class TestComputeWeightedScore:
         assert result == pytest.approx(0.5, abs=0.01)
 
     def test_weight_floor_prevents_zero_weight(self):
-        scores = {k: 1.0 for k in STATIC_WEIGHTS}
-        # Set harmonic confidence to near-zero
+        scores = {k: 0.0 for k in STATIC_WEIGHTS}
+        scores["harmonic"] = 1.0
         confs = {k: 1.0 for k in STATIC_WEIGHTS}
-        confs["harmonic"] = 0.001
-        result_low = compute_weighted_score(scores, STATIC_WEIGHTS, confs)
-        confs["harmonic"] = 1.0
-        result_high = compute_weighted_score(scores, STATIC_WEIGHTS, confs)
+        result_low = compute_weighted_score(
+            scores,
+            STATIC_WEIGHTS,
+            confs,
+            weight_floors={"harmonic": 0.05},
+            harmonic_confidence_floor=HARMONIC_CONFIDENCE_FLOOR,
+        )
+        result_high = compute_weighted_score(
+            scores,
+            STATIC_WEIGHTS,
+            confs,
+            weight_floors={"harmonic": 0.35},
+            harmonic_confidence_floor=1.0,
+        )
         assert 0.0 <= result_low <= 1.0
         assert 0.0 <= result_high <= 1.0
         assert result_low < result_high
 
     def test_harmonic_weight_reduced_for_weak_key(self):
-        scores = {k: 0.5 for k in STATIC_WEIGHTS}
-        scores["harmonic"] = 1.0  # harmonic is great
+        scores = {k: 0.0 for k in STATIC_WEIGHTS}
+        scores["harmonic"] = 1.0
         confs_full = {k: 1.0 for k in STATIC_WEIGHTS}
         confs_weak = {k: 1.0 for k in STATIC_WEIGHTS}
-        confs_weak["harmonic"] = HARMONIC_CONFIDENCE_FLOOR  # very weak
+        confs_weak["harmonic"] = HARMONIC_CONFIDENCE_FLOOR
 
         score_full = compute_weighted_score(scores, STATIC_WEIGHTS, confs_full)
         score_weak = compute_weighted_score(scores, STATIC_WEIGHTS, confs_weak)
-        # Harmonic contribution should be lower when confidence is low
         assert score_full > score_weak
 
     def test_output_between_0_and_1(self):
-        scores = {k: 0.8 for k in STATIC_WEIGHTS}
+        scores = {k: 0.0 for k in STATIC_WEIGHTS}
+        scores["harmonic"] = 1.0
         confs = {k: 0.5 for k in STATIC_WEIGHTS}
         weaker = compute_weighted_score(
             scores,
@@ -704,7 +714,7 @@ class TestComputeWeightedScore:
         )
         assert 0.0 <= weaker <= 1.0
         assert 0.0 <= stronger <= 1.0
-        assert weaker != stronger
+        assert weaker < stronger
 
     def test_uses_configured_weight_floors_and_confidence_floor(self):
         scores = {k: 0.5 for k in STATIC_WEIGHTS}

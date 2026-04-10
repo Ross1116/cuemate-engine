@@ -600,6 +600,8 @@ def track_recommendation_outcome(
     Output: {"chosen_track_id": str, "was_recommended": bool, "position": int|None,
              "lane": str|None, "higher_scored_lanes": [str]}
     """
+    chosen_track_id = str(chosen_track_id or "")
+
     def _track_id(rec: dict[str, Any]) -> str:
         # Support both raw track_id string and nested candidate object
         if "track_id" in rec:

@@ -144,6 +144,12 @@ func Open(path string) (*Repository, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite database: %w", err)
 	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	if _, err := db.Exec("PRAGMA busy_timeout = 5000"); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("configure sqlite busy timeout: %w", err)
+	}
 	return &Repository{db: db}, nil
 }
 
@@ -251,6 +257,7 @@ func (r *Repository) GetPlaylistSnapshotTracks(ctx context.Context, playlistID s
 		  f.key,
 		  r.intensity_band,
 		  r.role_hints,
+		  r.track_id,
 		  f.analysis_signature,
 		  f.config_signature,
 		  f.scoring_contract_id_at_analysis
@@ -275,6 +282,7 @@ func (r *Repository) GetPlaylistSnapshotTracks(ctx context.Context, playlistID s
 		var musicalKey sql.NullString
 		var intensityBand sql.NullString
 		var roleHints sql.NullString
+		var relTrackID sql.NullString
 		var analysisSig sql.NullString
 		var configSig sql.NullString
 		var scoringContract sql.NullString
@@ -287,6 +295,7 @@ func (r *Repository) GetPlaylistSnapshotTracks(ctx context.Context, playlistID s
 			&musicalKey,
 			&intensityBand,
 			&roleHints,
+			&relTrackID,
 			&analysisSig,
 			&configSig,
 			&scoringContract,
@@ -308,7 +317,7 @@ func (r *Repository) GetPlaylistSnapshotTracks(ctx context.Context, playlistID s
 			}
 		}
 		switch {
-		case !analysisSig.Valid || !configSig.Valid || !scoringContract.Valid:
+		case !analysisSig.Valid || !configSig.Valid || !scoringContract.Valid || !relTrackID.Valid:
 			track.AnalysisState = "unanalysed"
 		default:
 			track.AnalysisState = "ready"
@@ -398,25 +407,45 @@ func (r *Repository) UpdateTrackImportedKeyTx(ctx context.Context, tx *sql.Tx, t
 }
 
 func (r *Repository) updateTrackImportedBPM(ctx context.Context, exec execContexter, trackID string, bpm float64, updatedAt string) error {
-	_, err := exec.ExecContext(
+	result, err := exec.ExecContext(
 		ctx,
 		"UPDATE tracks SET imported_bpm = ?, updated_at = ? WHERE id = ?",
 		bpm,
 		updatedAt,
 		trackID,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rowsAffected == 0 {
+		return ErrTrackNotFound
+	}
+	return nil
 }
 
 func (r *Repository) updateTrackImportedKey(ctx context.Context, exec execContexter, trackID string, key string, updatedAt string) error {
-	_, err := exec.ExecContext(
+	result, err := exec.ExecContext(
 		ctx,
 		"UPDATE tracks SET imported_key = ?, updated_at = ? WHERE id = ?",
 		key,
 		updatedAt,
 		trackID,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rowsAffected == 0 {
+		return ErrTrackNotFound
+	}
+	return nil
 }
 
 func (r *Repository) GetPlaylistsContainingTrack(ctx context.Context, trackID string) ([]PlaylistRef, error) {
@@ -565,11 +594,13 @@ func (r *Repository) createAnalysisJobWithKindTx(
 		  AND status = 'pending'
 		  AND analysis_signature = ?
 		  AND config_signature = ?
+		  AND playlist_id IS ?
 		`,
 		trackID,
 		jobKind,
 		analysisSignature,
 		configSignature,
+		nullString(playlistID),
 	)
 	if err != nil {
 		return 0, err
@@ -745,7 +776,7 @@ func (r *Repository) updateRecommendationEventChoice(
 	if chosenWasRecommended {
 		value = 1
 	}
-	_, err := exec.ExecContext(
+	result, err := exec.ExecContext(
 		ctx,
 		`
 		UPDATE recommendation_events
@@ -757,7 +788,17 @@ func (r *Repository) updateRecommendationEventChoice(
 		skippedOverJSON,
 		eventID,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rowsAffected == 0 {
+		return ErrRecommendationEventNotFound
+	}
+	return nil
 }
 
 func (r *Repository) InsertSyncOutbox(
@@ -871,19 +912,27 @@ func (r *Repository) AckPlaylistSnapshot(ctx context.Context, snapshotID string,
 	if state == nil {
 		return nil, ErrSnapshotNotFound
 	}
-	_, err = r.db.ExecContext(
+	result, err := r.db.ExecContext(
 		ctx,
 		`
 		UPDATE playlist_sync_state
 		SET last_snapshot_acked_at = ?, updated_at = ?
-		WHERE playlist_id = ?
+		WHERE playlist_id = ? AND last_snapshot_id = ?
 		`,
 		ackedAt,
 		ackedAt,
 		state.PlaylistID,
+		snapshotID,
 	)
 	if err != nil {
 		return nil, err
+	}
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return nil, err
+	}
+	if rowsAffected == 0 {
+		return nil, ErrSnapshotNotFound
 	}
 	return r.GetPlaylistSyncState(ctx, state.PlaylistID)
 }

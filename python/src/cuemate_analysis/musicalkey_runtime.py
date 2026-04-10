@@ -82,6 +82,14 @@ CLASS_TO_KEY_INFO: dict[int, MusicalKeyClassInfo] = {
 MODEL_CACHE: dict[tuple[str, str], tuple[nn.Module, torch.device]] = {}
 
 
+def _coerce_existing_track_path(track_path: str | Path) -> Path:
+    if isinstance(track_path, Path):
+        if not track_path.is_file():
+            raise FileNotFoundError(f"track_path is not a readable file: {track_path}")
+        return track_path
+    return resolve_existing_file_path(track_path, "track_path")
+
+
 class BasicConv2d(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, kernel_size: int | tuple[int, int]) -> None:
         super().__init__()
@@ -196,7 +204,7 @@ def load_audio_excerpt(
     duration_seconds: float,
     sample_rate: int = MUSICALKEYCNN_SAMPLE_RATE,
 ) -> np.ndarray:
-    resolved_track_path = resolve_existing_file_path(track_path, "track_path")
+    resolved_track_path = _coerce_existing_track_path(track_path)
     with sf.SoundFile(resolved_track_path) as handle:
         native_sample_rate = int(handle.samplerate)
         total_frames = int(handle.frames)
@@ -219,7 +227,7 @@ def load_audio_full_track(
     *,
     sample_rate: int = MUSICALKEYCNN_SAMPLE_RATE,
 ) -> np.ndarray:
-    resolved_track_path = resolve_existing_file_path(track_path, "track_path")
+    resolved_track_path = _coerce_existing_track_path(track_path)
     with sf.SoundFile(resolved_track_path) as handle:
         native_sample_rate = int(handle.samplerate)
         audio = handle.read(dtype="float32", always_2d=True)
@@ -259,7 +267,7 @@ def select_excerpt_starts(
     excerpt_seconds: float = MUSICALKEYCNN_EXCERPT_SECONDS,
     max_excerpts: int = MUSICALKEYCNN_MAX_EXCERPTS,
 ) -> list[float]:
-    resolved_track_path = resolve_existing_file_path(track_path, "track_path")
+    resolved_track_path = _coerce_existing_track_path(track_path)
     with sf.SoundFile(resolved_track_path) as handle:
         duration_seconds = float(handle.frames) / float(handle.samplerate)
 
@@ -364,8 +372,9 @@ def build_prediction_payload(
 
     top_info = CLASS_TO_KEY_INFO[top_index]
     second_info = CLASS_TO_KEY_INFO[second_index]
+    normalized_track_path = track_path.as_posix() if isinstance(track_path, Path) else Path(track_path).as_posix()
     return {
-        "track_path": str(track_path),
+        "track_path": normalized_track_path,
         "key": top_info.key,
         "key_number": top_info.key_number,
         "key_letter": top_info.key_letter,

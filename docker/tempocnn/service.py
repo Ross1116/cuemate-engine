@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import os
+import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -17,6 +18,7 @@ from cuemate_analysis.path_safety import resolve_allowed_roots, resolve_existing
 logger = logging.getLogger(__name__)
 
 MODEL_CACHE: dict[str, object] = {}
+MODEL_CACHE_LOCK = threading.Lock()
 RESULT_CACHE: dict[tuple[str, str, int, int], dict[str, object]] = {}
 TEMPOCNN_AUDIO_WORKERS = max(1, min(4, os.cpu_count() or 1))
 ALLOWED_SERVICE_ROOTS_ENV = "CUEMATE_SERVICE_ALLOWED_ROOTS"
@@ -35,9 +37,13 @@ def detect_gpu_counts() -> tuple[int | None, int | None]:
 def get_model(model_path: Path):
     model_key = model_path.as_posix()
     model = MODEL_CACHE.get(model_key)
-    if model is None:
-        model = es.TempoCNN(graphFilename=str(model_path))
-        MODEL_CACHE[model_key] = model
+    if model is not None:
+        return model
+    with MODEL_CACHE_LOCK:
+        model = MODEL_CACHE.get(model_key)
+        if model is None:
+            model = es.TempoCNN(graphFilename=str(model_path))
+            MODEL_CACHE[model_key] = model
     return model
 
 
@@ -220,12 +226,20 @@ class TempoCNNHandler(BaseHTTPRequestHandler):
                 track_path = str(item.get("track_path") or "")
                 computed_results[track_path] = item
                 if "error" not in item and track_path:
-                    RESULT_CACHE[
-                        build_cache_key(
+                    try:
+                        cache_key = build_cache_key(
                             resolved_model_path,
                             Path(track_path),
                         )
-                    ] = dict(item)
+                        RESULT_CACHE[cache_key] = dict(item)
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to cache TempoCNN result for model=%s track=%s: %s",
+                            resolved_model_path,
+                            track_path,
+                            exc,
+                            exc_info=exc,
+                        )
 
         results = [
             dict(

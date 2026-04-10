@@ -8,9 +8,10 @@ Today, the repository is primarily a **Python-first analysis engine** with:
 - staged BPM/key analysis for fast feedback
 - background enrichment for absolute features
 - persisted relative playlist context
+- live recommendation/scoring lanes and pair diagnostics
 - Docker-backed model workers for BPM, key, and semantic mood/intensity analysis
 
-The Go and protobuf layers are present for the later recommendation/API surfaces, but the current working core lives in the Python analysis plane.
+The Go and protobuf layers are now present as the service boundary for the scorer, but the current working core still lives in the Python analysis plane.
 
 ## Current State
 
@@ -19,6 +20,24 @@ Implemented today:
 - Milestone 1 absolute analysis
 - Milestone 2 Phase 1 relative-context logic
 - Milestone 2 Phase 2 persisted relative context + refresh/orchestration
+- Milestone 3 recommendation/scoring core:
+  - target-aware candidate scoring
+  - lane organization (`maintain`, `build`, `reset`, `jump`, `contrast`)
+  - recommendation confidence
+  - pair scoring diagnostics
+  - scoring metadata and compatibility checks
+- Milestone 4 Python scoring service slice:
+  - protobuf scoring contract revised to match the live scorer
+  - local gRPC scoring service runtime
+  - Python proto/codegen workflow
+- Milestone 4 Go bootstrap slice:
+  - Go protobuf/gRPC client bootstrap
+  - `scoringctl` smoke CLI for metadata and fixture-driven score calls
+  - Go proto/codegen workflow
+- Milestone 4 Go live API slice:
+  - Go HTTP API server for `/recommendations`, `/scoring/metadata`, `/healthz`, and `/readyz`
+  - SQLite hydration of live scoring inputs
+  - scorer readiness/circuit-breaker handling in the decision plane
 - staged analysis pipeline:
   - `fast_pass`
   - `staged` (default)
@@ -27,15 +46,14 @@ Implemented today:
 Deferred for now:
 
 - windowed intro/outro analysis
-- recommendation/scoring engine implementation
 
-Next major milestone:
+Follow-on work:
 
-- Milestone 3: live recommendation core
+- recommendation outcome analytics and tuning loops built on top of the captured event data
 
 ## Architecture
 
-The current pipeline is split into 4 main layers:
+The current pipeline is split into 5 main layers:
 
 1. Import/catalog
 - imports local playlists or DJ-library playlists from Rekordbox XML, Traktor NML, and Serato crates
@@ -55,6 +73,11 @@ The current pipeline is split into 4 main layers:
 - persists canonical rows into:
   - `track_features_rel`
   - `playlist_stats`
+
+5. Recommendation/scoring
+- ranks next-track candidates from precomputed absolute + relative context
+- organizes results into move lanes
+- exposes CLI inspection surfaces for recommendations, score breakdowns, weights, scoring metadata, and a local gRPC scoring service
 
 ## Repository Layout
 
@@ -85,8 +108,8 @@ The current pipeline is split into 4 main layers:
 |  |- stack-decisions.md
 |
 |- go/
-|  |- cmd/                               # Placeholder for future Go entrypoints
-|  |- internal/                          # Placeholder for future Go packages
+|  |- cmd/                               # Go API + smoke/debug entrypoints
+|  |- internal/                          # Go client/bootstrap packages
 |  |- gen/                               # Generated Go artifacts
 |  |- README.md
 |
@@ -111,6 +134,7 @@ The current pipeline is split into 4 main layers:
 |  |  |- models.py                       # Dataclasses / result shapes
 |  |  |- config.py                       # Runtime config loading + signatures
 |  |  |- dsp_benchmark.py                # DSP benchmark harness
+|  |- src/djengine/                      # Generated Python protobuf/gRPC artifacts
 |  |- tests/                             # Python test suite
 |  |- pyproject.toml
 |  |- README.md
@@ -145,6 +169,7 @@ Current important tables:
   - fast-stage BPM/key results for immediate feedback
 - `track_features_abs`
   - canonical absolute analysis rows
+  - includes `analysis_signature`, `config_signature`, and `scoring_contract_id_at_analysis`
 - `track_features_rel`
   - canonical persisted relative playlist rows
 - `playlist_stats`
@@ -199,6 +224,11 @@ Current split:
   - `energy_essentia_fused`
   - `energy_essentia_bucket`
 
+- scoring compatibility metadata:
+  - `analysis_signature`
+  - `config_signature`
+  - `scoring_contract_id_at_analysis`
+
 ### Canonical relative layer
 
 Persisted in:
@@ -207,6 +237,23 @@ Persisted in:
 - `playlist_stats`
 
 The canonical relative read path is persisted-first. Relative rows are refreshed after successful enrichment or via `refresh-relative-playlist`.
+
+### Recommendation/scoring layer
+
+Current recommendation output is lane-based and target-aware:
+
+- `maintain`
+- `build`
+- `reset`
+- `jump`
+- `contrast`
+
+Current scoring metadata also exposes:
+
+- active scoring contract id
+- compatible analysis/config signatures
+- component availability/active state
+- capability flags for known gaps such as unavailable vocals/window features
 
 ## Model Runtime Topology
 
@@ -381,6 +428,22 @@ python -m cuemate_analysis analyze-relative-playlist --playlist "Fred again" --e
 python -m cuemate_analysis refresh-relative-playlist --playlist "Fred again"
 ```
 
+### Recommendation/scoring workflows
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\compile-proto.ps1
+python -m cuemate_analysis recommend-next --playlist "Fred again" --current-track trk_example123 --target maintain
+python -m cuemate_analysis score-pair --playlist "Fred again" --current trk_example123 --candidate trk_example456 --target reset
+python -m cuemate_analysis inspect-scoring-weights --playlist "Fred again"
+python -m cuemate_analysis inspect-scoring-metadata
+python -m cuemate_analysis inspect-scoring-metadata --json
+python -m cuemate_analysis serve-scoring --host 127.0.0.1 --port 47834
+go run ./go/cmd/apiserver
+go run ./go/cmd/scoringctl metadata
+go run ./go/cmd/scoringctl score --fixture .\go\testdata\score_candidate.json
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8080/recommendations -ContentType "application/json" -Body '{"playlist_name":"Fred again","current_track_id":"trk_example123","target":"build"}'
+```
+
 ### Essentia semantic workflows
 
 ```powershell
@@ -435,6 +498,8 @@ Compile protobuf contract:
 powershell -ExecutionPolicy Bypass -File .\scripts\compile-proto.ps1
 ```
 
+The compile helper runs `buf lint`, writes `data/scoring.pb`, and generates Python and Go gRPC stubs into `python/src/djengine/` and `go/gen/`.
+
 Benchmark local DSP:
 
 ```powershell
@@ -444,11 +509,12 @@ python -m cuemate_analysis benchmark-dsp --path "D:\Music\track.flac"
 
 ## Known Boundaries
 
-- the recommendation/scoring engine is not implemented yet
-- Go runtime/API surfaces are still placeholders
+- Go decision plane now serves the live recommendations API plus single-consumer snapshot/outbox sync primitives; richer outcome analytics and actual mobile consumption are follow-on work
 - windowed intro/outro analysis is intentionally deferred
+- `transition_support`, `vocal_transition`, and `rhythmic_continuity` are still explicit stubs and are excluded from weighted scoring
+- `vocals_abs` / `vocals_rel` are not populated by the current analysis pipeline yet, so vocal-dependent recommendation logic remains limited
 - some metadata imported from DJ libraries or file tags can still be wrong; the current resolver uses provenance + confidence heuristics rather than treating any source as perfect
-- Essentia semantic calibration infrastructure exists, but semantic validation/tuning is still ongoing
+- Essentia semantic calibration infrastructure exists, and the current semantic lane is live; future listening-test calibration can still refine those heuristics
 
 ## Roadmap
 
@@ -456,13 +522,15 @@ Done:
 
 - Milestone 1 absolute analysis
 - Milestone 2 persisted relative context
+- Milestone 3 Python recommendation/scoring core
+- Milestone 4 local service/API bootstrap, write-side cleanup, and explicit-ack sync protocol
 
 Next:
 
-- Milestone 3 recommendation/scoring core
+- mobile/API integration
+- recommendation outcome analytics and tuning loop
 
 Later:
 
-- mobile/API integration
-- operational sync surfaces
+- multi-device/authenticated sync surfaces
 - optional advanced enrichments

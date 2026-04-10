@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import json
+import logging
 import os
+import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -10,11 +12,16 @@ from pathlib import Path
 import numpy as np
 
 import essentia.standard as es
+from cuemate_analysis.path_safety import resolve_allowed_roots, resolve_existing_file_path
 
+
+logger = logging.getLogger(__name__)
 
 MODEL_CACHE: dict[str, object] = {}
+MODEL_CACHE_LOCK = threading.Lock()
 RESULT_CACHE: dict[tuple[str, str, int, int], dict[str, object]] = {}
 TEMPOCNN_AUDIO_WORKERS = max(1, min(4, os.cpu_count() or 1))
+ALLOWED_SERVICE_ROOTS_ENV = "CUEMATE_SERVICE_ALLOWED_ROOTS"
 
 
 def detect_gpu_counts() -> tuple[int | None, int | None]:
@@ -27,16 +34,21 @@ def detect_gpu_counts() -> tuple[int | None, int | None]:
     return physical, logical
 
 
-def get_model(model_path: str):
-    model = MODEL_CACHE.get(model_path)
-    if model is None:
-        model = es.TempoCNN(graphFilename=model_path)
-        MODEL_CACHE[model_path] = model
+def get_model(model_path: Path):
+    model_key = model_path.as_posix()
+    model = MODEL_CACHE.get(model_key)
+    if model is not None:
+        return model
+    with MODEL_CACHE_LOCK:
+        model = MODEL_CACHE.get(model_key)
+        if model is None:
+            model = es.TempoCNN(graphFilename=str(model_path))
+            MODEL_CACHE[model_key] = model
     return model
 
 
-def load_tempo_audio(track_path: str):
-    return es.MonoLoader(filename=track_path, sampleRate=11025, resampleQuality=4)()
+def load_tempo_audio(track_path: Path):
+    return es.MonoLoader(filename=str(track_path), sampleRate=11025, resampleQuality=4)()
 
 
 def analyze_audio(model, track_path: str, tempo_audio) -> dict[str, object]:
@@ -71,10 +83,10 @@ def analyze_audio(model, track_path: str, tempo_audio) -> dict[str, object]:
     }
 
 
-def analyze_tracks(model, track_paths: list[str]) -> list[dict[str, object]]:
+def analyze_tracks(model, track_paths: list[Path]) -> list[dict[str, object]]:
     worker_count = max(1, min(TEMPOCNN_AUDIO_WORKERS, len(track_paths)))
 
-    def load_one(track_path: str):
+    def load_one(track_path: Path):
         try:
             return track_path, load_tempo_audio(track_path), None
         except Exception as exc:
@@ -89,20 +101,20 @@ def analyze_tracks(model, track_paths: list[str]) -> list[dict[str, object]]:
     results: list[dict[str, object]] = []
     for track_path, tempo_audio, load_error in loaded:
         if load_error is not None or tempo_audio is None:
-            results.append({"track_path": str(track_path), "error": load_error or "audio_load_failed"})
+            results.append({"track_path": track_path.as_posix(), "error": load_error or "audio_load_failed"})
             continue
         try:
-            results.append(analyze_audio(model, track_path, tempo_audio))
+            results.append(analyze_audio(model, track_path.as_posix(), tempo_audio))
         except Exception as exc:
-            results.append({"track_path": str(track_path), "error": str(exc)})
+            results.append({"track_path": track_path.as_posix(), "error": str(exc)})
     return results
 
 
-def build_cache_key(model_path: str, track_path: str) -> tuple[str, str, int, int]:
-    stat_result = Path(track_path).stat()
+def build_cache_key(model_path: Path, track_path: Path) -> tuple[str, str, int, int]:
+    stat_result = track_path.stat()
     return (
-        model_path,
-        str(Path(track_path).resolve()),
+        model_path.as_posix(),
+        track_path.as_posix(),
         int(stat_result.st_mtime_ns),
         int(stat_result.st_size),
     )
@@ -159,9 +171,28 @@ class TempoCNNHandler(BaseHTTPRequestHandler):
             )
             return
 
+        allowed_roots = resolve_allowed_roots(os.getenv(ALLOWED_SERVICE_ROOTS_ENV))
+        try:
+            resolved_model_path = resolve_existing_file_path(
+                model_path,
+                "model_path",
+                allowed_roots=allowed_roots,
+            )
+            resolved_track_paths = [
+                resolve_existing_file_path(
+                    str(track_path),
+                    "track_path",
+                    allowed_roots=allowed_roots,
+                )
+                for track_path in track_paths
+            ]
+        except Exception as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+
         tf_physical_gpu_count, tf_logical_gpu_count = detect_gpu_counts()
         try:
-            model = get_model(model_path)
+            model = get_model(resolved_model_path)
         except Exception as exc:
             self._send_json(
                 HTTPStatus.BAD_REQUEST,
@@ -173,21 +204,21 @@ class TempoCNNHandler(BaseHTTPRequestHandler):
             )
             return
 
-        resolved_track_paths = [str(track_path) for track_path in track_paths]
         cached_results: dict[str, dict[str, object]] = {}
         immediate_results: dict[str, dict[str, object]] = {}
-        missing_track_paths: list[str] = []
+        missing_track_paths: list[Path] = []
         for track_path in resolved_track_paths:
+            track_key = track_path.as_posix()
             try:
-                cache_key = build_cache_key(model_path, track_path)
+                cache_key = build_cache_key(resolved_model_path, track_path)
             except Exception as exc:
-                immediate_results[track_path] = {"track_path": track_path, "error": str(exc)}
+                immediate_results[track_key] = {"track_path": track_key, "error": str(exc)}
                 continue
             cached = RESULT_CACHE.get(cache_key)
             if cached is None:
                 missing_track_paths.append(track_path)
                 continue
-            cached_results[track_path] = dict(cached)
+            cached_results[track_key] = dict(cached)
 
         computed_results: dict[str, dict[str, object]] = {}
         if missing_track_paths:
@@ -195,14 +226,27 @@ class TempoCNNHandler(BaseHTTPRequestHandler):
                 track_path = str(item.get("track_path") or "")
                 computed_results[track_path] = item
                 if "error" not in item and track_path:
-                    RESULT_CACHE[build_cache_key(model_path, track_path)] = dict(item)
+                    try:
+                        cache_key = build_cache_key(
+                            resolved_model_path,
+                            Path(track_path),
+                        )
+                        RESULT_CACHE[cache_key] = dict(item)
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to cache TempoCNN result for model=%s track=%s: %s",
+                            resolved_model_path,
+                            track_path,
+                            exc,
+                            exc_info=exc,
+                        )
 
         results = [
             dict(
-                immediate_results.get(track_path)
-                or cached_results.get(track_path)
-                or computed_results.get(track_path)
-                or {"track_path": track_path, "error": "missing_result"}
+                immediate_results.get(track_path.as_posix())
+                or cached_results.get(track_path.as_posix())
+                or computed_results.get(track_path.as_posix())
+                or {"track_path": track_path.as_posix(), "error": "missing_result"}
             )
             for track_path in resolved_track_paths
         ]
@@ -222,9 +266,15 @@ def main() -> int:
     default_model = os.getenv("CUEMATE_TEMPOCNN_DEFAULT_MODEL")
     if default_model:
         try:
-            get_model(default_model)
-        except Exception:
-            pass
+            get_model(
+                resolve_existing_file_path(
+                    default_model,
+                    "CUEMATE_TEMPOCNN_DEFAULT_MODEL",
+                    allowed_roots=resolve_allowed_roots(os.getenv(ALLOWED_SERVICE_ROOTS_ENV)),
+                )
+            )
+        except Exception as exc:
+            logger.warning("Failed to preload default tempo model '%s': %s", default_model, exc, exc_info=exc)
     server = ThreadingHTTPServer(("0.0.0.0", port), TempoCNNHandler)
     server.serve_forever()
     return 0

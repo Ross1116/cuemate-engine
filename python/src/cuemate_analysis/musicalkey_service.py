@@ -8,6 +8,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from cuemate_analysis.path_safety import resolve_allowed_roots, resolve_existing_file_path
 from cuemate_analysis.musicalkey_runtime import (
     MUSICALKEYCNN_POLICY_BALANCED,
     detect_gpu_counts,
@@ -18,6 +19,16 @@ from cuemate_analysis.musicalkey_runtime import (
 )
 
 logger = logging.getLogger(__name__)
+_ALLOWED_SERVICE_ROOTS_ENV = "CUEMATE_SERVICE_ALLOWED_ROOTS"
+
+
+def build_track_artifact_identity(track_path: Path) -> tuple[str, int, int]:
+    stat_result = track_path.stat()
+    return (
+        track_path.as_posix(),
+        int(stat_result.st_mtime_ns),
+        int(stat_result.st_size),
+    )
 
 
 class MusicalKeyHandler(BaseHTTPRequestHandler):
@@ -80,9 +91,28 @@ class MusicalKeyHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": f"invalid_policy: {exc}"})
             return
 
+        allowed_roots = resolve_allowed_roots(os.getenv(_ALLOWED_SERVICE_ROOTS_ENV))
+        try:
+            resolved_model_path = resolve_existing_file_path(
+                model_path,
+                "model_path",
+                allowed_roots=allowed_roots,
+            )
+            resolved_track_paths = [
+                resolve_existing_file_path(
+                    str(track_path),
+                    "track_path",
+                    allowed_roots=allowed_roots,
+                )
+                for track_path in track_paths
+            ]
+        except Exception as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+
         physical_gpu_count, logical_gpu_count = detect_gpu_counts()
         try:
-            model, runner_device = load_model(model_path, device_choice=device)
+            model, runner_device = load_model(resolved_model_path, device_choice=device)
         except Exception as exc:
             self._send_json(
                 HTTPStatus.BAD_REQUEST,
@@ -96,37 +126,60 @@ class MusicalKeyHandler(BaseHTTPRequestHandler):
 
         results: list[dict[str, object]] = []
         try:
-            resolved_track_paths = [str(track_path) for track_path in track_paths]
             cached_results: dict[str, dict[str, object]] = {}
-            missing_track_paths: list[str] = []
+            missing_track_paths: list[Path] = []
+            track_identities = {
+                track_path.as_posix(): build_track_artifact_identity(track_path)
+                for track_path in resolved_track_paths
+            }
             for track_path in resolved_track_paths:
-                cache_key = build_cache_key(model_path, normalized_policy, str(runner_device), track_path)
+                track_key = track_path.as_posix()
+                cache_key = build_cache_key(
+                    resolved_model_path,
+                    normalized_policy,
+                    str(runner_device),
+                    track_identities[track_key],
+                )
                 cached = RESULT_CACHE.get(cache_key)
                 if cached is None:
                     missing_track_paths.append(track_path)
                     continue
-                cached_results[track_path] = dict(cached)
+                cached_results[track_key] = dict(cached)
 
             computed_results: dict[str, dict[str, object]] = {}
             if missing_track_paths:
                 for item in predict_keys(model, runner_device, missing_track_paths, policy=normalized_policy):
-                    track_path = str(item.get("track_path") or "")
+                    raw_track_path = str(item.get("track_path") or "").strip()
+                    track_path = Path(raw_track_path).as_posix() if raw_track_path else ""
+                    item = {**item, "track_path": track_path} if track_path else item
                     computed_results[track_path] = item
                     if "error" not in item and track_path:
+                        track_identity = track_identities.get(track_path)
+                        if track_identity is None:
+                            continue
                         RESULT_CACHE[
-                            build_cache_key(model_path, normalized_policy, str(runner_device), track_path)
+                            build_cache_key(
+                                resolved_model_path,
+                                normalized_policy,
+                                str(runner_device),
+                                track_identity,
+                            )
                         ] = dict(item)
 
             results = [
-                dict(cached_results.get(track_path) or computed_results.get(track_path) or {"track_path": track_path, "error": "missing_result"})
+                dict(
+                    cached_results.get(track_path.as_posix())
+                    or computed_results.get(track_path.as_posix())
+                    or {"track_path": track_path.as_posix(), "error": "missing_result"}
+                )
                 for track_path in resolved_track_paths
             ]
         except Exception:
-            for track_path in track_paths:
+            for track_path in resolved_track_paths:
                 try:
-                    results.extend(predict_keys(model, runner_device, [str(track_path)], policy=normalized_policy))
+                    results.extend(predict_keys(model, runner_device, [track_path], policy=normalized_policy))
                 except Exception as exc:
-                    results.append({"track_path": str(track_path), "error": str(exc)})
+                    results.append({"track_path": track_path.as_posix(), "error": str(exc)})
 
         self._send_json(
             HTTPStatus.OK,
@@ -140,30 +193,30 @@ class MusicalKeyHandler(BaseHTTPRequestHandler):
         )
 
 
-RESULT_CACHE: dict[tuple[str, str, str, str, int, int], dict[str, object]] = {}
+RESULT_CACHE: dict[tuple[str, str, str, str, str, int, int], dict[str, object]] = {}
 
 
-def build_model_artifact_identity(model_path: str) -> str:
-    stat_result = Path(model_path).stat()
-    payload = f"{Path(model_path).resolve().as_posix()}:{int(stat_result.st_mtime_ns)}:{int(stat_result.st_size)}"
+def build_model_artifact_identity(model_path: Path) -> str:
+    stat_result = model_path.stat()
+    payload = f"{model_path.as_posix()}:{int(stat_result.st_mtime_ns)}:{int(stat_result.st_size)}"
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
 
 
 def build_cache_key(
-    model_path: str,
+    model_path: Path,
     policy: str,
     runner_device: str,
-    track_path: str,
-) -> tuple[str, str, str, str, int, int]:
-    stat_result = Path(track_path).stat()
+    track_identity: tuple[str, int, int],
+) -> tuple[str, str, str, str, str, int, int]:
+    track_path, track_mtime_ns, track_size = track_identity
     return (
-        model_path,
+        model_path.as_posix(),
         build_model_artifact_identity(model_path),
         policy,
         runner_device,
-        str(Path(track_path).resolve()),
-        int(stat_result.st_mtime_ns),
-        int(stat_result.st_size),
+        track_path,
+        track_mtime_ns,
+        track_size,
     )
 
 
@@ -174,7 +227,13 @@ def main() -> int:
     default_device = os.getenv("CUEMATE_MUSICALKEYCNN_DEFAULT_DEVICE", "auto")
     if default_model:
         try:
-            model, runner_device = load_model(default_model, device_choice=default_device)
+            allowed_roots = resolve_allowed_roots(os.getenv(_ALLOWED_SERVICE_ROOTS_ENV))
+            resolved_default_model = resolve_existing_file_path(
+                default_model,
+                "CUEMATE_MUSICALKEYCNN_DEFAULT_MODEL",
+                allowed_roots=allowed_roots,
+            )
+            model, runner_device = load_model(resolved_default_model, device_choice=default_device)
             warm_pipeline(model, runner_device)
         except Exception as exc:
             logger.exception("Failed to warm default MusicalKeyCNN model '%s': %s", default_model, exc)

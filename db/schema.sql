@@ -169,6 +169,53 @@ CREATE TABLE track_features_fast (
   analysis_signature TEXT NOT NULL,
   config_signature TEXT NOT NULL
 );
+CREATE TABLE manual_corrections (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL DEFAULT 'local',
+  track_id TEXT NOT NULL REFERENCES tracks(id),
+  field TEXT NOT NULL,
+  old_value TEXT NOT NULL,
+  new_value TEXT NOT NULL,
+  corrected_at TEXT NOT NULL
+);
+CREATE TABLE recommendation_events (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL DEFAULT 'local',
+  playlist_id TEXT NOT NULL REFERENCES playlists(id),
+  current_track_id TEXT NOT NULL REFERENCES tracks(id),
+  target TEXT NOT NULL,
+  candidate_count INTEGER NOT NULL,
+  recommendation_confidence REAL,
+  recommendations_status TEXT NOT NULL DEFAULT 'available',
+  lanes_returned TEXT NOT NULL,
+  track_chosen TEXT REFERENCES tracks(id),
+  chosen_was_recommended INTEGER,
+  skipped_over TEXT,
+  adapted_weights TEXT,
+  scoring_contract_id TEXT NOT NULL,
+  timestamp TEXT NOT NULL
+);
+CREATE TABLE sync_outbox (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  entity_type TEXT NOT NULL,
+  entity_id TEXT NOT NULL,
+  action TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  synced_at TEXT
+);
+CREATE TABLE playlist_sync_state (
+  playlist_id TEXT PRIMARY KEY REFERENCES playlists(id) ON DELETE CASCADE,
+  last_snapshot_id TEXT NOT NULL UNIQUE,
+  last_snapshot_generated_at TEXT NOT NULL,
+  last_snapshot_acked_at TEXT,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX idx_manual_corrections_track_id ON manual_corrections (track_id);
+CREATE INDEX idx_recommendation_events_playlist_id ON recommendation_events (playlist_id);
+CREATE INDEX idx_recommendation_events_timestamp ON recommendation_events (timestamp);
+CREATE INDEX idx_recommendation_events_status ON recommendation_events (recommendations_status);
+CREATE INDEX idx_sync_outbox_unsynced ON sync_outbox (synced_at, id);
 -- Dbmate schema migrations
 INSERT INTO "schema_migrations" (version) VALUES
   ('20260403112734'),
@@ -179,4 +226,6 @@ INSERT INTO "schema_migrations" (version) VALUES
   ('20260404210000'),
   ('20260404220000'),
   ('20260404230000'),
-  ('20260405093000');
+  ('20260405093000'),
+  ('20260409183000'),
+  ('20260410030000');

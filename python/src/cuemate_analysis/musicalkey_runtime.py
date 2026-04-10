@@ -1,3 +1,13 @@
+"""MusicalKeyCNN runtime helpers.
+
+This module is internal runtime code. It validates that referenced files exist,
+but it intentionally does not enforce allowed-root policies itself. Service
+layers are responsible for path allowlisting before calling into this module.
+Because path_safety skips allowlist enforcement when allowed_roots is None,
+direct calls into these helpers are unsafe unless the caller has already
+validated the paths.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -11,6 +21,8 @@ import numpy as np
 import soundfile as sf
 import torch
 import torch.nn as nn
+
+from cuemate_analysis.path_safety import resolve_existing_file_path
 
 
 MUSICALKEYCNN_DEVICE_CHOICES = {"auto", "cpu", "cuda"}
@@ -68,6 +80,14 @@ CLASS_TO_KEY_INFO: dict[int, MusicalKeyClassInfo] = {
 }
 
 MODEL_CACHE: dict[tuple[str, str], tuple[nn.Module, torch.device]] = {}
+
+
+def _coerce_existing_track_path(track_path: str | Path) -> Path:
+    if isinstance(track_path, Path):
+        if not track_path.is_file():
+            raise FileNotFoundError(f"track_path is not a readable file: {track_path}")
+        return track_path
+    return resolve_existing_file_path(track_path, "track_path")
 
 
 class BasicConv2d(nn.Module):
@@ -158,7 +178,7 @@ def resolve_device(choice: str | None) -> torch.device:
 
 
 def load_model(model_path: str | Path, device_choice: str | None = None) -> tuple[nn.Module, torch.device]:
-    resolved_model_path = Path(model_path).expanduser().resolve()
+    resolved_model_path = resolve_existing_file_path(model_path, "model_path")
     resolved_device = resolve_device(device_choice)
     cache_key = (resolved_model_path.as_posix(), str(resolved_device))
     cached = MODEL_CACHE.get(cache_key)
@@ -184,7 +204,8 @@ def load_audio_excerpt(
     duration_seconds: float,
     sample_rate: int = MUSICALKEYCNN_SAMPLE_RATE,
 ) -> np.ndarray:
-    with sf.SoundFile(Path(track_path)) as handle:
+    resolved_track_path = _coerce_existing_track_path(track_path)
+    with sf.SoundFile(resolved_track_path) as handle:
         native_sample_rate = int(handle.samplerate)
         total_frames = int(handle.frames)
         start_frame = max(0, min(total_frames, int(start_seconds * native_sample_rate)))
@@ -193,7 +214,7 @@ def load_audio_excerpt(
         audio = handle.read(frames=frame_count, dtype="float32", always_2d=True)
 
     if audio.size == 0:
-        raise ValueError(f"No audio samples decoded for {track_path}")
+        raise ValueError(f"No audio samples decoded for {resolved_track_path}")
 
     waveform = np.mean(audio, axis=1, dtype=np.float32)
     if native_sample_rate != sample_rate:
@@ -206,12 +227,13 @@ def load_audio_full_track(
     *,
     sample_rate: int = MUSICALKEYCNN_SAMPLE_RATE,
 ) -> np.ndarray:
-    with sf.SoundFile(Path(track_path)) as handle:
+    resolved_track_path = _coerce_existing_track_path(track_path)
+    with sf.SoundFile(resolved_track_path) as handle:
         native_sample_rate = int(handle.samplerate)
         audio = handle.read(dtype="float32", always_2d=True)
 
     if audio.size == 0:
-        raise ValueError(f"No audio samples decoded for {track_path}")
+        raise ValueError(f"No audio samples decoded for {resolved_track_path}")
 
     waveform = np.mean(audio, axis=1, dtype=np.float32)
     if native_sample_rate != sample_rate:
@@ -245,7 +267,8 @@ def select_excerpt_starts(
     excerpt_seconds: float = MUSICALKEYCNN_EXCERPT_SECONDS,
     max_excerpts: int = MUSICALKEYCNN_MAX_EXCERPTS,
 ) -> list[float]:
-    with sf.SoundFile(Path(track_path)) as handle:
+    resolved_track_path = _coerce_existing_track_path(track_path)
+    with sf.SoundFile(resolved_track_path) as handle:
         duration_seconds = float(handle.frames) / float(handle.samplerate)
 
     usable_duration = max(0.0, duration_seconds - excerpt_seconds)
@@ -270,11 +293,16 @@ def preprocess_audio_excerpts(
     excerpt_seconds: float = MUSICALKEYCNN_EXCERPT_SECONDS,
     max_excerpts: int = MUSICALKEYCNN_MAX_EXCERPTS,
 ) -> torch.Tensor:
-    starts = select_excerpt_starts(track_path, excerpt_seconds=excerpt_seconds, max_excerpts=max_excerpts)
+    resolved_track_path = _coerce_existing_track_path(track_path)
+    starts = select_excerpt_starts(
+        resolved_track_path,
+        excerpt_seconds=excerpt_seconds,
+        max_excerpts=max_excerpts,
+    )
     excerpt_tensors: list[torch.Tensor] = []
     for start_seconds in starts:
         waveform = load_audio_excerpt(
-            track_path,
+            resolved_track_path,
             start_seconds=start_seconds,
             duration_seconds=excerpt_seconds,
             sample_rate=sample_rate,
@@ -289,7 +317,7 @@ def preprocess_audio_excerpts(
         )
 
     if not excerpt_tensors:
-        raise ValueError(f"No excerpts prepared for {track_path}")
+        raise ValueError(f"No excerpts prepared for {resolved_track_path}")
     return torch.stack(excerpt_tensors, dim=0)
 
 
@@ -349,8 +377,9 @@ def build_prediction_payload(
 
     top_info = CLASS_TO_KEY_INFO[top_index]
     second_info = CLASS_TO_KEY_INFO[second_index]
+    normalized_track_path = track_path.as_posix() if isinstance(track_path, Path) else Path(track_path).as_posix()
     return {
-        "track_path": Path(track_path).resolve().as_posix(),
+        "track_path": normalized_track_path,
         "key": top_info.key,
         "key_number": top_info.key_number,
         "key_letter": top_info.key_letter,
@@ -384,9 +413,10 @@ def preprocess_tracks_for_policy(
     worker_count = max(1, min(MUSICALKEYCNN_PREPROCESS_WORKERS, len(track_paths)))
 
     def preprocess_one(track_path: str | Path) -> tuple[str, torch.Tensor]:
+        resolved_track_path = resolve_existing_file_path(track_path, "track_path")
         return (
-            Path(track_path).resolve().as_posix(),
-            preprocess_audio_for_policy(track_path, policy=normalized_policy),
+            resolved_track_path.as_posix(),
+            preprocess_audio_for_policy(resolved_track_path, policy=normalized_policy),
         )
 
     if worker_count == 1:

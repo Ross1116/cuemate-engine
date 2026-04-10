@@ -1,0 +1,53 @@
+{
+  "current_track": {
+    "track_id": "trk_current",
+    "signatures": {
+      "analysis_signature": "m1-ebd25381ebad",
+      "config_signature": "default",
+      "scoring_contract_id": "m3-v1"
+    },
+    "bpm": 128.0,
+    "musical_key": "8A",
+    "key_confidence": 0.9,
+    "key_source": "musicalkeycnn",
+    "key_agreement": 1,
+    "energy_rel": 0.55,
+    "bass_rel": 0.55,
+    "drums_rel": 0.5,
+    "vocals_rel": 0.1,
+    "groove_rel": 0.5,
+    "intensity_band": "Drive"
+  },
+  "candidate": {
+    "track_id": "trk_candidate",
+    "signatures": {
+      "analysis_signature": "m1-ebd25381ebad",
+      "config_signature": "default",
+      "scoring_contract_id": "m3-v1"
+    },
+    "bpm": 127.5,
+    "musical_key": "9A",
+    "key_confidence": 0.9,
+    "key_source": "musicalkeycnn",
+    "key_agreement": 1,
+    "energy_rel": 0.42,
+    "bass_rel": 0.38,
+    "drums_rel": 0.5,
+    "vocals_rel": 0.3,
+    "groove_rel": 0.5,
+    "intensity_band": "Drive"
+  },
+  "history": [
+    {
+      "track_id": "trk_history",
+      "musical_key": "8A",
+      "energy_rel": 0.52,
+      "relation": "played",
+      "plays_ago": 1
+    }
+  ],
+  "playlist_stats": {
+    "energy_spread": 0.18
+  },
+  "target_lane": "reset"
+}

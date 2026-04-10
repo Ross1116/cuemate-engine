@@ -31,6 +31,35 @@ DEFAULT_WEIGHT_FLOORS = {
     "rhythmic_continuity": 0.02,
 }
 
+DEFAULT_SCORING_THRESHOLDS = {
+    "bpm_hard": 8.0,
+    "bpm_hard_by_target": {
+        "maintain": 8.0,
+        "build": 12.0,
+        "jump": 20.0,
+        "reset": 20.0,
+    },
+    "bpm_ratio_pass": ["half", "double", "three_two", "two_three"],
+    "bpm_soft": 3.0,
+    "cooldown_window": 5,
+}
+
+DEFAULT_SCORING_MOVE_TYPES = {
+    "jump_threshold": 0.12,
+    "build_threshold": 0.05,
+    "maintain_range": 0.05,
+    "reset_energy_threshold": -0.08,
+    "reset_vocal_threshold": 0.50,
+    "drop_threshold": -0.05,
+}
+
+DEFAULT_SCORING_PENALTIES = {
+    "max_total_penalty": 0.80,
+    "bpm_over_soft": 0.30,
+    "key_mismatch": 0.45,
+    "vocal_clash": 0.35,
+}
+
 
 @dataclass(frozen=True)
 class AnalysisSettings:
@@ -73,8 +102,30 @@ class ThresholdSettings:
 
 @dataclass(frozen=True)
 class ScoringSettings:
+    """Scoring config payload for build_scoring_config().
+
+    __post_init__ uses object.__setattr__ because this frozen dataclass still needs
+    per-instance mutable defaults for thresholds, move_types, and penalties without
+    sharing a single dict across instances.
+    """
     static_weights: dict[str, float]
     weight_floors: dict[str, float]
+    harmonic_confidence_floor: float = 0.15
+    thresholds: dict[str, Any] = None  # type: ignore[assignment]
+    move_types: dict[str, Any] = None  # type: ignore[assignment]
+    penalties: dict[str, Any] = None  # type: ignore[assignment]
+    contrast_threshold: float = 0.45
+    secondary_contrast_threshold: float = 0.65
+    max_per_lane: int = 3
+
+    def __post_init__(self) -> None:
+        # Provide mutable defaults after frozen dataclass construction
+        if self.thresholds is None:
+            object.__setattr__(self, "thresholds", dict(DEFAULT_SCORING_THRESHOLDS))
+        if self.move_types is None:
+            object.__setattr__(self, "move_types", dict(DEFAULT_SCORING_MOVE_TYPES))
+        if self.penalties is None:
+            object.__setattr__(self, "penalties", dict(DEFAULT_SCORING_PENALTIES))
 
 
 @dataclass(frozen=True)
@@ -425,6 +476,13 @@ def load_runtime_settings(repo_root: Path | None = None) -> RuntimeSettings:
             key: float(value)
             for key, value in scoring_payload.get("weight_floors", DEFAULT_WEIGHT_FLOORS).items()
         },
+        harmonic_confidence_floor=float(scoring_payload.get("harmonic_confidence_floor", 0.15)),
+        thresholds={**DEFAULT_SCORING_THRESHOLDS, **scoring_payload.get("thresholds", {})},
+        move_types={**DEFAULT_SCORING_MOVE_TYPES, **scoring_payload.get("move_types", {})},
+        penalties={**DEFAULT_SCORING_PENALTIES, **scoring_payload.get("penalties", {})},
+        contrast_threshold=float(scoring_payload.get("contrast_threshold", 0.45)),
+        secondary_contrast_threshold=float(scoring_payload.get("secondary_contrast_threshold", 0.65)),
+        max_per_lane=int(scoring_payload.get("max_per_lane", 3)),
     )
     weight_adaptation = WeightAdaptationSettings(
         mode=str(weight_adaptation_payload.get("mode", "auto")),
@@ -474,3 +532,24 @@ def build_fast_analysis_signature(settings: RuntimeSettings) -> str:
         settings.config_signature,
         settings.analysis,
     )
+
+
+def build_scoring_config(settings: RuntimeSettings, *, target: str = "maintain") -> dict[str, Any]:
+    """Merge RuntimeSettings scoring section into the flat dict shape consumed by scoring functions.
+
+    The `target` parameter (maintain/build/reset/jump) is request-time state and
+    is NOT persisted in config — it's injected per recommendation call.
+    """
+    s = settings.scoring
+    return {
+        "target": target,
+        "static_weights": s.static_weights,
+        "weight_floors": s.weight_floors,
+        "harmonic_confidence_floor": s.harmonic_confidence_floor,
+        "thresholds": s.thresholds,
+        "move_types": s.move_types,
+        "penalties": s.penalties,
+        "contrast_threshold": s.contrast_threshold,
+        "secondary_contrast_threshold": s.secondary_contrast_threshold,
+        "max_per_lane": s.max_per_lane,
+    }

@@ -61,6 +61,7 @@ MODEL_FILENAMES = {
 # Version semantic scoring explicitly so cache invalidates when normalization,
 # class selection, fusion weights, or other interpretation logic changes.
 SEMANTIC_SCORING_VERSION = "2026-04-06-class-index-cache-deam-final-v1"
+ALLOWED_SERVICE_ROOTS_ENV = "CUEMATE_SERVICE_ALLOWED_ROOTS"
 
 # Finalized decision:
 # Treat DEAM arousal/valence outputs as [1, 9] and normalize to [0, 1].
@@ -73,6 +74,61 @@ AUXILIARY_CACHE_KEYS = (
     "loudness_norm",
     "bass_abs",
 )
+
+
+def resolve_allowed_roots() -> list[Path]:
+    raw_roots = os.getenv(ALLOWED_SERVICE_ROOTS_ENV)
+    if raw_roots:
+        parts = [item.strip() for item in raw_roots.split(os.pathsep) if item.strip()]
+    elif os.name != "nt":
+        parts = ["/workspace", "/host"]
+    else:
+        parts = []
+    return [Path(item).expanduser().resolve() for item in parts]
+
+
+def resolve_existing_file_path(
+    raw_path: str | Path,
+    label: str,
+    *,
+    allowed_roots: list[Path],
+) -> Path:
+    text = str(raw_path).strip()
+    if not text:
+        raise ValueError(f"{label} is required.")
+    resolved = Path(text).expanduser().resolve()
+    if not resolved.is_file():
+        raise FileNotFoundError(f"{label} is not a readable file: {resolved}")
+    if allowed_roots and not any(_is_relative_to(resolved, root) for root in allowed_roots):
+        allowed = ", ".join(root.as_posix() for root in allowed_roots)
+        raise ValueError(f"{label} must stay within allowed roots: {allowed}")
+    return resolved
+
+
+def resolve_existing_dir_path(
+    raw_path: str | Path,
+    label: str,
+    *,
+    allowed_roots: list[Path],
+) -> Path:
+    text = str(raw_path).strip()
+    if not text:
+        raise ValueError(f"{label} is required.")
+    resolved = Path(text).expanduser().resolve()
+    if not resolved.is_dir():
+        raise FileNotFoundError(f"{label} is not a readable directory: {resolved}")
+    if allowed_roots and not any(_is_relative_to(resolved, root) for root in allowed_roots):
+        allowed = ", ".join(root.as_posix() for root in allowed_roots)
+        raise ValueError(f"{label} must stay within allowed roots: {allowed}")
+    return resolved
+
+
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
 
 
 def clamp(value: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
@@ -93,11 +149,12 @@ def detect_gpu_counts() -> tuple[int | None, int | None]:
     return physical, logical
 
 
-def get_tempo_model(model_path: str):
-    model = TEMPO_MODEL_CACHE.get(model_path)
+def get_tempo_model(model_path: Path):
+    model_key = model_path.as_posix()
+    model = TEMPO_MODEL_CACHE.get(model_key)
     if model is None:
-        model = es.TempoCNN(graphFilename=model_path)
-        TEMPO_MODEL_CACHE[model_path] = model
+        model = es.TempoCNN(graphFilename=str(model_path))
+        TEMPO_MODEL_CACHE[model_key] = model
     return model
 
 
@@ -108,8 +165,8 @@ def build_musicnn_predictor(graph_filename: Path, output: str):
     return es.TensorflowPredictMusiCNN(**kwargs)
 
 
-def resolve_model_paths(model_root: str) -> dict[str, Path]:
-    root = Path(model_root).resolve()
+def resolve_model_paths(model_root: Path) -> dict[str, Path]:
+    root = model_root.resolve()
     return {name: root / relative for name, relative in MODEL_FILENAMES.items()}
 
 
@@ -136,7 +193,7 @@ def infer_class_index(
     raise ValueError(f"Could not find class {candidates} in metadata classes={classes}")
 
 
-def fingerprint_model_artifacts(model_root: str) -> str:
+def fingerprint_model_artifacts(model_root: Path) -> str:
     paths = resolve_model_paths(model_root)
     identity: list[dict[str, object]] = []
     for name, path in sorted(paths.items()):
@@ -153,13 +210,13 @@ def fingerprint_model_artifacts(model_root: str) -> str:
     return hashlib.sha1(digest).hexdigest()[:16]
 
 
-def make_bundle_cache_key(model_root: str, family_policy: str) -> str:
-    resolved_root = Path(model_root).resolve().as_posix()
+def make_bundle_cache_key(model_root: Path, family_policy: str) -> str:
+    resolved_root = model_root.resolve().as_posix()
     artifact_fingerprint = fingerprint_model_artifacts(model_root)
     return f"{resolved_root}::{artifact_fingerprint}::{family_policy}"
 
 
-def validate_model_paths(model_root: str) -> dict[str, Path]:
+def validate_model_paths(model_root: Path) -> dict[str, Path]:
     paths = resolve_model_paths(model_root)
     for path in paths.values():
         if not path.is_file():
@@ -194,7 +251,7 @@ def validate_requested_device(state: dict[str, Any], requested_device: str) -> N
         )
 
 
-def load_bundle_state(model_root: str, family_policy: str) -> dict[str, Any]:
+def load_bundle_state(model_root: Path, family_policy: str) -> dict[str, Any]:
     cache_key = make_bundle_cache_key(model_root, family_policy)
     state = SEMANTIC_BUNDLE_STATE_CACHE.get(cache_key)
     if state is not None:
@@ -205,7 +262,7 @@ def load_bundle_state(model_root: str, family_policy: str) -> dict[str, Any]:
     return state
 
 
-def create_bundle(model_root: str, family_policy: str) -> dict[str, Any]:
+def create_bundle(model_root: Path, family_policy: str) -> dict[str, Any]:
     paths = validate_model_paths(model_root)
     state = load_bundle_state(model_root, family_policy)
     return {
@@ -245,7 +302,7 @@ def create_bundle(model_root: str, family_policy: str) -> dict[str, Any]:
     }
 
 
-def load_thread_bundle(model_root: str, family_policy: str):
+def load_thread_bundle(model_root: Path, family_policy: str):
     cache_key = make_bundle_cache_key(model_root, family_policy)
     thread_bundles = getattr(THREAD_LOCAL, "bundles", None)
     if thread_bundles is None:
@@ -258,27 +315,27 @@ def load_thread_bundle(model_root: str, family_policy: str):
     return bundle
 
 
-def load_tempo_audio(track_path: str):
+def load_tempo_audio(track_path: Path):
     return es.MonoLoader(
-        filename=track_path,
+        filename=str(track_path),
         sampleRate=TEMPO_SAMPLE_RATE,
         resampleQuality=4,
     )()
 
 
-def load_semantic_audio(track_path: str):
+def load_semantic_audio(track_path: Path):
     return es.MonoLoader(
-        filename=track_path,
+        filename=str(track_path),
         sampleRate=SAMPLE_RATE,
         resampleQuality=4,
     )()
 
 
-def load_semantic_excerpt(track_path: str, start_time: float, end_time: float):
+def load_semantic_excerpt(track_path: Path, start_time: float, end_time: float):
     safe_start = max(0.0, float(start_time))
     safe_end = max(safe_start + 0.05, float(end_time))
     return es.EasyLoader(
-        filename=track_path,
+        filename=str(track_path),
         sampleRate=SAMPLE_RATE,
         downmix="mix",
         startTime=safe_start,
@@ -464,7 +521,7 @@ def extract_peak_window(audio: np.ndarray, excerpt_seconds: float) -> np.ndarray
     return audio[best_start:best_start + excerpt_samples]
 
 
-def decode_middle_excerpt(track_path: str, duration_seconds: float | None, excerpt_seconds: float) -> np.ndarray:
+def decode_middle_excerpt(track_path: Path, duration_seconds: float | None, excerpt_seconds: float) -> np.ndarray:
     if duration_seconds is None or duration_seconds <= 0:
         return load_semantic_audio(track_path)
     excerpt = max(0.05, float(excerpt_seconds))
@@ -476,7 +533,7 @@ def decode_middle_excerpt(track_path: str, duration_seconds: float | None, excer
 
 
 def decode_window_by_ratio(
-    track_path: str,
+    track_path: Path,
     duration_seconds: float | None,
     *,
     start_ratio: float,
@@ -495,7 +552,7 @@ def decode_window_by_ratio(
 
 
 def decode_peak_excerpt(
-    track_path: str,
+    track_path: Path,
     duration_seconds: float | None,
     peak_time_ratio: float | None,
     excerpt_seconds: float,
@@ -525,7 +582,7 @@ def weighted_average_samples(samples: list[tuple[float, dict[str, float]]]) -> d
 
 def analyze_semantic_audio(
     bundle,
-    track_path: str,
+    track_path: Path,
     auxiliary: dict[str, float | None],
     request_cfg: dict[str, float],
 ) -> dict[str, object]:
@@ -616,7 +673,7 @@ def analyze_semantic_audio(
         ]
         averaged = weighted_average_samples(samples)
         return {
-            "track_path": track_path,
+            "track_path": track_path.as_posix(),
             **averaged,
             "semantic_confidence": clamp(
                 sum(estimate_semantic_confidence(sample) * weight for weight, sample in samples)
@@ -628,7 +685,7 @@ def analyze_semantic_audio(
         }
 
     return {
-        "track_path": track_path,
+        "track_path": track_path.as_posix(),
         **middle,
         "semantic_confidence": semantic_confidence,
         "sampling_mode": "middle_excerpt",
@@ -637,11 +694,11 @@ def analyze_semantic_audio(
     }
 
 
-def build_tempo_cache_key(model_path: str, track_path: str) -> tuple[str, str, int, int]:
-    stat_result = Path(track_path).stat()
+def build_tempo_cache_key(model_path: Path, track_path: Path) -> tuple[str, str, int, int]:
+    stat_result = track_path.stat()
     return (
-        model_path,
-        str(Path(track_path).resolve()),
+        model_path.as_posix(),
+        track_path.as_posix(),
         int(stat_result.st_mtime_ns),
         int(stat_result.st_size),
     )
@@ -679,30 +736,30 @@ def fingerprint_auxiliary_features(auxiliary_features: dict[str, float | None]) 
 
 
 def build_semantic_cache_key(
-    model_root: str,
+    model_root: Path,
     family_policy: str,
-    track_path: str,
+    track_path: Path,
     sampling_mode: str,
     request_cfg: dict[str, float],
     auxiliary_features: dict[str, float | None],
 ) -> tuple[str, str, int, int, str]:
-    stat_result = Path(track_path).stat()
+    stat_result = track_path.stat()
     artifact_fingerprint = fingerprint_model_artifacts(model_root)
     request_fingerprint = semantic_request_fingerprint(request_cfg)
     auxiliary_fingerprint = fingerprint_auxiliary_features(auxiliary_features)
     return (
         artifact_fingerprint,
-        str(Path(track_path).resolve()),
+        track_path.as_posix(),
         int(stat_result.st_mtime_ns),
         int(stat_result.st_size),
         f"{family_policy}:{sampling_mode}:{request_fingerprint}:{auxiliary_fingerprint}",
     )
 
 
-def analyze_tempo_tracks(model, track_paths: list[str]) -> list[dict[str, object]]:
+def analyze_tempo_tracks(model, track_paths: list[Path]) -> list[dict[str, object]]:
     worker_count = max(1, min(TEMPO_AUDIO_WORKERS, len(track_paths)))
 
-    def load_one(track_path: str):
+    def load_one(track_path: Path):
         try:
             return track_path, load_tempo_audio(track_path), None
         except Exception as exc:
@@ -717,19 +774,19 @@ def analyze_tempo_tracks(model, track_paths: list[str]) -> list[dict[str, object
     results: list[dict[str, object]] = []
     for track_path, tempo_audio, load_error in loaded:
         if load_error is not None or tempo_audio is None:
-            results.append({"track_path": track_path, "error": load_error or "audio_load_failed"})
+            results.append({"track_path": track_path.as_posix(), "error": load_error or "audio_load_failed"})
             continue
         try:
-            results.append(analyze_tempo_audio(model, track_path, tempo_audio))
+            results.append(analyze_tempo_audio(model, track_path.as_posix(), tempo_audio))
         except Exception as exc:
-            results.append({"track_path": track_path, "error": str(exc)})
+            results.append({"track_path": track_path.as_posix(), "error": str(exc)})
     return results
 
 
 def analyze_semantic_tracks(
-    model_root: str,
+    model_root: Path,
     family_policy: str,
-    track_paths: list[str],
+    track_paths: list[Path],
     auxiliary_features_by_track: dict[str, dict[str, float | None]],
     request_cfg: dict[str, float],
 ) -> list[dict[str, object]]:
@@ -737,10 +794,11 @@ def analyze_semantic_tracks(
     pending = list(track_paths)
 
     cached_by_track: dict[str, dict[str, object]] = {}
-    pending_uncached: list[str] = []
+    pending_uncached: list[Path] = []
 
     for track_path in pending:
-        auxiliary = dict(auxiliary_features_by_track.get(track_path, {}) or {})
+        track_key = track_path.as_posix()
+        auxiliary = dict(auxiliary_features_by_track.get(track_key, {}) or {})
         cache_key = build_semantic_cache_key(
             model_root,
             family_policy,
@@ -751,13 +809,14 @@ def analyze_semantic_tracks(
         )
         cached = SEMANTIC_RESULT_CACHE.get(cache_key)
         if cached is not None:
-            cached_by_track[track_path] = dict(cached)
+            cached_by_track[track_key] = dict(cached)
             continue
         pending_uncached.append(track_path)
 
-    def analyze_one(track_path: str) -> dict[str, object]:
+    def analyze_one(track_path: Path) -> dict[str, object]:
         bundle = load_thread_bundle(model_root, family_policy)
-        auxiliary = dict(auxiliary_features_by_track.get(track_path, {}) or {})
+        track_key = track_path.as_posix()
+        auxiliary = dict(auxiliary_features_by_track.get(track_key, {}) or {})
 
         payload = analyze_semantic_audio(bundle, track_path, auxiliary, request_cfg)
         payload.update(
@@ -789,7 +848,7 @@ def analyze_semantic_tracks(
                 try:
                     computed_payloads.append(analyze_one(item))
                 except Exception as exc:
-                    computed_payloads.append({"track_path": item, "error": str(exc)})
+                    computed_payloads.append({"track_path": item.as_posix(), "error": str(exc)})
         else:
             computed_payloads = []
             futures = [INFERENCE_EXECUTOR.submit(analyze_one, item) for item in pending_uncached]
@@ -797,7 +856,7 @@ def analyze_semantic_tracks(
                 try:
                     computed_payloads.append(future.result())
                 except Exception as exc:
-                    computed_payloads.append({"track_path": item, "error": str(exc)})
+                    computed_payloads.append({"track_path": item.as_posix(), "error": str(exc)})
 
         computed_by_track = {str(item.get("track_path")): item for item in computed_payloads}
 
@@ -815,9 +874,10 @@ def analyze_semantic_tracks(
             trigger_counts[clean] = trigger_counts.get(clean, 0) + 1
 
     for track_path in pending:
-        item = cached_by_track.get(track_path) or computed_by_track.get(track_path)
+        track_key = track_path.as_posix()
+        item = cached_by_track.get(track_key) or computed_by_track.get(track_key)
         if item is None:
-            results.append({"track_path": track_path, "error": "missing_result"})
+            results.append({"track_path": track_key, "error": "missing_result"})
             continue
         if "error" not in item:
             item = {
@@ -887,9 +947,28 @@ class SharedTensorflowHandler(BaseHTTPRequestHandler):
             )
             return
 
+        allowed_roots = resolve_allowed_roots()
+        try:
+            resolved_model_path = resolve_existing_file_path(
+                model_path,
+                "model_path",
+                allowed_roots=allowed_roots,
+            )
+            resolved_track_paths = [
+                resolve_existing_file_path(
+                    str(track_path),
+                    "track_path",
+                    allowed_roots=allowed_roots,
+                )
+                for track_path in track_paths
+            ]
+        except Exception as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+
         tf_physical_gpu_count, tf_logical_gpu_count = detect_gpu_counts()
         try:
-            model = get_tempo_model(model_path)
+            model = get_tempo_model(resolved_model_path)
         except Exception as exc:
             self._send_json(
                 HTTPStatus.BAD_REQUEST,
@@ -901,23 +980,23 @@ class SharedTensorflowHandler(BaseHTTPRequestHandler):
             )
             return
 
-        resolved_track_paths = [str(track_path) for track_path in track_paths]
         results: list[dict[str, object]] = []
-        missing: list[str] = []
+        missing: list[Path] = []
         cached_results: dict[str, dict[str, object]] = {}
 
         for track_path in resolved_track_paths:
+            track_key = track_path.as_posix()
             try:
-                cache_key = build_tempo_cache_key(model_path, track_path)
+                cache_key = build_tempo_cache_key(resolved_model_path, track_path)
             except Exception as exc:
-                results.append({"track_path": track_path, "error": str(exc)})
+                results.append({"track_path": track_key, "error": str(exc)})
                 continue
 
             cached = TEMPO_RESULT_CACHE.get(cache_key)
             if cached is None:
                 missing.append(track_path)
             else:
-                cached_results[track_path] = dict(cached)
+                cached_results[track_key] = dict(cached)
 
         computed = {
             str(item.get("track_path")): item
@@ -925,16 +1004,17 @@ class SharedTensorflowHandler(BaseHTTPRequestHandler):
         }
 
         for track_path in missing:
-            item = computed.get(track_path)
+            item = computed.get(track_path.as_posix())
             if item and "error" not in item:
-                TEMPO_RESULT_CACHE[build_tempo_cache_key(model_path, track_path)] = dict(item)
+                TEMPO_RESULT_CACHE[build_tempo_cache_key(resolved_model_path, track_path)] = dict(item)
 
         ordered_results = []
         for track_path in resolved_track_paths:
+            track_key = track_path.as_posix()
             ordered_results.append(
-                cached_results.get(track_path)
-                or computed.get(track_path)
-                or {"track_path": track_path, "error": "missing_result"}
+                cached_results.get(track_key)
+                or computed.get(track_key)
+                or {"track_path": track_key, "error": "missing_result"}
             )
 
         self._send_json(
@@ -960,8 +1040,27 @@ class SharedTensorflowHandler(BaseHTTPRequestHandler):
             )
             return
 
+        allowed_roots = resolve_allowed_roots()
         try:
-            state = load_bundle_state(model_root, family_policy)
+            resolved_model_root = resolve_existing_dir_path(
+                model_root,
+                "model_root",
+                allowed_roots=allowed_roots,
+            )
+            resolved_track_paths = [
+                resolve_existing_file_path(
+                    str(track_path),
+                    "track_path",
+                    allowed_roots=allowed_roots,
+                )
+                for track_path in track_paths
+            ]
+        except Exception as exc:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+
+        try:
+            state = load_bundle_state(resolved_model_root, family_policy)
             validate_requested_device(state, device)
         except Exception as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
@@ -977,9 +1076,9 @@ class SharedTensorflowHandler(BaseHTTPRequestHandler):
         }
 
         results = analyze_semantic_tracks(
-            model_root,
+            resolved_model_root,
             family_policy,
-            [str(track_path) for track_path in track_paths],
+            resolved_track_paths,
             auxiliary_features_by_track,
             request_cfg,
         )
@@ -1005,15 +1104,28 @@ def main() -> int:
 
     if default_model_root:
         try:
-            load_thread_bundle(default_model_root, default_family_policy)
-        except Exception:
-            pass
+            load_thread_bundle(
+                resolve_existing_dir_path(
+                    default_model_root,
+                    "CUEMATE_ESSENTIA_SEMANTIC_MODEL_ROOT",
+                    allowed_roots=resolve_allowed_roots(),
+                ),
+                default_family_policy,
+            )
+        except Exception as exc:
+            logger.warning("Failed to preload default semantic model root '%s': %s", default_model_root, exc)
 
     if default_tempo_model:
         try:
-            get_tempo_model(default_tempo_model)
-        except Exception:
-            pass
+            get_tempo_model(
+                resolve_existing_file_path(
+                    default_tempo_model,
+                    "CUEMATE_TEMPOCNN_DEFAULT_MODEL",
+                    allowed_roots=resolve_allowed_roots(),
+                )
+            )
+        except Exception as exc:
+            logger.warning("Failed to preload default tempo model '%s': %s", default_tempo_model, exc)
 
     server = ThreadingHTTPServer(("0.0.0.0", port), SharedTensorflowHandler)
     server.serve_forever()

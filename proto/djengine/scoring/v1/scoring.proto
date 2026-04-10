@@ -24,42 +24,37 @@ message CompatibilityStatus {
   repeated string notes = 5;
 }
 
-message WindowMetrics {
-  double energy = 1;
-  double bass_occupancy = 2;
-  double vocal_occupancy = 3;
-  double harmonic_density = 4;
-  double rhythmic_density = 5;
-  double cleanliness = 6;
-  map<string, double> metrics = 7;
-}
-
 message TrackContext {
   string track_id = 1;
-  string analysis_id = 2;
-  SignatureMetadata signatures = 3;
-  double bpm = 4;
-  string musical_key = 5;
-  double energy = 6;
-  double loudness_lufs = 7;
-  repeated string tags = 8;
-  map<string, string> attributes = 9;
-}
-
-message CandidateContext {
-  TrackContext track = 1;
-  WindowMetrics intro_window = 2;
-  WindowMetrics outro_window = 3;
-  string intensity_band = 4;
-  repeated string role_hints = 5;
-  map<string, string> attributes = 6;
+  SignatureMetadata signatures = 2;
+  double bpm = 3;
+  string musical_key = 4;
+  optional double key_confidence = 5;
+  string key_source = 6;
+  optional int32 key_agreement = 7;
+  optional double energy_rel = 8;
+  optional double bass_rel = 9;
+  optional double drums_rel = 10;
+  optional double vocals_rel = 11;
+  optional double groove_rel = 12;
+  string intensity_band = 13;
+  repeated string role_hints = 14;
+  string title = 15;
+  string artist = 16;
 }
 
 message HistoryEntry {
   string track_id = 1;
-  string relation = 2;
-  int32 plays_ago = 3;
-  double elapsed_since_play_seconds = 4;
+  string musical_key = 2;
+  optional double energy_rel = 3;
+  string relation = 4;
+  optional int32 plays_ago = 5;
+  optional double elapsed_since_play_seconds = 6;
+}
+
+message PlaylistStatsContext {
+  optional double energy_spread = 1;
+  map<string, double> adapted_weights = 2;
 }
 
 message LaneGroup {
@@ -68,56 +63,157 @@ message LaneGroup {
   string summary = 3;
 }
 
-message SetContext {
-  string session_id = 1;
-  string current_track_id = 2;
-  double current_track_position_seconds = 3;
-  double target_mix_in_seconds = 4;
-  repeated HistoryEntry history = 5;
-  map<string, string> attributes = 6;
-}
-
 message WeightAdaptation {
   string adaptation_id = 1;
   map<string, double> component_weights = 2;
   string explanation = 3;
 }
 
+message PenaltyFactor {
+  string factor = 1;
+  double severity = 2;
+  double raw_penalty = 3;
+  string gate = 4;
+}
+
+message TransitionFeatures {
+  double effective_bpm_distance = 1;
+  double raw_bpm_distance = 2;
+  string bpm_relationship = 3;
+  int32 key_distance = 4;
+  string key_compat_label = 5;
+  double key_confidence_current = 6;
+  double key_confidence_candidate = 7;
+  double delta_energy_rel = 8;
+  double delta_bass_rel = 9;
+  optional double current_vocals_rel = 10;
+  optional double candidate_vocals_rel = 11;
+  double current_outro_low_end = 12;
+  double candidate_intro_low_end = 13;
+}
+
+message TempoKeySummary {
+  string tempo_text = 1;
+  string key_text = 2;
+  string key_state = 3;
+}
+
+message AdvisoryText {
+  string level = 1;
+  repeated string notes = 2;
+}
+
+message ExplanationBlock {
+  repeated string summary = 1;
+  repeated string why = 2;
+  repeated string watch = 3;
+  AdvisoryText handoff = 4;
+  TempoKeySummary tempo_key = 5;
+  repeated string character_shift = 6;
+}
+
+message CandidateWindows {
+  AdvisoryText candidate_intro_32 = 1;
+}
+
+message OutroSummary {
+  string text = 1;
+  double cleanliness_abs = 2;
+}
+
+message SetTrend {
+  string label = 1;
+  string direction = 2;
+}
+
+message SetContext {
+  SetTrend trend = 1;
+  repeated string session_notes = 2;
+  int32 history_length = 3;
+  bool has_gaps = 4;
+}
+
+message CapabilityMetadata {
+  map<string, bool> flags = 1;
+}
+
 message ScoredCandidate {
-  CandidateContext candidate = 1;
-  double final_score = 2;
-  LaneGroup lane_group = 3;
-  repeated string advisory_hints = 4;
-  map<string, double> score_components = 5;
-  string explanation = 6;
-  double confidence = 7;
-  repeated string confidence_notes = 8;
+  TrackContext candidate = 1;
+  double raw_score = 2;
+  double final_score = 3;
+  double penalty_multiplier = 4;
+  repeated PenaltyFactor penalty_factors = 5;
+  string risk = 6;
+  double risk_score = 7;
+  repeated string risk_factors = 8;
+  string move = 9;
+  double move_confidence = 10;
+  string move_note = 11;
+  double contrast_score = 12;
+  map<string, double> component_scores = 13;
+  map<string, double> component_confidences = 14;
+  map<string, double> weights_used = 15;
+  TransitionFeatures transition_features = 16;
+  string primary_lane = 17;
+  bool secondary_lane = 18;
+  double ranking_strength = 19;
+  TempoKeySummary tempo_key = 20;
+  repeated string advisory_hints = 21;
+  repeated string reasons = 22;
+  repeated string watchouts = 23;
+  ExplanationBlock explanation = 24;
+  CandidateWindows windows = 25;
+}
+
+message RecommendationLane {
+  LaneGroup lane_group = 1;
+  repeated ScoredCandidate items = 2;
+  string availability = 3;
+  string empty_reason = 4;
+}
+
+message RecommendationMeta {
+  string target = 1;
+  int32 total_candidates = 2;
+  int32 filtered_candidates = 3;
+  int32 scored_candidates = 4;
+  string current_track_id = 5;
+  bool requested_lane_available = 6;
+  repeated string best_alternative_lanes = 7;
+  string fallback_note = 8;
 }
 
 message GetRecommendationsRequest {
-  SetContext set_context = 1;
-  TrackContext current_track = 2;
-  repeated CandidateContext candidates = 3;
-  int32 max_results = 4;
-  SignatureMetadata expected_signatures = 5;
-  WeightAdaptation requested_weight_adaptation = 6;
+  TrackContext current_track = 1;
+  repeated TrackContext candidates = 2;
+  repeated HistoryEntry history = 3;
+  PlaylistStatsContext playlist_stats = 4;
+  string target_lane = 5;
+  int32 max_per_lane = 6;
 }
 
 message GetRecommendationsResponse {
-  repeated ScoredCandidate recommendations = 1;
-  SignatureMetadata active_signatures = 2;
-  CompatibilityStatus compatibility = 3;
-  WeightAdaptation applied_weight_adaptation = 4;
-  string recommendations_status = 5;
-  string note = 6;
+  repeated RecommendationLane lanes = 1;
+  repeated string lane_order = 2;
+  double recommendation_confidence = 3;
+  RecommendationMeta meta = 4;
+  SignatureMetadata active_signatures = 5;
+  CompatibilityStatus compatibility = 6;
+  WeightAdaptation applied_weight_adaptation = 7;
+  string recommendations_status = 8;
+  TrackContext current_track = 9;
+  OutroSummary current_outro_summary = 10;
+  SetContext set_context = 11;
+  CapabilityMetadata capabilities = 12;
+  string status_note = 13;
 }
 
 message ScoreCandidateRequest {
-  SetContext set_context = 1;
-  TrackContext current_track = 2;
-  CandidateContext candidate = 3;
-  SignatureMetadata expected_signatures = 4;
-  WeightAdaptation requested_weight_adaptation = 5;
+  TrackContext current_track = 1;
+  TrackContext candidate = 2;
+  repeated HistoryEntry history = 3;
+  PlaylistStatsContext playlist_stats = 4;
+  string target_lane = 5;
 }
 
 message ScoreCandidateResponse {
@@ -133,6 +229,9 @@ message ComponentMetadata {
   string component_id = 1;
   string description = 2;
   double weight = 3;
+  bool available = 4;
+  bool active = 5;
+  string status = 6;
 }
 
 message GetScoringMetadataResponse {
@@ -145,4 +244,5 @@ message GetScoringMetadataResponse {
   bool healthy = 7;
   string engine_version = 8;
   string status_note = 9;
+  string expected_relative_signature = 10;
 }

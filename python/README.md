@@ -7,15 +7,15 @@ The Python analysis plane is responsible for offline ingest, feature extraction,
 ```text
 python/
 |- src/        # Hand-written analysis and service packages
+|  |- djengine/ # Generated protobuf/grpc Python artifacts
 |- tests/      # Analysis-plane tests
-|- generated/  # Generated protobuf/grpc Python artifacts
 |- models/     # Local model weights and checkpoints (git-ignored)
 |- pyproject.toml
 ```
 
-## Current Milestone 1 scope
+## Current scope
 
-The current implementation covers the first milestone from the decision engine plan:
+The current implementation covers the shipped Python analysis and scoring core:
 
 - import local files and directories as playlists/crates
 - import playlists from exported Rekordbox XML, Traktor NML, and Serato crate files
@@ -23,6 +23,8 @@ The current implementation covers the first milestone from the decision engine p
 - decode audio and extract absolute features on PC
 - persist imported tracks, playlists, analysis jobs, and `track_features_abs` into SQLite
 - inspect imported and analyzed tracks from a local CLI
+- score and recommend transitions from persisted absolute + relative context
+- expose the scorer through a local gRPC service after protobuf compilation
 
 This package now exposes the local recommendation/scoring CLI, but a few signals are still intentionally incomplete:
 
@@ -99,6 +101,9 @@ python -m cuemate_analysis download-essentia-semantic-models
 python -m cuemate_analysis analyze-essentia-playlist --playlist "My Playlist"
 python -m cuemate_analysis recommend-next --playlist "My Playlist" --current-track trk_example123 --target maintain
 python -m cuemate_analysis score-pair --playlist "My Playlist" --current trk_example123 --candidate trk_example456
+python -m cuemate_analysis inspect-scoring-weights --playlist "My Playlist"
+python -m cuemate_analysis inspect-scoring-metadata
+python -m cuemate_analysis serve-scoring --host 127.0.0.1 --port 47834
 python -m cuemate_analysis purge-model-cache
 python -m cuemate_analysis list-playlist --name "My Playlist"
 python -m cuemate_analysis show-track --track-id trk_example123
@@ -117,6 +122,8 @@ Important notes:
 - `download-essentia-semantic-models` and `analyze-essentia-playlist` are the model-acquisition and read-only inspection surfaces for Essentia semantic absolute features
 - `recommend-next` organizes scored suggestions into `maintain`, `build`, `reset`, `jump`, and `contrast` lanes
 - `score-pair` is the main diagnostics surface for auditing one current->candidate transition
+- `inspect-scoring-weights` and `inspect-scoring-metadata` expose the active scoring contract and runtime weights
+- `serve-scoring` runs the local gRPC scorer after the protobuf contract has been compiled
 - treat vocal-related weights and diagnostics as placeholders for now: `vocal_transition` is stubbed, and `vocals_abs` / `vocals_rel` are currently unavailable in analysis output
 - if TempoCNN is unavailable for a track, analysis falls back to the current librosa baseline automatically and records `baseline_fallback` as the source
 - TempoCNN now runs through Docker and will try GPU before falling back to CPU
@@ -147,3 +154,13 @@ docker run --rm --gpus all `
   "/audio/Fred again/Fred again.. - ..FEISTY.flac" `
   "/workspace/python/models/essentia/deepsquare-k16-3.pb"
 ```
+
+## Protobuf / gRPC workflow
+
+Generate the scoring contract artifacts before using the gRPC service:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\compile-proto.ps1
+```
+
+This runs `buf lint`, writes `data/scoring.pb`, and generates Python gRPC stubs into `python/src/djengine/`.

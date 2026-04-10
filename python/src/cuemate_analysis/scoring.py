@@ -381,9 +381,14 @@ def get_scoring_metadata(
         from cuemate_analysis.config import load_runtime_settings
 
         settings = load_runtime_settings()
+    from cuemate_analysis.config import build_relative_experiment_signature
 
     active_analysis_signature = str(getattr(settings, "analysis_signature"))
     active_config_signature = str(getattr(settings, "config_signature"))
+    expected_relative_signature = build_relative_experiment_signature(
+        settings,
+        energy_source="canonical",
+    )
     active_weights = dict(getattr(settings, "scoring").static_weights)
     metadata_status_note = status_note or (
         "Python scoring core metadata. "
@@ -422,6 +427,7 @@ def get_scoring_metadata(
         "healthy": healthy,
         "engine_version": __version__,
         "status_note": metadata_status_note,
+        "expected_relative_signature": expected_relative_signature,
     }
 
 
@@ -471,6 +477,9 @@ def check_analysis_compatibility(
             ],
         }
 
+    def _analysis_family_match(track_sig: str, active_sig: str) -> bool:
+        return track_sig == active_sig or track_sig.startswith(f"{active_sig}-")
+
     analysis_exact = track_analysis_signature == active_analysis_signature
     config_exact = track_config_signature == active_config_signature
     if analysis_exact and config_exact:
@@ -483,7 +492,10 @@ def check_analysis_compatibility(
         }
 
     notes: list[str] = []
-    analysis_compatible = track_analysis_signature in compatible_analysis_signatures
+    analysis_compatible = (
+        track_analysis_signature in compatible_analysis_signatures
+        or any(_analysis_family_match(track_analysis_signature, sig) for sig in compatible_analysis_signatures)
+    )
     config_compatible = track_config_signature in compatible_config_signatures
     if not analysis_compatible:
         return {

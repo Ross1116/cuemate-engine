@@ -11,7 +11,7 @@ Today, the repository is primarily a **Python-first analysis engine** with:
 - live recommendation/scoring lanes and pair diagnostics
 - Docker-backed model workers for BPM, key, and semantic mood/intensity analysis
 
-The Go and protobuf layers are present for the later recommendation/API surfaces, but the current working core lives in the Python analysis plane.
+The Go and protobuf layers are now present as the service boundary for the scorer, but the current working core still lives in the Python analysis plane.
 
 ## Current State
 
@@ -26,6 +26,18 @@ Implemented today:
   - recommendation confidence
   - pair scoring diagnostics
   - scoring metadata and compatibility checks
+- Milestone 4 Python scoring service slice:
+  - protobuf scoring contract revised to match the live scorer
+  - local gRPC scoring service runtime
+  - Python proto/codegen workflow
+- Milestone 4 Go bootstrap slice:
+  - Go protobuf/gRPC client bootstrap
+  - `scoringctl` smoke CLI for metadata and fixture-driven score calls
+  - Go proto/codegen workflow
+- Milestone 4 Go live API slice:
+  - Go HTTP API server for `/recommendations`, `/scoring/metadata`, `/healthz`, and `/readyz`
+  - SQLite hydration of live scoring inputs
+  - scorer readiness/circuit-breaker handling in the decision plane
 - staged analysis pipeline:
   - `fast_pass`
   - `staged` (default)
@@ -34,7 +46,6 @@ Implemented today:
 Deferred for now:
 
 - windowed intro/outro analysis
-- Go/gRPC runtime wiring
 - recommendation outcome logging / feedback loop
 
 ## Architecture
@@ -63,7 +74,7 @@ The current pipeline is split into 5 main layers:
 5. Recommendation/scoring
 - ranks next-track candidates from precomputed absolute + relative context
 - organizes results into move lanes
-- exposes CLI inspection surfaces for recommendations, score breakdowns, weights, and scoring metadata
+- exposes CLI inspection surfaces for recommendations, score breakdowns, weights, scoring metadata, and a local gRPC scoring service
 
 ## Repository Layout
 
@@ -94,8 +105,8 @@ The current pipeline is split into 5 main layers:
 |  |- stack-decisions.md
 |
 |- go/
-|  |- cmd/                               # Placeholder for future Go entrypoints
-|  |- internal/                          # Placeholder for future Go packages
+|  |- cmd/                               # Go API + smoke/debug entrypoints
+|  |- internal/                          # Go client/bootstrap packages
 |  |- gen/                               # Generated Go artifacts
 |  |- README.md
 |
@@ -120,6 +131,7 @@ The current pipeline is split into 5 main layers:
 |  |  |- models.py                       # Dataclasses / result shapes
 |  |  |- config.py                       # Runtime config loading + signatures
 |  |  |- dsp_benchmark.py                # DSP benchmark harness
+|  |- src/djengine/                      # Generated Python protobuf/gRPC artifacts
 |  |- tests/                             # Python test suite
 |  |- pyproject.toml
 |  |- README.md
@@ -416,11 +428,17 @@ python -m cuemate_analysis refresh-relative-playlist --playlist "Fred again"
 ### Recommendation/scoring workflows
 
 ```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\compile-proto.ps1
 python -m cuemate_analysis recommend-next --playlist "Fred again" --current-track trk_example123 --target maintain
 python -m cuemate_analysis score-pair --playlist "Fred again" --current trk_example123 --candidate trk_example456 --target reset
 python -m cuemate_analysis inspect-scoring-weights --playlist "Fred again"
 python -m cuemate_analysis inspect-scoring-metadata
 python -m cuemate_analysis inspect-scoring-metadata --json
+python -m cuemate_analysis serve-scoring --host 127.0.0.1 --port 47834
+go run ./go/cmd/apiserver
+go run ./go/cmd/scoringctl metadata
+go run ./go/cmd/scoringctl score --fixture .\go\testdata\score_candidate.json
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8080/recommendations -ContentType "application/json" -Body '{"playlist_name":"Fred again","current_track_id":"trk_example123","target":"build"}'
 ```
 
 ### Essentia semantic workflows
@@ -477,6 +495,8 @@ Compile protobuf contract:
 powershell -ExecutionPolicy Bypass -File .\scripts\compile-proto.ps1
 ```
 
+The compile helper runs `buf lint`, writes `data/scoring.pb`, and generates Python and Go gRPC stubs into `python/src/djengine/` and `go/gen/`.
+
 Benchmark local DSP:
 
 ```powershell
@@ -486,7 +506,7 @@ python -m cuemate_analysis benchmark-dsp --path "D:\Music\track.flac"
 
 ## Known Boundaries
 
-- Go runtime/API surfaces are still placeholders
+- Go decision plane now serves the live recommendations API plus single-consumer snapshot/outbox sync primitives, but richer feedback loops and actual mobile consumption are still deferred
 - windowed intro/outro analysis is intentionally deferred
 - `transition_support`, `vocal_transition`, and `rhythmic_continuity` are still explicit stubs and are excluded from weighted scoring
 - `vocals_abs` / `vocals_rel` are not populated by the current analysis pipeline yet, so vocal-dependent recommendation logic remains limited
@@ -500,14 +520,14 @@ Done:
 - Milestone 1 absolute analysis
 - Milestone 2 persisted relative context
 - Milestone 3 Python recommendation/scoring core
+- Milestone 4 local service/API bootstrap, write-side cleanup, and explicit-ack sync protocol
 
 Next:
 
-- Go/gRPC integration on top of the Python scoring contract
 - recommendation outcome logging and tuning loop
+- mobile/API integration
 
 Later:
 
-- mobile/API integration
 - operational sync surfaces
 - optional advanced enrichments

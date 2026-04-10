@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+scoring/v1/scoring_pb2.py
+scoring/v1/scoring_pb2_grpc.py

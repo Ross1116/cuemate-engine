@@ -12,6 +12,8 @@ import soundfile as sf
 import torch
 import torch.nn as nn
 
+from cuemate_analysis.path_safety import resolve_existing_file_path
+
 
 MUSICALKEYCNN_DEVICE_CHOICES = {"auto", "cpu", "cuda"}
 MUSICALKEYCNN_SAMPLE_RATE = 44100
@@ -158,7 +160,7 @@ def resolve_device(choice: str | None) -> torch.device:
 
 
 def load_model(model_path: str | Path, device_choice: str | None = None) -> tuple[nn.Module, torch.device]:
-    resolved_model_path = Path(model_path).expanduser().resolve()
+    resolved_model_path = resolve_existing_file_path(model_path, "model_path")
     resolved_device = resolve_device(device_choice)
     cache_key = (resolved_model_path.as_posix(), str(resolved_device))
     cached = MODEL_CACHE.get(cache_key)
@@ -184,7 +186,8 @@ def load_audio_excerpt(
     duration_seconds: float,
     sample_rate: int = MUSICALKEYCNN_SAMPLE_RATE,
 ) -> np.ndarray:
-    with sf.SoundFile(Path(track_path)) as handle:
+    resolved_track_path = resolve_existing_file_path(track_path, "track_path")
+    with sf.SoundFile(resolved_track_path) as handle:
         native_sample_rate = int(handle.samplerate)
         total_frames = int(handle.frames)
         start_frame = max(0, min(total_frames, int(start_seconds * native_sample_rate)))
@@ -193,7 +196,7 @@ def load_audio_excerpt(
         audio = handle.read(frames=frame_count, dtype="float32", always_2d=True)
 
     if audio.size == 0:
-        raise ValueError(f"No audio samples decoded for {track_path}")
+        raise ValueError(f"No audio samples decoded for {resolved_track_path}")
 
     waveform = np.mean(audio, axis=1, dtype=np.float32)
     if native_sample_rate != sample_rate:
@@ -206,12 +209,13 @@ def load_audio_full_track(
     *,
     sample_rate: int = MUSICALKEYCNN_SAMPLE_RATE,
 ) -> np.ndarray:
-    with sf.SoundFile(Path(track_path)) as handle:
+    resolved_track_path = resolve_existing_file_path(track_path, "track_path")
+    with sf.SoundFile(resolved_track_path) as handle:
         native_sample_rate = int(handle.samplerate)
         audio = handle.read(dtype="float32", always_2d=True)
 
     if audio.size == 0:
-        raise ValueError(f"No audio samples decoded for {track_path}")
+        raise ValueError(f"No audio samples decoded for {resolved_track_path}")
 
     waveform = np.mean(audio, axis=1, dtype=np.float32)
     if native_sample_rate != sample_rate:
@@ -245,7 +249,8 @@ def select_excerpt_starts(
     excerpt_seconds: float = MUSICALKEYCNN_EXCERPT_SECONDS,
     max_excerpts: int = MUSICALKEYCNN_MAX_EXCERPTS,
 ) -> list[float]:
-    with sf.SoundFile(Path(track_path)) as handle:
+    resolved_track_path = resolve_existing_file_path(track_path, "track_path")
+    with sf.SoundFile(resolved_track_path) as handle:
         duration_seconds = float(handle.frames) / float(handle.samplerate)
 
     usable_duration = max(0.0, duration_seconds - excerpt_seconds)
@@ -350,7 +355,7 @@ def build_prediction_payload(
     top_info = CLASS_TO_KEY_INFO[top_index]
     second_info = CLASS_TO_KEY_INFO[second_index]
     return {
-        "track_path": Path(track_path).resolve().as_posix(),
+        "track_path": Path(track_path).as_posix(),
         "key": top_info.key,
         "key_number": top_info.key_number,
         "key_letter": top_info.key_letter,
@@ -384,9 +389,10 @@ def preprocess_tracks_for_policy(
     worker_count = max(1, min(MUSICALKEYCNN_PREPROCESS_WORKERS, len(track_paths)))
 
     def preprocess_one(track_path: str | Path) -> tuple[str, torch.Tensor]:
+        resolved_track_path = resolve_existing_file_path(track_path, "track_path")
         return (
-            Path(track_path).resolve().as_posix(),
-            preprocess_audio_for_policy(track_path, policy=normalized_policy),
+            resolved_track_path.as_posix(),
+            preprocess_audio_for_policy(resolved_track_path, policy=normalized_policy),
         )
 
     if worker_count == 1:

@@ -38,6 +38,8 @@ Install these before doing anything else.
 
 - Tailscale
 - dbmate
+- `protoc-gen-go`
+- `protoc-gen-go-grpc`
 
 ### Suggested install commands
 
@@ -58,6 +60,13 @@ For `protoc`, install the latest official Windows release from the protobuf GitH
 Official releases:
 
 - https://github.com/protocolbuffers/protobuf/releases/latest
+
+Install the Go protobuf plugins after Go is available:
+
+```powershell
+go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.5
+go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1
+```
 
 ## 2. Open a fresh PowerShell
 
@@ -116,6 +125,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\compile-proto.ps1
 ```
 
 Expected result: the contract validates and a descriptor file is written under `data/`.
+The script also generates Python stubs under `python/src/djengine/` and Go stubs under `go/gen/`.
 
 ## 8. Validate Docker Compose wiring
 

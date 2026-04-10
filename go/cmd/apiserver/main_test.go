@@ -205,6 +205,17 @@ func TestRecommendationsCreatesRecommendationEvent(t *testing.T) {
 	if meta["recommendation_event_id"] == nil {
 		t.Fatalf("expected recommendation_event_id in response meta: %#v", meta)
 	}
+	eventID := meta["recommendation_event_id"].(string)
+	items, err := srv.repo.GetRecommendationEventItems(context.Background(), eventID)
+	if err != nil {
+		t.Fatalf("GetRecommendationEventItems() error = %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("event items = %#v", items)
+	}
+	if items[0].CandidateTrackID != "trk_candidate" || items[0].LaneID != "maintain" || items[0].LaneRank != 1 {
+		t.Fatalf("unexpected event item = %#v", items[0])
+	}
 }
 
 func TestPlayedEventUpdatesRecommendationEvent(t *testing.T) {
@@ -239,6 +250,80 @@ func TestPlayedEventUpdatesRecommendationEvent(t *testing.T) {
 	_ = json.Unmarshal(rec.Body.Bytes(), &payload)
 	if payload["chosen_was_recommended"] != true {
 		t.Fatalf("chosen_was_recommended = %#v", payload["chosen_was_recommended"])
+	}
+	jobs, err := srv.repo.ListFeedbackTuningJobsByPlaylist(context.Background(), "pl_1")
+	if err != nil {
+		t.Fatalf("ListFeedbackTuningJobsByPlaylist() error = %v", err)
+	}
+	if len(jobs) != 1 || jobs[0].Status != "pending" || jobs[0].TriggerEventID == nil || *jobs[0].TriggerEventID != eventID {
+		t.Fatalf("feedback tuning jobs = %#v", jobs)
+	}
+}
+
+func TestFeedbackSummaryReturnsPlaylistMetrics(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+	ctx := context.Background()
+	eventID := "evt_feedback_1"
+	err := srv.repo.InsertRecommendationEvent(ctx, recommendationsrepo.RecommendationEventRecord{
+		ID:                    eventID,
+		PlaylistID:            "pl_1",
+		CurrentTrackID:        "trk_current",
+		Target:                "reset",
+		CandidateCount:        2,
+		RecommendationsStatus: "available",
+		LanesReturnedJSON:     `{"lane_order":["reset","build"],"lanes":{"reset":[{"track_id":"trk_candidate","score":0.9}]}}`,
+		TrackChosen:           stringPtr("trk_candidate"),
+		ChosenWasRecommended:  boolPtr(true),
+		ScoringContractID:     "m3-v1",
+		Timestamp:             "2026-04-10T00:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("InsertRecommendationEvent() error = %v", err)
+	}
+	err = srv.repo.InsertRecommendationEventItems(ctx, []recommendationsrepo.RecommendationEventItemRecord{
+		{
+			EventID:                eventID,
+			LaneID:                 "reset",
+			LaneRank:               1,
+			CandidateTrackID:       "trk_candidate",
+			FinalScore:             0.9,
+			RawScore:               0.9,
+			PenaltyMultiplier:      1.0,
+			Move:                   "reset",
+			MoveConfidence:         0.9,
+			Risk:                   "low",
+			RiskScore:              0.1,
+			PrimaryLane:            stringPtr("reset"),
+			SecondaryLane:          false,
+			ComponentScoresJSON:    `{"harmonic":0.85}`,
+			ConfidencesJSON:        `{"harmonic":1.0}`,
+			WeightsUsedJSON:        `{"harmonic":0.12}`,
+			TransitionFeaturesJSON: `{"effective_bpm_distance":1.0}`,
+		},
+	})
+	if err != nil {
+		t.Fatalf("InsertRecommendationEventItems() error = %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/feedback/summary", bytes.NewBufferString(`{"playlist_name":"Test Playlist"}`))
+	srv.handleFeedbackSummary(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	metrics := payload["metrics"].(map[string]any)
+	if metrics["total_events"] != float64(1) || metrics["contributory_events"] != float64(1) {
+		t.Fatalf("metrics = %#v", metrics)
+	}
+	weights := payload["weights"].(map[string]any)
+	if weights["source"] != "adapted_weights" {
+		t.Fatalf("weights source = %#v", weights["source"])
 	}
 }
 
@@ -505,4 +590,12 @@ func fakeMetadata(relativeSignature string) *scoringv1.GetScoringMetadataRespons
 
 func jsonNumber(value int64) string {
 	return fmt.Sprintf("%d", value)
+}
+
+func stringPtr(value string) *string {
+	return &value
+}
+
+func boolPtr(value bool) *bool {
+	return &value
 }

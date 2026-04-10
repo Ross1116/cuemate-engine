@@ -58,6 +58,13 @@ type snapshotRequest struct {
 	PlaylistName string `json:"playlist_name"`
 }
 
+type feedbackSummaryRequest struct {
+	PlaylistID   string `json:"playlist_id"`
+	PlaylistName string `json:"playlist_name"`
+	Since        string `json:"since"`
+	Until        string `json:"until"`
+}
+
 type snapshotAckRequest struct {
 	SnapshotID string `json:"snapshot_id"`
 	AckedAt    string `json:"acked_at"`
@@ -104,6 +111,7 @@ func run() int {
 	mux.HandleFunc("/scoring/metadata", srv.handleMetadata)
 	mux.HandleFunc("/recommendations", srv.handleRecommendations)
 	mux.HandleFunc("/events/played", srv.handlePlayedEvent)
+	mux.HandleFunc("/feedback/summary", srv.handleFeedbackSummary)
 	mux.HandleFunc("/corrections", srv.handleCorrections)
 	mux.HandleFunc("/sync/playlists/snapshot", srv.handleSnapshot)
 	mux.HandleFunc("/sync/playlists/snapshot/ack", srv.handleSnapshotAck)
@@ -263,6 +271,7 @@ func (s *server) handleRecommendations(w http.ResponseWriter, r *http.Request) {
 	}
 
 	payload := translateRecommendationsResponse(response)
+	applyPlaylistWeightSource(payload, hydrated.Stats)
 	eventID, err := s.recordRecommendationEvent(r.Context(), hydrated, response, payload)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -336,13 +345,22 @@ func (s *server) handlePlayedEvent(w http.ResponseWriter, r *http.Request) {
 			log.Printf("failed to marshal recommendation event outbox payload for %s: %v", event.ID, err)
 			return fmt.Errorf("failed to encode sync payload: %w", err)
 		}
-		_, err = s.repo.InsertSyncOutboxTx(
+		if _, err = s.repo.InsertSyncOutboxTx(
 			r.Context(),
 			tx,
 			"recommendation_event",
 			event.ID,
 			"played",
 			string(outboxPayload),
+			playedAt,
+		); err != nil {
+			return err
+		}
+		_, err = s.repo.UpsertFeedbackTuningJobTx(
+			r.Context(),
+			tx,
+			event.PlaylistID,
+			&event.ID,
 			playedAt,
 		)
 		return err
@@ -843,8 +861,9 @@ func buildRecommendationsRequest(
 		if hydrated.Stats.EnergySpread != nil {
 			req.PlaylistStats.EnergySpread = hydrated.Stats.EnergySpread
 		}
-		if len(hydrated.Stats.AdaptedWeights) > 0 {
-			req.PlaylistStats.AdaptedWeights = hydrated.Stats.AdaptedWeights
+		if weights, source := effectivePlaylistWeights(hydrated.Stats); len(weights) > 0 {
+			req.PlaylistStats.AdaptedWeights = weights
+			req.PlaylistStats.WeightSource = source
 		}
 	}
 	return req
@@ -1053,14 +1072,70 @@ func (s *server) recordRecommendationEvent(
 	}
 
 	lanesSnapshot := make(map[string][]map[string]any)
+	eventItems := make([]recommendationsrepo.RecommendationEventItemRecord, 0)
+	eventID := uuid.NewString()
 	for _, lane := range resp.GetLanes() {
 		items := make([]map[string]any, 0, len(lane.GetItems()))
-		for _, item := range lane.GetItems() {
+		for idx, item := range lane.GetItems() {
 			items = append(items, map[string]any{
 				"track_id":       item.GetCandidate().GetTrackId(),
 				"score":          item.GetFinalScore(),
 				"primary_lane":   item.GetPrimaryLane(),
 				"secondary_lane": item.GetSecondaryLane(),
+			})
+			componentScoresJSON, err := json.Marshal(item.GetComponentScores())
+			if err != nil {
+				return nil, err
+			}
+			confidencesJSON, err := json.Marshal(item.GetComponentConfidences())
+			if err != nil {
+				return nil, err
+			}
+			weightsUsedJSON, err := json.Marshal(item.GetWeightsUsed())
+			if err != nil {
+				return nil, err
+			}
+			transitionFeatures := item.GetTransitionFeatures()
+			transitionFeaturesJSON, err := json.Marshal(map[string]any{
+				"effective_bpm_distance":   transitionFeatures.GetEffectiveBpmDistance(),
+				"raw_bpm_distance":         transitionFeatures.GetRawBpmDistance(),
+				"bpm_relationship":         transitionFeatures.GetBpmRelationship(),
+				"key_distance":             transitionFeatures.GetKeyDistance(),
+				"key_compat_label":         transitionFeatures.GetKeyCompatLabel(),
+				"key_confidence_current":   transitionFeatures.GetKeyConfidenceCurrent(),
+				"key_confidence_candidate": transitionFeatures.GetKeyConfidenceCandidate(),
+				"delta_energy_rel":         transitionFeatures.GetDeltaEnergyRel(),
+				"delta_bass_rel":           transitionFeatures.GetDeltaBassRel(),
+				"current_vocals_rel":       transitionVocalValue(transitionFeatures, true),
+				"candidate_vocals_rel":     transitionVocalValue(transitionFeatures, false),
+				"current_outro_low_end":    transitionFeatures.GetCurrentOutroLowEnd(),
+				"candidate_intro_low_end":  transitionFeatures.GetCandidateIntroLowEnd(),
+			})
+			if err != nil {
+				return nil, err
+			}
+			var primaryLane *string
+			if laneValue := firstNonEmpty(item.GetPrimaryLane(), lane.GetLaneGroup().GetLaneId()); laneValue != "" {
+				primaryLane = &laneValue
+			}
+			eventItems = append(eventItems, recommendationsrepo.RecommendationEventItemRecord{
+				EventID:                eventID,
+				LaneID:                 lane.GetLaneGroup().GetLaneId(),
+				LaneRank:               idx + 1,
+				CandidateTrackID:       item.GetCandidate().GetTrackId(),
+				FinalScore:             item.GetFinalScore(),
+				RawScore:               item.GetRawScore(),
+				PenaltyMultiplier:      item.GetPenaltyMultiplier(),
+				Move:                   item.GetMove(),
+				MoveConfidence:         item.GetMoveConfidence(),
+				Risk:                   item.GetRisk(),
+				RiskScore:              item.GetRiskScore(),
+				PrimaryLane:            primaryLane,
+				SecondaryLane:          item.GetSecondaryLane(),
+				ComponentScoresJSON:    string(componentScoresJSON),
+				ConfidencesJSON:        string(confidencesJSON),
+				WeightsUsedJSON:        string(weightsUsedJSON),
+				TransitionFeaturesJSON: string(transitionFeaturesJSON),
 			})
 		}
 		lanesSnapshot[lane.GetLaneGroup().GetLaneId()] = items
@@ -1082,7 +1157,6 @@ func (s *server) recordRecommendationEvent(
 		value := string(raw)
 		adaptedWeightsJSON = &value
 	}
-	eventID := uuid.NewString()
 	record := recommendationsrepo.RecommendationEventRecord{
 		ID:                    eventID,
 		PlaylistID:            hydrated.Playlist.ID,
@@ -1098,7 +1172,12 @@ func (s *server) recordRecommendationEvent(
 	if confidence := resp.GetRecommendationConfidence(); confidence > 0 {
 		record.RecommendationConfidence = &confidence
 	}
-	if err := s.repo.InsertRecommendationEvent(ctx, record); err != nil {
+	if err := s.repo.RunInTx(ctx, func(tx *sql.Tx) error {
+		if err := s.repo.InsertRecommendationEventTx(ctx, tx, record); err != nil {
+			return err
+		}
+		return s.repo.InsertRecommendationEventItemsTx(ctx, tx, eventItems)
+	}); err != nil {
 		return nil, err
 	}
 	return &eventID, nil
@@ -1144,6 +1223,231 @@ func derivePlayedOutcome(lanesJSON string, chosenTrackID string) (bool, []string
 	return chosenWasRecommended, skipped, nil
 }
 
+func (s *server) handleFeedbackSummary(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	var req feedbackSummaryRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON request"})
+		return
+	}
+	playlist, err := s.repo.ResolvePlaylist(r.Context(), req.PlaylistID, req.PlaylistName)
+	if err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, recommendationsrepo.ErrPlaylistNotFound) {
+			status = http.StatusNotFound
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	events, err := s.repo.ListRecommendationEventsByPlaylist(r.Context(), playlist.ID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	filteredEvents := make([]recommendationsrepo.RecommendationEventRecord, 0, len(events))
+	for _, event := range events {
+		if strings.TrimSpace(req.Since) != "" && event.Timestamp < req.Since {
+			continue
+		}
+		if strings.TrimSpace(req.Until) != "" && event.Timestamp > req.Until {
+			continue
+		}
+		filteredEvents = append(filteredEvents, event)
+	}
+	stats, err := s.repo.GetPlaylistStats(r.Context(), playlist.ID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	metadata, err := s.runtime.RefreshMetadata(r.Context())
+	if err != nil {
+		metadata = s.runtime.CachedMetadata()
+	}
+	payload, err := buildFeedbackSummaryPayload(r.Context(), s.repo, playlist, filteredEvents, stats, metadata, req.Since, req.Until)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, payload)
+}
+
+func buildFeedbackSummaryPayload(
+	ctx context.Context,
+	repo *recommendationsrepo.Repository,
+	playlist recommendationsrepo.PlaylistRef,
+	events []recommendationsrepo.RecommendationEventRecord,
+	stats *recommendationsrepo.PlaylistStats,
+	metadata *scoringv1.GetScoringMetadataResponse,
+	since, until string,
+) (map[string]any, error) {
+	staticWeights := componentWeightsFromMetadata(metadata)
+	baseWeights := map[string]float64{}
+	if len(staticWeights) > 0 {
+		baseWeights = copyWeightMap(staticWeights)
+	}
+	if stats != nil && len(stats.AdaptedWeights) > 0 {
+		baseWeights = copyWeightMap(stats.AdaptedWeights)
+	}
+	var tunedWeights map[string]float64
+	if stats != nil && len(stats.FeedbackTunedWeights) > 0 {
+		tunedWeights = copyWeightMap(stats.FeedbackTunedWeights)
+	}
+	effectiveWeights := baseWeights
+	if tunedWeights != nil {
+		effectiveWeights = copyWeightMap(tunedWeights)
+	}
+	weightSource := playlistWeightSource(stats)
+
+	totalEvents := len(events)
+	contributoryEvents := 0
+	rankedEvents := 0
+	chosenTop1 := 0
+	chosenTop3 := 0
+	chosenTop5 := 0
+	chosenRankTotal := 0.0
+	pairwiseComparisons := 0
+	laneAcceptanceCounts := map[string]int{}
+	higherScoredLaneSkips := map[string]int{}
+
+	for _, event := range events {
+		items, err := repo.GetRecommendationEventItems(ctx, event.ID)
+		if err != nil {
+			return nil, err
+		}
+		canonicalItems := canonicalizeRecommendationEventItems(items)
+		chosenTrackID := stringValue(event.TrackChosen)
+		chosenItem := findChosenEventItem(canonicalItems, chosenTrackID)
+		if chosenItem == nil {
+			continue
+		}
+		rankedEvents++
+		chosenRank := 0
+		for idx, item := range canonicalItems {
+			if item.CandidateTrackID == chosenTrackID {
+				chosenRank = idx + 1
+				break
+			}
+		}
+		if chosenRank > 0 {
+			chosenRankTotal += float64(chosenRank)
+			if chosenRank <= 1 {
+				chosenTop1++
+			}
+			if chosenRank <= 3 {
+				chosenTop3++
+			}
+			if chosenRank <= 5 {
+				chosenTop5++
+			}
+		}
+		if event.ChosenWasRecommended == nil || !*event.ChosenWasRecommended {
+			continue
+		}
+		contributoryEvents++
+		chosenLane := firstNonEmpty(stringValue(chosenItem.PrimaryLane), chosenItem.LaneID, "unknown")
+		laneAcceptanceCounts[chosenLane]++
+		chosenScore := chosenItem.FinalScore
+		for _, item := range canonicalItems {
+			if item.FinalScore > chosenScore {
+				pairwiseComparisons++
+			}
+		}
+		bestScoreByLane := map[string]float64{}
+		for _, item := range items {
+			laneID := firstNonEmpty(item.LaneID, stringValue(item.PrimaryLane), "unknown")
+			if current, ok := bestScoreByLane[laneID]; !ok || item.FinalScore > current {
+				bestScoreByLane[laneID] = item.FinalScore
+			}
+		}
+		for laneID, score := range bestScoreByLane {
+			if laneID != chosenLane && score > chosenScore {
+				higherScoredLaneSkips[laneID]++
+			}
+		}
+	}
+
+	topDenominator := totalEvents
+	if topDenominator == 0 {
+		topDenominator = 1
+	}
+	var meanChosenRank any = nil
+	if rankedEvents > 0 {
+		meanChosenRank = roundFloat(chosenRankTotal/float64(rankedEvents), 4)
+	}
+	tuningMetrics := map[string]any{}
+	if stats != nil && len(stats.FeedbackTuningMetrics) > 0 {
+		tuningMetrics = stats.FeedbackTuningMetrics
+	}
+
+	return map[string]any{
+		"playlist_id":   playlist.ID,
+		"playlist_name": playlist.Name,
+		"window": map[string]any{
+			"since": nullIfEmpty(since),
+			"until": nullIfEmpty(until),
+		},
+		"metrics": map[string]any{
+			"total_events":                   totalEvents,
+			"contributory_events":            contributoryEvents,
+			"ranked_events":                  rankedEvents,
+			"pairwise_comparison_count":      pairwiseComparisons,
+			"chosen_top1_rate":               roundFloat(float64(chosenTop1)/float64(topDenominator), 4),
+			"chosen_top3_rate":               roundFloat(float64(chosenTop3)/float64(topDenominator), 4),
+			"chosen_top5_rate":               roundFloat(float64(chosenTop5)/float64(topDenominator), 4),
+			"mean_chosen_rank":               meanChosenRank,
+			"lane_acceptance_counts":         laneAcceptanceCounts,
+			"higher_scored_lane_skip_counts": higherScoredLaneSkips,
+		},
+		"weights": map[string]any{
+			"source":    weightSource,
+			"static":    staticWeights,
+			"base":      baseWeights,
+			"tuned":     tunedWeights,
+			"effective": effectiveWeights,
+		},
+		"tuning": map[string]any{
+			"last_tuned_at":        stringOrNil(statsFieldString(stats, "feedback_last_tuned_at")),
+			"feedback_event_count": statsFieldInt(stats),
+			"notes":                statsFieldNotes(stats),
+			"metrics":              tuningMetrics,
+		},
+	}, nil
+}
+
+func canonicalizeRecommendationEventItems(items []recommendationsrepo.RecommendationEventItemRecord) []recommendationsrepo.RecommendationEventItemRecord {
+	byCandidate := map[string]recommendationsrepo.RecommendationEventItemRecord{}
+	for _, item := range items {
+		existing, ok := byCandidate[item.CandidateTrackID]
+		if !ok || item.FinalScore > existing.FinalScore {
+			byCandidate[item.CandidateTrackID] = item
+		}
+	}
+	out := make([]recommendationsrepo.RecommendationEventItemRecord, 0, len(byCandidate))
+	for _, item := range byCandidate {
+		out = append(out, item)
+	}
+	for i := 0; i < len(out); i++ {
+		for j := i + 1; j < len(out); j++ {
+			if out[j].FinalScore > out[i].FinalScore || (out[j].FinalScore == out[i].FinalScore && out[j].CandidateTrackID < out[i].CandidateTrackID) {
+				out[i], out[j] = out[j], out[i]
+			}
+		}
+	}
+	return out
+}
+
+func findChosenEventItem(items []recommendationsrepo.RecommendationEventItemRecord, chosenTrackID string) *recommendationsrepo.RecommendationEventItemRecord {
+	for idx := range items {
+		if items[idx].CandidateTrackID == chosenTrackID {
+			return &items[idx]
+		}
+	}
+	return nil
+}
+
 func parseCorrectionBPM(value any) (float64, bool) {
 	switch typed := value.(type) {
 	case float64:
@@ -1153,6 +1457,116 @@ func parseCorrectionBPM(value any) (float64, bool) {
 	default:
 		return 0, false
 	}
+}
+
+func playlistWeightSource(stats *recommendationsrepo.PlaylistStats) string {
+	if stats != nil && len(stats.FeedbackTunedWeights) > 0 {
+		return "feedback_tuned_weights"
+	}
+	if stats != nil && len(stats.AdaptedWeights) > 0 {
+		return "adapted_weights"
+	}
+	return "static"
+}
+
+func effectivePlaylistWeights(stats *recommendationsrepo.PlaylistStats) (map[string]float64, string) {
+	if stats != nil && len(stats.FeedbackTunedWeights) > 0 {
+		return copyWeightMap(stats.FeedbackTunedWeights), "feedback_tuned_weights"
+	}
+	if stats != nil && len(stats.AdaptedWeights) > 0 {
+		return copyWeightMap(stats.AdaptedWeights), "adapted_weights"
+	}
+	return nil, "static"
+}
+
+func applyPlaylistWeightSource(payload map[string]any, stats *recommendationsrepo.PlaylistStats) {
+	meta, ok := payload["meta"].(map[string]any)
+	if !ok {
+		return
+	}
+	weightAdaptation, ok := meta["weight_adaptation"].(map[string]any)
+	if !ok {
+		return
+	}
+	source := playlistWeightSource(stats)
+	weightAdaptation["mode"] = source
+	weightAdaptation["source"] = source
+}
+
+func componentWeightsFromMetadata(metadata *scoringv1.GetScoringMetadataResponse) map[string]float64 {
+	out := map[string]float64{}
+	if metadata == nil {
+		return out
+	}
+	for _, component := range metadata.GetComponents() {
+		out[component.GetComponentId()] = component.GetWeight()
+	}
+	return out
+}
+
+func copyWeightMap(source map[string]float64) map[string]float64 {
+	if len(source) == 0 {
+		return map[string]float64{}
+	}
+	out := make(map[string]float64, len(source))
+	for key, value := range source {
+		out[key] = value
+	}
+	return out
+}
+
+func roundFloat(value float64, digits int) float64 {
+	pow := 1.0
+	for i := 0; i < digits; i++ {
+		pow *= 10
+	}
+	if value >= 0 {
+		return float64(int(value*pow+0.5)) / pow
+	}
+	return float64(int(value*pow-0.5)) / pow
+}
+
+func valueOrNil(value *float64) any {
+	if value == nil {
+		return nil
+	}
+	return *value
+}
+
+func transitionVocalValue(features *scoringv1.TransitionFeatures, current bool) any {
+	if features == nil {
+		return nil
+	}
+	if current {
+		return valueOrNil(features.CurrentVocalsRel)
+	}
+	return valueOrNil(features.CandidateVocalsRel)
+}
+
+func statsFieldString(stats *recommendationsrepo.PlaylistStats, field string) *string {
+	if stats == nil {
+		return nil
+	}
+	switch field {
+	case "feedback_last_tuned_at":
+		return stats.FeedbackLastTunedAt
+	default:
+		return nil
+	}
+}
+
+func statsFieldInt(stats *recommendationsrepo.PlaylistStats) int {
+	if stats == nil {
+		return 0
+	}
+	return stats.FeedbackEventCount
+}
+
+func statsFieldNotes(stats *recommendationsrepo.PlaylistStats) []string {
+	if stats == nil {
+		return []string{}
+	}
+	return append([]string{}, stats.FeedbackTuningNotes...)
 }
 
 func parseCorrectionKey(value any) (string, bool) {

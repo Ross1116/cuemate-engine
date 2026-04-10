@@ -19,6 +19,7 @@ from cuemate_analysis.scoring import (
     get_recommendations,
     get_scoring_metadata,
     resolve_effective_weights,
+    resolve_weight_source,
     score_candidate,
 )
 from cuemate_analysis.scoring_proto import load_scoring_proto_modules
@@ -109,6 +110,9 @@ def _playlist_stats_from_proto(message: Any) -> dict[str, Any] | None:
         payload["energy_spread"] = float(message.energy_spread)
     if message.adapted_weights:
         payload["adapted_weights"] = dict(message.adapted_weights)
+    weight_source = str(getattr(message, "weight_source", "") or "")
+    if weight_source:
+        payload["weight_source"] = weight_source
     return payload or None
 
 
@@ -297,7 +301,14 @@ def _applied_weight_adaptation(
     config: dict[str, Any],
 ) -> dict[str, Any]:
     effective_weights = resolve_effective_weights(playlist_stats, config)
-    if playlist_stats and playlist_stats.get("adapted_weights"):
+    source = str((playlist_stats or {}).get("weight_source") or resolve_weight_source(playlist_stats))
+    if source == "feedback_tuned_weights":
+        return {
+            "adaptation_id": "feedback_tuned_weights",
+            "component_weights": effective_weights,
+            "explanation": "Playlist feedback_tuned_weights were applied.",
+        }
+    if source == "adapted_weights":
         return {
             "adaptation_id": "adapted_weights",
             "component_weights": effective_weights,

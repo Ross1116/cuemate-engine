@@ -76,6 +76,28 @@ jobs:
         with:
           go-version-file: go/go.mod
 
+      - name: Install protoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install Go proto plugins
+        run: |
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.5
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Generate Go protobuf stubs
+        working-directory: .
+        run: |
+          protoc \
+            --proto_path=proto \
+            --go_out=go \
+            --go_opt=module=github.com/Ross1116/cuemate-engine/go \
+            --go-grpc_out=go \
+            --go-grpc_opt=module=github.com/Ross1116/cuemate-engine/go \
+            proto/djengine/scoring/v1/scoring.proto
+
       - name: Go test
         shell: bash
         run: |

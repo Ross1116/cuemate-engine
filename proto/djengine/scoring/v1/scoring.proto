@@ -48,8 +48,8 @@ message HistoryEntry {
   string musical_key = 2;
   optional double energy_rel = 3;
   string relation = 4;
-  int32 plays_ago = 5;
-  double elapsed_since_play_seconds = 6;
+  optional int32 plays_ago = 5;
+  optional double elapsed_since_play_seconds = 6;
 }
 
 message PlaylistStatsContext {

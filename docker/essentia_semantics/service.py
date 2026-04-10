@@ -1112,8 +1112,8 @@ def main() -> int:
                 ),
                 default_family_policy,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Failed to preload default semantic model root '%s': %s", default_model_root, exc)
 
     if default_tempo_model:
         try:
@@ -1124,8 +1124,8 @@ def main() -> int:
                     allowed_roots=resolve_allowed_roots(),
                 )
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Failed to preload default tempo model '%s': %s", default_tempo_model, exc)
 
     server = ThreadingHTTPServer(("0.0.0.0", port), SharedTensorflowHandler)
     server.serve_forever()

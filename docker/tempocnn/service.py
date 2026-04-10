@@ -18,16 +18,6 @@ TEMPOCNN_AUDIO_WORKERS = max(1, min(4, os.cpu_count() or 1))
 ALLOWED_SERVICE_ROOTS_ENV = "CUEMATE_SERVICE_ALLOWED_ROOTS"
 
 
-def detect_gpu_counts() -> tuple[int | None, int | None]:
-    try:
-        import tensorflow as tf
-    except Exception:
-        return None, None
-    physical = len(tf.config.list_physical_devices("GPU"))
-    logical = len(tf.config.list_logical_devices("GPU"))
-    return physical, logical
-
-
 def resolve_allowed_roots() -> list[Path]:
     raw_roots = os.getenv(ALLOWED_SERVICE_ROOTS_ENV)
     if raw_roots:
@@ -63,6 +53,16 @@ def _is_relative_to(path: Path, root: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def detect_gpu_counts() -> tuple[int | None, int | None]:
+    try:
+        import tensorflow as tf
+    except Exception:
+        return None, None
+    physical = len(tf.config.list_physical_devices("GPU"))
+    logical = len(tf.config.list_logical_devices("GPU"))
+    return physical, logical
 
 
 def get_model(model_path: Path):
@@ -256,7 +256,7 @@ class TempoCNNHandler(BaseHTTPRequestHandler):
                     RESULT_CACHE[
                         build_cache_key(
                             resolved_model_path,
-                            resolve_existing_file_path(track_path, "track_path", allowed_roots=allowed_roots),
+                            Path(track_path),
                         )
                     ] = dict(item)
 

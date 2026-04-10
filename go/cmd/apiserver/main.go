@@ -8,7 +8,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	scoringv1 "github.com/Ross1116/cuemate-engine/go/gen/djengine/scoring/v1"
@@ -107,12 +109,44 @@ func run() int {
 	mux.HandleFunc("/sync/outbox/pull", srv.handleOutboxPull)
 	mux.HandleFunc("/sync/outbox/ack", srv.handleOutboxAck)
 
-	log.Printf("Go API server listening on %s", cfg.Addr)
-	if err := http.ListenAndServe(cfg.Addr, mux); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
+	httpServer := &http.Server{
+		Addr:         cfg.Addr,
+		Handler:      mux,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
-	return 0
+	serverErr := make(chan error, 1)
+	go func() {
+		log.Printf("Go API server listening on %s", cfg.Addr)
+		serverErr <- httpServer.ListenAndServe()
+	}()
+
+	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	select {
+	case err := <-serverErr:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		return 0
+	case <-sigCtx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := httpServer.Shutdown(shutdownCtx); err != nil {
+			log.Printf("Go API server shutdown failed for %s: %v", cfg.Addr, err)
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		if err := <-serverErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		log.Printf("Go API server shut down cleanly on %s", cfg.Addr)
+		return 0
+	}
 }
 
 func loadConfig() appConfig {
@@ -288,7 +322,7 @@ func (s *server) handlePlayedEvent(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(playedAt) == "" {
 		playedAt = recommendationsrepo.NowUTC()
 	}
-	outboxPayload, _ := json.Marshal(map[string]any{
+	outboxPayload, err := json.Marshal(map[string]any{
 		"recommendation_event_id": event.ID,
 		"playlist_id":             event.PlaylistID,
 		"current_track_id":        event.CurrentTrackID,
@@ -297,6 +331,11 @@ func (s *server) handlePlayedEvent(w http.ResponseWriter, r *http.Request) {
 		"skipped_over":            skippedOver,
 		"played_at":               playedAt,
 	})
+	if err != nil {
+		log.Printf("failed to marshal recommendation event outbox payload for %s: %v", event.ID, err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to encode sync payload"})
+		return
+	}
 	_, err = s.repo.InsertSyncOutbox(
 		r.Context(),
 		"recommendation_event",
@@ -464,7 +503,7 @@ func (s *server) handleCorrections(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	outboxPayload, _ := json.Marshal(map[string]any{
+	outboxPayload, err := json.Marshal(map[string]any{
 		"correction_id":             correction.ID,
 		"track_id":                  req.TrackID,
 		"field":                     correction.Field,
@@ -473,6 +512,11 @@ func (s *server) handleCorrections(w http.ResponseWriter, r *http.Request) {
 		"affected_playlist_ids":     playlistIDs,
 		"requires_snapshot_refresh": true,
 	})
+	if err != nil {
+		log.Printf("failed to marshal manual correction outbox payload for %s: %v", correction.ID, err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to encode sync payload"})
+		return
+	}
 	if _, err := s.repo.InsertSyncOutbox(r.Context(), "manual_correction", correction.ID, "upsert", string(outboxPayload), correctedAt); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -763,11 +807,12 @@ func buildRecommendationsRequest(
 
 	history := make([]*scoringv1.HistoryEntry, 0, len(hydrated.History))
 	for idx, item := range hydrated.History {
+		playsAgo := int32(len(hydrated.History) - idx)
 		entry := &scoringv1.HistoryEntry{
 			TrackId:    item.TrackID,
 			MusicalKey: stringValue(item.Key),
 			Relation:   "played",
-			PlaysAgo:   int32(len(hydrated.History) - idx),
+			PlaysAgo:   &playsAgo,
 		}
 		if item.EnergyRel != nil {
 			entry.EnergyRel = item.EnergyRel
@@ -1247,8 +1292,4 @@ func floatValue(value *float64) float64 {
 		return 0
 	}
 	return *value
-}
-
-func requestContext() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), 2*time.Second)
 }

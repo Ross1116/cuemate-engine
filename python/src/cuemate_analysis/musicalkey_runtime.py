@@ -196,7 +196,7 @@ def load_audio_excerpt(
         audio = handle.read(frames=frame_count, dtype="float32", always_2d=True)
 
     if audio.size == 0:
-        raise ValueError(f"No audio samples decoded for {track_path}")
+        raise ValueError(f"No audio samples decoded for {resolved_track_path}")
 
     waveform = np.mean(audio, axis=1, dtype=np.float32)
     if native_sample_rate != sample_rate:
@@ -215,7 +215,7 @@ def load_audio_full_track(
         audio = handle.read(dtype="float32", always_2d=True)
 
     if audio.size == 0:
-        raise ValueError(f"No audio samples decoded for {track_path}")
+        raise ValueError(f"No audio samples decoded for {resolved_track_path}")
 
     waveform = np.mean(audio, axis=1, dtype=np.float32)
     if native_sample_rate != sample_rate:

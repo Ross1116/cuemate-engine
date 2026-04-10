@@ -31,14 +31,19 @@ if (-not $gopath) {
   throw "Could not determine GOPATH."
 }
 
-$pluginBin = Join-Path $gopath "bin"
+$gobin = $env:GOBIN
+if ($gobin -and $gobin.Trim()) {
+  $pluginBin = $gobin.Trim()
+} else {
+  $pluginBin = Join-Path $gopath "bin"
+}
 $protocGenGo = Join-Path $pluginBin "protoc-gen-go.exe"
 $protocGenGoGrpc = Join-Path $pluginBin "protoc-gen-go-grpc.exe"
 if (-not (Test-Path $protocGenGo)) {
-  throw "Could not find protoc-gen-go at $protocGenGo. Install it with 'go install google.golang.org/protobuf/cmd/protoc-gen-go@latest'."
+  throw "Could not find protoc-gen-go at $protocGenGo. Install it with 'go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.5'."
 }
 if (-not (Test-Path $protocGenGoGrpc)) {
-  throw "Could not find protoc-gen-go-grpc at $protocGenGoGrpc. Install it with 'go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest'."
+  throw "Could not find protoc-gen-go-grpc at $protocGenGoGrpc. Install it with 'go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1'."
 }
 
 $env:Path = "$pluginBin;$env:Path"
@@ -64,7 +69,7 @@ New-Item -ItemType Directory -Force $PythonOut | Out-Null
   New-Item -ItemType Directory -Force $pkgDir | Out-Null
   $initPath = Join-Path $pkgDir "__init__.py"
   if (-not (Test-Path $initPath)) {
-    Set-Content -Path $initPath -Value '"""Generated scoring protobuf namespace."""'
+    Set-Content -Path $initPath -Value '"""Generated scoring protobuf namespace."""' -Encoding UTF8
   }
 }
 

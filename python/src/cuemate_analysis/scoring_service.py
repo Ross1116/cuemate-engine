@@ -90,10 +90,10 @@ def _history_from_proto(items: Any) -> list[dict[str, Any]]:
                 "key": item.musical_key or None,
                 "energy_rel": _optional_float(item, "energy_rel"),
                 "relation": item.relation or None,
-                "plays_ago": item.plays_ago or None,
+                "plays_ago": int(item.plays_ago) if item.HasField("plays_ago") else None,
                 "elapsed_since_play_seconds": (
                     float(item.elapsed_since_play_seconds)
-                    if item.elapsed_since_play_seconds
+                    if item.HasField("elapsed_since_play_seconds")
                     else None
                 ),
             }
@@ -551,7 +551,10 @@ def serve_scoring_grpc(
     max_workers: int = 8,
 ) -> int:
     server = build_grpc_server(settings, max_workers=max_workers)
-    server.add_insecure_port(f"{host}:{port}")
+    bind_address = f"{host}:{port}"
+    bound_port = server.add_insecure_port(bind_address)
+    if bound_port == 0:
+        raise RuntimeError(f"Failed to bind scoring gRPC service to {bind_address}")
     server.start()
     print(f"Scoring gRPC service listening on {host}:{port}")
     server.wait_for_termination()

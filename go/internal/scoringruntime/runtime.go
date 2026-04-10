@@ -9,6 +9,7 @@ import (
 	scoringv1 "github.com/Ross1116/cuemate-engine/go/gen/djengine/scoring/v1"
 	"github.com/Ross1116/cuemate-engine/go/internal/scoringclient"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
@@ -130,7 +131,16 @@ func IsUnavailable(err error) bool {
 		return true
 	}
 	st, ok := status.FromError(err)
-	return ok && st != nil
+	if !ok || st == nil {
+		return false
+	}
+	// Treat only transient transport/load conditions as temporarily unavailable.
+	switch st.Code() {
+	case codes.Unavailable, codes.DeadlineExceeded, codes.ResourceExhausted:
+		return true
+	default:
+		return false
+	}
 }
 
 func DescribeUnavailable(err error) string {

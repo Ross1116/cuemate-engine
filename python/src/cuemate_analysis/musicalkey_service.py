@@ -136,10 +136,12 @@ class MusicalKeyHandler(BaseHTTPRequestHandler):
             computed_results: dict[str, dict[str, object]] = {}
             if missing_track_paths:
                 for item in predict_keys(model, runner_device, missing_track_paths, policy=normalized_policy):
-                    track_path = str(item.get("track_path") or "")
+                    raw_track_path = str(item.get("track_path") or "").strip()
+                    track_path = Path(raw_track_path).as_posix() if raw_track_path else ""
+                    item = {**item, "track_path": track_path} if track_path else item
                     computed_results[track_path] = item
                     if "error" not in item and track_path:
-                        resolved_track_path = resolve_existing_file_path(track_path, "track_path")
+                        resolved_track_path = Path(track_path)
                         RESULT_CACHE[
                             build_cache_key(
                                 resolved_model_path,

@@ -237,6 +237,21 @@ class TestScoringMetadata:
         assert status["requires_reanalysis"] is False
         assert status["reason"] == "compatible_but_not_exact"
 
+    def test_check_analysis_compatibility_accepts_active_family_prefix(self):
+        metadata = get_scoring_metadata()
+        active = metadata["active_signatures"]
+        detailed_signature = f"{active['analysis_signature']}-tempo-tempocnn-abc123"
+        status = check_analysis_compatibility(
+            detailed_signature,
+            active["config_signature"],
+            SCORING_CONTRACT_ID,
+            scoring_metadata=metadata,
+        )
+        assert status["exact_match"] is False
+        assert status["compatible"] is True
+        assert status["requires_reanalysis"] is False
+        assert status["reason"] == "compatible_but_not_exact"
+
     def test_check_analysis_compatibility_rejects_missing_contract(self):
         metadata = get_scoring_metadata()
         active = metadata["active_signatures"]

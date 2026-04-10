@@ -477,6 +477,9 @@ def check_analysis_compatibility(
             ],
         }
 
+    def _analysis_family_match(track_sig: str, active_sig: str) -> bool:
+        return track_sig == active_sig or track_sig.startswith(f"{active_sig}-")
+
     analysis_exact = track_analysis_signature == active_analysis_signature
     config_exact = track_config_signature == active_config_signature
     if analysis_exact and config_exact:
@@ -489,7 +492,10 @@ def check_analysis_compatibility(
         }
 
     notes: list[str] = []
-    analysis_compatible = track_analysis_signature in compatible_analysis_signatures
+    analysis_compatible = (
+        track_analysis_signature in compatible_analysis_signatures
+        or any(_analysis_family_match(track_analysis_signature, sig) for sig in compatible_analysis_signatures)
+    )
     config_compatible = track_config_signature in compatible_config_signatures
     if not analysis_compatible:
         return {

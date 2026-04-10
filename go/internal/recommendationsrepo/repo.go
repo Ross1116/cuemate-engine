@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -283,7 +284,9 @@ func (r *Repository) GetPlaylistSnapshotTracks(ctx context.Context, playlistID s
 			track.IntensityBand = &intensityBand.String
 		}
 		if roleHints.Valid && strings.TrimSpace(roleHints.String) != "" {
-			_ = json.Unmarshal([]byte(roleHints.String), &track.RoleHints)
+			if err := json.Unmarshal([]byte(roleHints.String), &track.RoleHints); err != nil {
+				log.Printf("warning: failed to decode playlist snapshot role_hints %q: %v", roleHints.String, err)
+			}
 		}
 		switch {
 		case !analysisSig.Valid || !configSig.Valid || !scoringContract.Valid:
@@ -440,7 +443,15 @@ func (r *Repository) CreateAnalysisJobWithKind(
 	priority int,
 	createdAt string,
 ) (int64, error) {
-	_, err := r.db.ExecContext(
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+
+	_, err = tx.ExecContext(
 		ctx,
 		`
 		DELETE FROM analysis_jobs
@@ -458,7 +469,7 @@ func (r *Repository) CreateAnalysisJobWithKind(
 	if err != nil {
 		return 0, err
 	}
-	result, err := r.db.ExecContext(
+	result, err := tx.ExecContext(
 		ctx,
 		`
 		INSERT INTO analysis_jobs (
@@ -480,7 +491,14 @@ func (r *Repository) CreateAnalysisJobWithKind(
 	if err != nil {
 		return 0, err
 	}
-	return result.LastInsertId()
+	jobID, err := result.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return jobID, nil
 }
 
 func (r *Repository) InsertManualCorrection(ctx context.Context, record ManualCorrectionRecord) error {
@@ -1042,7 +1060,9 @@ func scanTrackContext(scanner interface{ Scan(...any) error }) (TrackContextReco
 		record.IntensityBand = &intensityBand.String
 	}
 	if roleHints.Valid && strings.TrimSpace(roleHints.String) != "" {
-		_ = json.Unmarshal([]byte(roleHints.String), &record.RoleHints)
+		if err := json.Unmarshal([]byte(roleHints.String), &record.RoleHints); err != nil {
+			log.Printf("warning: failed to decode role_hints %q for track %s: %v", roleHints.String, record.TrackID, err)
+		}
 	}
 	if analysisSignature.Valid {
 		record.AnalysisSignature = &analysisSignature.String

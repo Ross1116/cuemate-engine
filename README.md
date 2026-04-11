@@ -38,6 +38,11 @@ Implemented today:
   - Go HTTP API server for `/recommendations`, `/scoring/metadata`, `/healthz`, and `/readyz`
   - SQLite hydration of live scoring inputs
   - scorer readiness/circuit-breaker handling in the decision plane
+- Milestone 5 feedback loop slice:
+  - immutable recommendation event item capture for returned candidates
+  - `/events/played` outcome capture plus queued `feedback_tuning_jobs`
+  - playlist-level feedback summaries and per-playlist tuned weights
+  - local feedback worker for deferred auto-tuning
 - staged analysis pipeline:
   - `fast_pass`
   - `staged` (default)
@@ -49,7 +54,7 @@ Deferred for now:
 
 Follow-on work:
 
-- recommendation outcome analytics and tuning loops built on top of the captured event data
+- mobile/API integration on top of the current local-first recommendation and sync surfaces
 
 ## Architecture
 
@@ -500,6 +505,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\compile-proto.ps1
 
 The compile helper runs `buf lint`, writes `data/scoring.pb`, and generates Python and Go gRPC stubs into `python/src/djengine/` and `go/gen/`.
 
+For the shipped Milestone 5 operator flow, see [docs/feedback-loop-local.md](docs/feedback-loop-local.md).
+
 Benchmark local DSP:
 
 ```powershell
@@ -509,7 +516,7 @@ python -m cuemate_analysis benchmark-dsp --path "D:\Music\track.flac"
 
 ## Known Boundaries
 
-- Go decision plane now serves the live recommendations API plus single-consumer snapshot/outbox sync primitives; richer outcome analytics and actual mobile consumption are follow-on work
+- Go decision plane now serves the live recommendations API, event capture, feedback summary surfaces, and single-consumer snapshot/outbox sync primitives; actual mobile consumption remains follow-on work
 - windowed intro/outro analysis is intentionally deferred
 - `transition_support`, `vocal_transition`, and `rhythmic_continuity` are still explicit stubs and are excluded from weighted scoring
 - `vocals_abs` / `vocals_rel` are not populated by the current analysis pipeline yet, so vocal-dependent recommendation logic remains limited
@@ -524,11 +531,11 @@ Done:
 - Milestone 2 persisted relative context
 - Milestone 3 Python recommendation/scoring core
 - Milestone 4 local service/API bootstrap, write-side cleanup, and explicit-ack sync protocol
+- Milestone 5 per-playlist feedback loop and auto-tuned weights
 
 Next:
 
 - mobile/API integration
-- recommendation outcome analytics and tuning loop
 
 Later:
 

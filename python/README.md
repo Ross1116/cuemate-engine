@@ -34,6 +34,13 @@ This package now exposes the local recommendation/scoring CLI, but a few signals
 
 Those components are explicit stubs and are excluded from weighted scoring until they are implemented. Windowed intro/outro features are still deferred, and `vocals_abs` / `vocals_rel` are not populated by the current analysis pipeline yet.
 
+The shipped local feedback loop is also part of the current scope:
+
+- recommendation event item capture for returned candidates
+- playlist-level feedback summaries
+- per-playlist tuned weights that override heuristic playlist adaptation
+- a local worker that applies tuned weights from queued `feedback_tuning_jobs`
+
 ## Install
 
 From the repository root:
@@ -102,6 +109,9 @@ python -m cuemate_analysis analyze-essentia-playlist --playlist "My Playlist"
 python -m cuemate_analysis recommend-next --playlist "My Playlist" --current-track trk_example123 --target maintain
 python -m cuemate_analysis score-pair --playlist "My Playlist" --current trk_example123 --candidate trk_example456
 python -m cuemate_analysis inspect-scoring-weights --playlist "My Playlist"
+python -m cuemate_analysis feedback-summary --playlist "My Playlist"
+python -m cuemate_analysis feedback-tune --playlist "My Playlist" --preview-only
+python -m cuemate_analysis run-feedback-worker --limit 10
 python -m cuemate_analysis inspect-scoring-metadata
 python -m cuemate_analysis serve-scoring --host 127.0.0.1 --port 47834
 python -m cuemate_analysis purge-model-cache
@@ -122,7 +132,11 @@ Important notes:
 - `download-essentia-semantic-models` and `analyze-essentia-playlist` are the model-acquisition and read-only inspection surfaces for Essentia semantic absolute features
 - `recommend-next` organizes scored suggestions into `maintain`, `build`, `reset`, `jump`, and `contrast` lanes
 - `score-pair` is the main diagnostics surface for auditing one current->candidate transition
-- `inspect-scoring-weights` and `inspect-scoring-metadata` expose the active scoring contract and runtime weights
+- `inspect-scoring-weights` exposes the static/base/tuned/effective layers plus the active weight source
+- `feedback-summary` reports playlist-level recommendation outcomes and current feedback-tuning state
+- `feedback-tune` previews or applies per-playlist tuned weights from recorded outcomes
+- `run-feedback-worker` claims queued `feedback_tuning_jobs` and applies tuned weights when thresholds are met
+- `inspect-scoring-metadata` exposes the active scoring contract and runtime metadata
 - `serve-scoring` runs the local gRPC scorer after the protobuf contract has been compiled
 - treat vocal-related weights and diagnostics as placeholders for now: `vocal_transition` is stubbed, and `vocals_abs` / `vocals_rel` are currently unavailable in analysis output
 - if TempoCNN is unavailable for a track, analysis falls back to the current librosa baseline automatically and records `baseline_fallback` as the source
@@ -132,7 +146,7 @@ Important notes:
 - MusicalKeyCNN now defaults to `full_track`
 - if MusicalKeyCNN is unavailable for a track, analysis now falls back to a tagged key only when one exists
 - repeated requests now go through warm TempoCNN and MusicalKeyCNN service containers when possible
-- the Essentia semantic lane uses the same shared TensorFlow/Essentia warm Docker service as TempoCNN (TempoCNN aliases into that shared service — there is a single shared container, not two)
+- the Essentia semantic lane uses the same shared TensorFlow/Essentia warm Docker service as TempoCNN (TempoCNN aliases into that shared service - there is a single shared container, not two)
 - repeated requests for unchanged files are cached inside those warm services, so reruns are much faster than the first pass
 - those persistent model caches are also stored in `data/inference-cache.db`, and `purge-model-cache` clears both the persistent rows and the warm service state
 - playlist analysis batches TempoCNN tracks through the warm service so the model stays loaded
@@ -142,6 +156,12 @@ Important notes:
 - the default local Docker image name for key detection is `cuemate-musicalkeycnn:local`, and you can override it with `CUEMATE_MUSICALKEYCNN_IMAGE`
 - if Docker cannot expose a usable GPU cleanly, the TempoCNN notes will say it retried on CPU
 - `librosa`-based baseline analysis remains CPU-bound
+
+Feedback-tuning weight precedence:
+
+- `feedback_tuned_weights`
+- `adapted_weights`
+- static scoring weights
 
 Manual Docker debug for one track:
 

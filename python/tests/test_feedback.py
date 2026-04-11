@@ -10,6 +10,12 @@ from cuemate_analysis.config import build_relative_experiment_signature
 from cuemate_analysis.config import load_runtime_settings
 from cuemate_analysis.database import Database
 from cuemate_analysis.feedback import build_feedback_summary, compute_feedback_tuning
+from cuemate_analysis.feedback_shared import (
+    build_feedback_weight_layers,
+    canonicalize_event_items,
+    decode_json_array,
+    decode_json_object,
+)
 
 
 def _seed_feedback_db(tmp_path: Path) -> Database:
@@ -173,6 +179,20 @@ def test_compute_feedback_tuning_skips_apply_when_thresholds_not_met():
     assert result["thresholds_met"] is False
 
 
+def test_feedback_shared_helpers_decode_and_canonicalize():
+    assert decode_json_object('{"harmonic": 0.8}') == {"harmonic": 0.8}
+    assert decode_json_array('["build", "jump"]') == ["build", "jump"]
+    canonical = canonicalize_event_items(
+        [
+            {"candidate_track_id": "trk_b", "final_score": 0.6},
+            {"candidate_track_id": "trk_a", "final_score": 0.7},
+            {"candidate_track_id": "trk_a", "final_score": 0.8},
+        ]
+    )
+    assert [item["candidate_track_id"] for item in canonical] == ["trk_a", "trk_b"]
+    assert canonical[0]["final_score"] == 0.8
+
+
 def test_cli_feedback_summary_and_inspect_weights_report_weight_layers(tmp_path: Path, monkeypatch, capsys):
     settings = replace(load_runtime_settings(), database_path=tmp_path / "feedback.db")
     expected_relative_signature = build_relative_experiment_signature(settings, energy_source="canonical")
@@ -243,3 +263,18 @@ def test_cli_feedback_summary_and_inspect_weights_report_weight_layers(tmp_path:
     assert inspect_payload["base_weights"]["harmonic"] == 0.12
     assert inspect_payload["tuned_weights"]["harmonic"] == 0.20
     assert inspect_payload["effective_weights"]["harmonic"] == 0.20
+
+
+def test_feedback_weight_layers_match_expected_precedence(tmp_path: Path):
+    settings = replace(load_runtime_settings(), database_path=tmp_path / "feedback.db")
+    layers = build_feedback_weight_layers(
+        {
+            "adapted_weights": {"harmonic": 0.12, "target_energy": 0.22},
+            "feedback_tuned_weights": {"harmonic": 0.20, "target_energy": 0.18},
+        },
+        settings,
+    )
+    assert layers["source"] == "feedback_tuned_weights"
+    assert layers["base"]["harmonic"] == 0.12
+    assert layers["tuned"]["harmonic"] > layers["base"]["harmonic"]
+    assert layers["effective"]["harmonic"] == 0.20

@@ -37,6 +37,7 @@ from cuemate_analysis.essentia_semantic_backend import (
 )
 from cuemate_analysis.energy_experiments import analyze_energy_path
 from cuemate_analysis.energy_features import EnergyFeatureVector, energy_consensus
+from cuemate_analysis.feedback_shared import build_feedback_weight_layers
 from cuemate_analysis.ingest import (
     discover_audio_files,
     make_playlist_id,
@@ -74,6 +75,14 @@ from cuemate_analysis.tempo_backend import (
 )
 
 TEMPOCNN_PROGRESS_BATCH_SIZE = 8
+DISPLAY_MOJIBAKE_REPLACEMENTS = {
+    "â€™": "'",
+    "â€˜": "'",
+    "â€œ": '"',
+    "â€": '"',
+    "â€”": "-",
+    "â€“": "-",
+}
 
 
 @dataclass(frozen=True)
@@ -92,6 +101,21 @@ def hash_file_identity(path: Path) -> str:
         while chunk := handle.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()[:12]
+
+
+def normalize_display_text(value: object) -> str:
+    text = str(value or "")
+    for source, replacement in DISPLAY_MOJIBAKE_REPLACEMENTS.items():
+        text = text.replace(source, replacement)
+    return text
+
+
+def format_track_label(track_id: str, artist: object, title: object) -> str:
+    clean_artist = normalize_display_text(artist)
+    clean_title = normalize_display_text(title)
+    if clean_artist or clean_title:
+        return f"{clean_artist} - {clean_title} [{track_id}]".strip()
+    return track_id
 
 
 def resolve_expected_essentia_semantic_signature(settings) -> str:
@@ -2857,8 +2881,8 @@ def handle_recommend_next(args: argparse.Namespace) -> int:
         candidates = [row_to_scoring_track_context(r) for r in candidate_rows]
 
     if args.current_track is None and not args.json:
-        current_label = f"{current.artist} - {current.title}" if current.artist or current.title else current.track_id
-        print(f"No --current-track given; using first analyzed track: {current_label} [{current.track_id}]")
+        current_label = format_track_label(current.track_id, current.artist, current.title)
+        print(f"No --current-track given; using first analyzed track: {current_label}")
 
     result = get_recommendations(
         current,
@@ -2888,8 +2912,8 @@ def handle_recommend_next(args: argparse.Namespace) -> int:
     # Human-readable output
     conf = result["recommendation_confidence"]
     meta = result["meta"]
-    current_label = f"{current.artist} - {current.title}" if current.artist or current.title else current.track_id
-    print(f"\nRecommendations for '{args.playlist}' | current: {current_label} [{current.track_id}]")
+    current_label = format_track_label(current.track_id, current.artist, current.title)
+    print(f"\nRecommendations for '{args.playlist}' | current: {current_label}")
     print(f"Target: {args.target}  |  Confidence: {conf:.2f}  |  Scored: {meta['scored_candidates']} tracks\n")
     fallback_note = meta.get("fallback_note")
     if fallback_note:
@@ -2906,11 +2930,11 @@ def handle_recommend_next(args: argparse.Namespace) -> int:
             move = item["move"]
             risk = item["risk"]
             bpm_rel = item["transition_features"].get("effective_bpm_distance", 0.0)
-            key_label = item["transition_features"].get("key_compat_label", "—")
+            key_label = normalize_display_text(item["transition_features"].get("key_compat_label", "-"))
             secondary = " (contrast)" if item.get("secondary_lane") else ""
-            cand_label = f"{cand.artist} - {cand.title}" if cand.artist or cand.title else cand.track_id
+            cand_label = format_track_label(cand.track_id, cand.artist, cand.title)
             print(
-                f"    {cand_label} [{cand.track_id}]\n"
+                f"    {cand_label}\n"
                 f"      score={score:.3f}  move={move:<8}  risk={risk:<6}  bpm_dist={bpm_rel:.1f}  key={key_label}{secondary}"
             )
         print()
@@ -2968,9 +2992,7 @@ def handle_score_pair(args: argparse.Namespace) -> int:
 
     # Human-readable breakdown
     def _track_label(t) -> str:
-        if t.artist or t.title:
-            return f"{t.artist} - {t.title} [{t.track_id}]"
-        return t.track_id
+        return format_track_label(t.track_id, t.artist, t.title)
 
     print(f"\nScore pair: {_track_label(current)}  ->  {_track_label(candidate)}")
     print(f"  Final score:      {result['score']:.4f}  (raw: {result['raw_score']:.4f})")
@@ -3025,7 +3047,6 @@ def handle_score_pair(args: argparse.Namespace) -> int:
 
 def handle_inspect_scoring_weights(args: argparse.Namespace) -> int:
     from cuemate_analysis.config import build_scoring_config
-    from cuemate_analysis.scoring import resolve_effective_weights, resolve_weight_source
 
     settings = load_runtime_settings()
     config = build_scoring_config(settings, target="maintain")
@@ -3038,12 +3059,12 @@ def handle_inspect_scoring_weights(args: argparse.Namespace) -> int:
         playlist_stats = db.get_playlist_stats_for_scoring(playlist_id)
         _ensure_scoring_relative_freshness(args.playlist, playlist_stats, settings)
 
-    static_weights = config["static_weights"]
-    adapted_weights = (playlist_stats or {}).get("adapted_weights") if playlist_stats else None
-    tuned_weights = (playlist_stats or {}).get("feedback_tuned_weights") if playlist_stats else None
-    base_weights = adapted_weights or static_weights
-    effective_weights = resolve_effective_weights(playlist_stats, config)
-    weight_source = resolve_weight_source(playlist_stats)
+    weight_layers = build_feedback_weight_layers(playlist_stats, settings, config=config)
+    static_weights = weight_layers["static"]
+    base_weights = weight_layers["base"]
+    tuned_weights = weight_layers["tuned"]
+    effective_weights = weight_layers["effective"]
+    weight_source = weight_layers["source"]
 
     if args.json:
         print(json.dumps({

@@ -5,9 +5,14 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from cuemate_analysis.config import RuntimeSettings, build_scoring_config
+from cuemate_analysis.config import RuntimeSettings
 from cuemate_analysis.database import Database
-from cuemate_analysis.scoring import resolve_effective_weights, resolve_weight_source
+from cuemate_analysis.feedback_shared import (
+    build_feedback_weight_layers,
+    canonicalize_event_items,
+    decode_json_array,
+    decode_json_object,
+)
 
 
 LEARNING_RATE = 0.35
@@ -15,56 +20,6 @@ MAX_COMPONENT_SHIFT = 0.25
 MIN_CONTRIBUTORY_EVENTS = 20
 MIN_PAIRWISE_COMPARISONS = 40
 MIN_NEW_EVENTS_SINCE_LAST_TUNE = 5
-
-
-def _decode_json_object(raw_value: Any) -> dict[str, Any]:
-    if isinstance(raw_value, dict):
-        return raw_value
-    if not raw_value:
-        return {}
-    if isinstance(raw_value, str):
-        decoded = json.loads(raw_value)
-        return decoded if isinstance(decoded, dict) else {}
-    return {}
-
-
-def _decode_json_array(raw_value: Any) -> list[Any]:
-    if isinstance(raw_value, list):
-        return raw_value
-    if not raw_value:
-        return []
-    if isinstance(raw_value, str):
-        decoded = json.loads(raw_value)
-        return decoded if isinstance(decoded, list) else []
-    return []
-
-
-def _normalize_weight_map(payload: dict[str, Any] | None, static_weights: dict[str, float]) -> dict[str, float]:
-    weights = dict(static_weights)
-    if payload:
-        for key, value in payload.items():
-            if key in static_weights and value is not None:
-                weights[key] = float(value)
-    total = sum(weights.values())
-    if total > 0:
-        weights = {key: float(value) / total for key, value in weights.items()}
-    return weights
-
-
-def _canonicalize_event_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    by_candidate: dict[str, dict[str, Any]] = {}
-    for item in items:
-        candidate_track_id = str(item.get("candidate_track_id") or "")
-        if not candidate_track_id:
-            continue
-        existing = by_candidate.get(candidate_track_id)
-        final_score = float(item.get("final_score", 0.0) or 0.0)
-        if existing is None or final_score > float(existing.get("final_score", 0.0) or 0.0):
-            by_candidate[candidate_track_id] = dict(item)
-    return sorted(
-        by_candidate.values(),
-        key=lambda item: (-float(item.get("final_score", 0.0) or 0.0), str(item.get("candidate_track_id") or "")),
-    )
 
 
 def _load_feedback_events(
@@ -149,10 +104,10 @@ def _load_feedback_events(
                 "risk_score": float(row["risk_score"]),
                 "primary_lane": str(row["primary_lane"] or row["lane_id"]),
                 "secondary_lane": bool(row["secondary_lane"]),
-                "component_scores": _decode_json_object(row["component_scores_json"]),
-                "confidences": _decode_json_object(row["confidences_json"]),
-                "weights_used": _decode_json_object(row["weights_used_json"]),
-                "transition_features": _decode_json_object(row["transition_features_json"]),
+                "component_scores": decode_json_object(row["component_scores_json"]),
+                "confidences": decode_json_object(row["confidences_json"]),
+                "weights_used": decode_json_object(row["weights_used_json"]),
+                "transition_features": decode_json_object(row["transition_features_json"]),
             }
         )
 
@@ -169,11 +124,11 @@ def _load_feedback_events(
                 "recommendations_status": str(row["recommendations_status"]),
                 "track_chosen": str(row["track_chosen"]) if row["track_chosen"] is not None else None,
                 "chosen_was_recommended": bool(row["chosen_was_recommended"]) if row["chosen_was_recommended"] is not None else False,
-                "skipped_over": _decode_json_array(row["skipped_over"]),
-                "adapted_weights": _decode_json_object(row["adapted_weights"]),
+                "skipped_over": decode_json_array(row["skipped_over"]),
+                "adapted_weights": decode_json_object(row["adapted_weights"]),
                 "timestamp": str(row["timestamp"]),
                 "items": items,
-                "canonical_items": _canonicalize_event_items(items),
+                "canonical_items": canonicalize_event_items(items),
             }
         )
     return events
@@ -188,19 +143,8 @@ def build_feedback_summary(
     since: str | None = None,
     until: str | None = None,
 ) -> dict[str, Any]:
-    static_weights = _normalize_weight_map(None, settings.scoring.static_weights)
     playlist_stats = database.get_playlist_stats_for_scoring(playlist_id)
-    base_weights = _normalize_weight_map(
-        (playlist_stats or {}).get("adapted_weights"),
-        settings.scoring.static_weights,
-    )
-    tuned_weights = (
-        _normalize_weight_map((playlist_stats or {}).get("feedback_tuned_weights"), settings.scoring.static_weights)
-        if (playlist_stats or {}).get("feedback_tuned_weights")
-        else None
-    )
-    effective_weights = resolve_effective_weights(playlist_stats, build_scoring_config(settings, target="maintain"))
-    weight_source = resolve_weight_source(playlist_stats)
+    weight_layers = build_feedback_weight_layers(playlist_stats, settings)
 
     events = _load_feedback_events(database, playlist_id, since=since, until=until)
     total_events = len(events)
@@ -282,11 +226,7 @@ def build_feedback_summary(
             "higher_scored_lane_skip_counts": dict(sorted(higher_scored_lane_skips.items())),
         },
         "weights": {
-            "source": weight_source,
-            "static": static_weights,
-            "base": base_weights,
-            "tuned": tuned_weights,
-            "effective": {key: float(value) for key, value in sorted(effective_weights.items())},
+            **weight_layers,
         },
         "tuning": {
             "last_tuned_at": (playlist_stats or {}).get("feedback_last_tuned_at"),
@@ -332,12 +272,12 @@ def compute_feedback_tuning(
         if last_tuned_at and str(event.get("timestamp") or "") > str(last_tuned_at):
             new_contributory_events += 1
         chosen_score = float(chosen_item.get("final_score", 0.0) or 0.0)
-        chosen_components = _decode_json_object(chosen_item.get("component_scores"))
+        chosen_components = decode_json_object(chosen_item.get("component_scores"))
         for skipped in canonical_items:
             skipped_score = float(skipped.get("final_score", 0.0) or 0.0)
             if skipped_score <= chosen_score:
                 continue
-            skipped_components = _decode_json_object(skipped.get("component_scores"))
+            skipped_components = decode_json_object(skipped.get("component_scores"))
             pairwise_count += 1
             for component, base_weight in static_weights.items():
                 if component not in chosen_components or component not in skipped_components:

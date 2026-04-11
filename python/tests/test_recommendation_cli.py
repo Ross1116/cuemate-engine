@@ -297,6 +297,59 @@ def test_score_pair_prints_stub_and_missing_vocal_notes(monkeypatch, capsys):
     assert "vocals_abs / vocals_rel are not populated yet" in out
 
 
+def test_recommend_next_normalizes_common_mojibake_in_display_labels(monkeypatch, capsys):
+    current = _ctx(track_id="trk_current", title="Betoâ€™s Intro", artist="Fred again..")
+    candidate = _ctx(track_id="trk_candidate", title="Turn On The Lights again..", artist="Fred again.. â€” Future")
+    contexts = {
+        "trk_current": current,
+        "trk_reset": _ctx(track_id="trk_reset", title="Reset Pick"),
+        "trk_jump": _ctx(track_id="trk_jump", title="Jump Pick"),
+        "trk_candidate": candidate,
+    }
+
+    monkeypatch.setattr(
+        "cuemate_analysis.cli.load_runtime_settings",
+        lambda: SimpleNamespace(database_path=Path("fake.db")),
+    )
+    monkeypatch.setattr(
+        "cuemate_analysis.config.build_relative_experiment_signature",
+        lambda settings, energy_source="canonical": "sig-current",
+    )
+    monkeypatch.setattr("cuemate_analysis.cli.Database", lambda _: _FakeDB())
+    monkeypatch.setattr("cuemate_analysis.config.build_scoring_config", lambda settings, target: {"target": target})
+    monkeypatch.setattr(
+        "cuemate_analysis.scoring.row_to_scoring_track_context",
+        lambda row: contexts[row["track_id"]],
+    )
+    monkeypatch.setattr(
+        "cuemate_analysis.scoring.get_recommendations",
+        lambda *args, **kwargs: {
+            "lane_order": ["maintain"],
+            "lanes": {
+                "maintain": [_lane_item(candidate, score=0.82, move="maintain")],
+            },
+            "target_lane": "maintain",
+            "recommendation_confidence": 0.75,
+            "meta": {"scored_candidates": 1, "fallback_note": None},
+        },
+    )
+
+    assert main(
+        [
+            "recommend-next",
+            "--playlist",
+            "Test Playlist",
+            "--current-track",
+            "trk_current",
+            "--target",
+            "maintain",
+        ]
+    ) == 0
+    out = capsys.readouterr().out
+    assert "Beto's Intro" in out
+    assert "Fred again.. - Future" in out
+
+
 def test_inspect_scoring_metadata_json(monkeypatch, capsys):
     monkeypatch.setattr(
         "cuemate_analysis.cli.load_runtime_settings",
@@ -438,7 +491,7 @@ def test_inspect_scoring_weights_text(monkeypatch, capsys):
     assert "Scoring weights for 'Test Playlist'" in out
     assert "target_energy" in out
     assert "0.3100" in out
-    assert "Adaptation is active" in out
+    assert "Heuristic playlist adaptation is active" in out
 
 
 def test_recommend_next_requires_fresh_relative_artifacts(monkeypatch, capsys):

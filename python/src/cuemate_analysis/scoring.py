@@ -694,15 +694,29 @@ def resolve_effective_weights(
 ) -> dict[str, float]:
     """Return effective per-component weights for live scoring.
 
-    Reads precomputed `adapted_weights` from playlist_stats when available.
-    Falls back to config-provided static weights when available, otherwise
-    STATIC_WEIGHTS so scoring works without a DB-populated crate.
+    Weight precedence:
+    1. feedback_tuned_weights
+    2. adapted_weights
+    3. config-provided static weights
+    4. module STATIC_WEIGHTS fallback
     """
+    if playlist_stats and playlist_stats.get("feedback_tuned_weights"):
+        return dict(playlist_stats["feedback_tuned_weights"])
     if playlist_stats and playlist_stats.get("adapted_weights"):
         return dict(playlist_stats["adapted_weights"])
     if config and config.get("static_weights"):
         return dict(config["static_weights"])
     return dict(STATIC_WEIGHTS)
+
+
+def resolve_weight_source(
+    playlist_stats: dict[str, Any] | None,
+) -> str:
+    if playlist_stats and playlist_stats.get("feedback_tuned_weights"):
+        return "feedback_tuned_weights"
+    if playlist_stats and playlist_stats.get("adapted_weights"):
+        return "adapted_weights"
+    return "static"
 
 
 # ---------------------------------------------------------------------------

@@ -4,10 +4,13 @@ package djengine.scoring.v1;
 
 option go_package = "github.com/Ross1116/cuemate-engine/go/gen/djengine/scoring/v1;scoringv1";
 
+import "google/protobuf/struct.proto";
+
 service ScoringService {
   rpc GetRecommendations(GetRecommendationsRequest) returns (GetRecommendationsResponse);
   rpc ScoreCandidate(ScoreCandidateRequest) returns (ScoreCandidateResponse);
   rpc GetScoringMetadata(GetScoringMetadataRequest) returns (GetScoringMetadataResponse);
+  rpc GetFeedbackSummary(GetFeedbackSummaryRequest) returns (GetFeedbackSummaryResponse);
 }
 
 message SignatureMetadata {
@@ -55,6 +58,7 @@ message HistoryEntry {
 message PlaylistStatsContext {
   optional double energy_spread = 1;
   map<string, double> adapted_weights = 2;
+  string weight_source = 3;
 }
 
 message LaneGroup {
@@ -245,4 +249,78 @@ message GetScoringMetadataResponse {
   string engine_version = 8;
   string status_note = 9;
   string expected_relative_signature = 10;
+}
+
+message FeedbackSummaryEventItem {
+  string candidate_track_id = 1;
+  double final_score = 2;
+  string lane_id = 3;
+  string primary_lane = 4;
+}
+
+message FeedbackSummaryEvent {
+  string event_id = 1;
+  string timestamp = 2;
+  string track_chosen = 3;
+  bool chosen_was_recommended = 4;
+  repeated FeedbackSummaryEventItem items = 5;
+}
+
+message FeedbackSummaryPlaylistStats {
+  map<string, double> adapted_weights = 1;
+  map<string, double> feedback_tuned_weights = 2;
+  repeated string feedback_tuning_notes = 3;
+  int32 feedback_event_count = 4;
+  string feedback_last_tuned_at = 5;
+  google.protobuf.Struct feedback_tuning_metrics = 6;
+}
+
+message FeedbackSummaryWindow {
+  string since = 1;
+  string until = 2;
+}
+
+message FeedbackSummaryMetrics {
+  int32 total_events = 1;
+  int32 contributory_events = 2;
+  int32 ranked_events = 3;
+  int32 pairwise_comparison_count = 4;
+  double chosen_top1_rate = 5;
+  double chosen_top3_rate = 6;
+  double chosen_top5_rate = 7;
+  optional double mean_chosen_rank = 8;
+  map<string, int32> lane_acceptance_counts = 9;
+  map<string, int32> higher_scored_lane_skip_counts = 10;
+}
+
+message FeedbackSummaryWeights {
+  string source = 1;
+  map<string, double> static_weights = 2;
+  map<string, double> base_weights = 3;
+  map<string, double> tuned_weights = 4;
+  map<string, double> effective_weights = 5;
+}
+
+message FeedbackSummaryTuning {
+  string last_tuned_at = 1;
+  int32 feedback_event_count = 2;
+  repeated string notes = 3;
+  google.protobuf.Struct metrics = 4;
+}
+
+message GetFeedbackSummaryRequest {
+  string playlist_id = 1;
+  string playlist_name = 2;
+  FeedbackSummaryWindow window = 3;
+  FeedbackSummaryPlaylistStats playlist_stats = 4;
+  repeated FeedbackSummaryEvent events = 5;
+}
+
+message GetFeedbackSummaryResponse {
+  string playlist_id = 1;
+  string playlist_name = 2;
+  FeedbackSummaryWindow window = 3;
+  FeedbackSummaryMetrics metrics = 4;
+  FeedbackSummaryWeights weights = 5;
+  FeedbackSummaryTuning tuning = 6;
 }

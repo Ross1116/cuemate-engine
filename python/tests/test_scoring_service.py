@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import sys
+from importlib import resources
 from pathlib import Path
 
 import grpc
@@ -63,6 +64,7 @@ def scoring_proto_runtime(tmp_path, monkeypatch):
         [
             "grpc_tools.protoc",
             f"-I{repo_root / 'proto'}",
+            f"-I{resources.files('grpc_tools').joinpath('_proto')}",
             f"--python_out={out_root}",
             f"--grpc_python_out={out_root}",
             str(proto_file),

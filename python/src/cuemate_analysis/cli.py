@@ -37,6 +37,7 @@ from cuemate_analysis.essentia_semantic_backend import (
 )
 from cuemate_analysis.energy_experiments import analyze_energy_path
 from cuemate_analysis.energy_features import EnergyFeatureVector, energy_consensus
+from cuemate_analysis.feedback_shared import build_feedback_weight_layers
 from cuemate_analysis.ingest import (
     discover_audio_files,
     make_playlist_id,
@@ -74,6 +75,14 @@ from cuemate_analysis.tempo_backend import (
 )
 
 TEMPOCNN_PROGRESS_BATCH_SIZE = 8
+DISPLAY_MOJIBAKE_REPLACEMENTS = {
+    "â€™": "'",
+    "â€˜": "'",
+    "â€œ": '"',
+    "â€": '"',
+    "â€”": "-",
+    "â€“": "-",
+}
 
 
 @dataclass(frozen=True)
@@ -92,6 +101,21 @@ def hash_file_identity(path: Path) -> str:
         while chunk := handle.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()[:12]
+
+
+def normalize_display_text(value: object) -> str:
+    text = str(value or "")
+    for source, replacement in DISPLAY_MOJIBAKE_REPLACEMENTS.items():
+        text = text.replace(source, replacement)
+    return text
+
+
+def format_track_label(track_id: str, artist: object, title: object) -> str:
+    clean_artist = normalize_display_text(artist)
+    clean_title = normalize_display_text(title)
+    if clean_artist or clean_title:
+        return f"{clean_artist} - {clean_title} [{track_id}]".strip()
+    return track_id
 
 
 def resolve_expected_essentia_semantic_signature(settings) -> str:
@@ -946,6 +970,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print backend diagnostics after processing jobs.",
     )
 
+    clear_analysis_queue_parser = subparsers.add_parser(
+        "clear-analysis-queue",
+        help="Remove queued analysis jobs from the local analysis queue.",
+    )
+    clear_analysis_queue_parser.add_argument(
+        "--include-running",
+        action="store_true",
+        help="Also remove jobs currently marked as running. Use this for stale/stuck workers only.",
+    )
+    clear_analysis_queue_parser.add_argument(
+        "--job-kind",
+        choices=["all", "fast_pass", "enrichment"],
+        default="all",
+        help="Limit queue clearing to one analysis job kind.",
+    )
+
+    run_feedback_worker_parser = subparsers.add_parser(
+        "run-feedback-worker",
+        help="Process pending feedback tuning jobs from recorded recommendation outcomes.",
+    )
+    run_feedback_worker_parser.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        help="Maximum pending feedback jobs to process in one pass.",
+    )
+
     prewarm_parser = subparsers.add_parser(
         "prewarm-model-services",
         help="Start and prewarm the shared TF/Essentia and MusicalKeyCNN services.",
@@ -1082,6 +1133,24 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Emit structured JSON to stdout.",
     )
+
+    feedback_summary_parser = subparsers.add_parser(
+        "feedback-summary",
+        help="Summarize recorded recommendation outcomes and active per-playlist weights.",
+    )
+    feedback_summary_parser.add_argument("--playlist", required=True, help="Playlist name.")
+    feedback_summary_parser.add_argument("--since", help="Optional RFC3339 lower time bound.")
+    feedback_summary_parser.add_argument("--until", help="Optional RFC3339 upper time bound.")
+    feedback_summary_parser.add_argument("--json", action="store_true", help="Emit structured JSON to stdout.")
+
+    feedback_tune_parser = subparsers.add_parser(
+        "feedback-tune",
+        help="Compute or apply per-playlist feedback-tuned weights from recorded outcomes.",
+    )
+    feedback_tune_parser.add_argument("--playlist", required=True, help="Playlist name.")
+    feedback_tune_parser.add_argument("--preview-only", action="store_true", help="Compute without writing tuned weights.")
+    feedback_tune_parser.add_argument("--force", action="store_true", help="Bypass automatic apply thresholds.")
+    feedback_tune_parser.add_argument("--json", action="store_true", help="Emit structured JSON to stdout.")
 
     inspect_metadata_parser = subparsers.add_parser(
         "inspect-scoring-metadata",
@@ -2561,6 +2630,27 @@ def handle_purge_model_cache(args: argparse.Namespace) -> int:
     return 0
 
 
+def handle_clear_analysis_queue(args: argparse.Namespace) -> int:
+    settings = load_runtime_settings()
+    statuses = ["pending"]
+    if args.include_running:
+        statuses.append("running")
+    job_kind = None if args.job_kind == "all" else args.job_kind
+
+    with Database(settings.database_path) as database:
+        deleted = database.clear_analysis_jobs(statuses=statuses, job_kind=job_kind)
+
+    scope = f"job kind '{job_kind}'" if job_kind is not None else "all job kinds"
+    status_label = ", ".join(statuses)
+    print(f"Removed {deleted} analysis job(s) from the local queue.")
+    print(f"- Statuses cleared: {status_label}")
+    print(f"- Scope: {scope}")
+    print(f"- Database: {settings.database_path}")
+    if args.include_running:
+        print("- Running jobs were included; make sure no active analysis worker is still using those rows.")
+    return 0
+
+
 def handle_run_analysis_worker(args: argparse.Namespace) -> int:
     settings = load_runtime_settings()
     expected_essentia_semantic_signature = resolve_expected_essentia_semantic_signature(settings)
@@ -2828,8 +2918,8 @@ def handle_recommend_next(args: argparse.Namespace) -> int:
         candidates = [row_to_scoring_track_context(r) for r in candidate_rows]
 
     if args.current_track is None and not args.json:
-        current_label = f"{current.artist} - {current.title}" if current.artist or current.title else current.track_id
-        print(f"No --current-track given; using first analyzed track: {current_label} [{current.track_id}]")
+        current_label = format_track_label(current.track_id, current.artist, current.title)
+        print(f"No --current-track given; using first analyzed track: {current_label}")
 
     result = get_recommendations(
         current,
@@ -2859,8 +2949,8 @@ def handle_recommend_next(args: argparse.Namespace) -> int:
     # Human-readable output
     conf = result["recommendation_confidence"]
     meta = result["meta"]
-    current_label = f"{current.artist} - {current.title}" if current.artist or current.title else current.track_id
-    print(f"\nRecommendations for '{args.playlist}' | current: {current_label} [{current.track_id}]")
+    current_label = format_track_label(current.track_id, current.artist, current.title)
+    print(f"\nRecommendations for '{args.playlist}' | current: {current_label}")
     print(f"Target: {args.target}  |  Confidence: {conf:.2f}  |  Scored: {meta['scored_candidates']} tracks\n")
     fallback_note = meta.get("fallback_note")
     if fallback_note:
@@ -2877,11 +2967,11 @@ def handle_recommend_next(args: argparse.Namespace) -> int:
             move = item["move"]
             risk = item["risk"]
             bpm_rel = item["transition_features"].get("effective_bpm_distance", 0.0)
-            key_label = item["transition_features"].get("key_compat_label", "—")
+            key_label = normalize_display_text(item["transition_features"].get("key_compat_label", "-"))
             secondary = " (contrast)" if item.get("secondary_lane") else ""
-            cand_label = f"{cand.artist} - {cand.title}" if cand.artist or cand.title else cand.track_id
+            cand_label = format_track_label(cand.track_id, cand.artist, cand.title)
             print(
-                f"    {cand_label} [{cand.track_id}]\n"
+                f"    {cand_label}\n"
                 f"      score={score:.3f}  move={move:<8}  risk={risk:<6}  bpm_dist={bpm_rel:.1f}  key={key_label}{secondary}"
             )
         print()
@@ -2939,9 +3029,7 @@ def handle_score_pair(args: argparse.Namespace) -> int:
 
     # Human-readable breakdown
     def _track_label(t) -> str:
-        if t.artist or t.title:
-            return f"{t.artist} - {t.title} [{t.track_id}]"
-        return t.track_id
+        return format_track_label(t.track_id, t.artist, t.title)
 
     print(f"\nScore pair: {_track_label(current)}  ->  {_track_label(candidate)}")
     print(f"  Final score:      {result['score']:.4f}  (raw: {result['raw_score']:.4f})")
@@ -2996,7 +3084,6 @@ def handle_score_pair(args: argparse.Namespace) -> int:
 
 def handle_inspect_scoring_weights(args: argparse.Namespace) -> int:
     from cuemate_analysis.config import build_scoring_config
-    from cuemate_analysis.scoring import resolve_effective_weights
 
     settings = load_runtime_settings()
     config = build_scoring_config(settings, target="maintain")
@@ -3009,35 +3096,215 @@ def handle_inspect_scoring_weights(args: argparse.Namespace) -> int:
         playlist_stats = db.get_playlist_stats_for_scoring(playlist_id)
         _ensure_scoring_relative_freshness(args.playlist, playlist_stats, settings)
 
-    static_weights = config["static_weights"]
-    adapted_weights = (playlist_stats or {}).get("adapted_weights") if playlist_stats else None
-    effective_weights = resolve_effective_weights(playlist_stats, config)
+    weight_layers = build_feedback_weight_layers(playlist_stats, settings, config=config)
+    static_weights = weight_layers["static"]
+    base_weights = weight_layers["base"]
+    tuned_weights = weight_layers["tuned"]
+    effective_weights = weight_layers["effective"]
+    weight_source = weight_layers["source"]
 
     if args.json:
         print(json.dumps({
             "playlist": args.playlist,
             "static_weights": static_weights,
-            "adapted_weights": adapted_weights,
+            "base_weights": base_weights,
+            "tuned_weights": tuned_weights,
             "effective_weights": effective_weights,
+            "weight_source": weight_source,
             "weight_floors": config["weight_floors"],
         }, indent=2))
         return 0
 
     print(f"\nScoring weights for '{args.playlist}'\n")
-    print(f"  {'Component':<24}  {'Static':>8}  {'Adapted':>8}  {'Effective':>9}")
-    print(f"  {'-'*24}  {'-'*8}  {'-'*8}  {'-'*9}")
+    print(f"  Active weight source:    {weight_source}")
+    print(f"  {'Component':<24}  {'Static':>8}  {'Base':>8}  {'Tuned':>8}  {'Effective':>9}")
+    print(f"  {'-'*24}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*9}")
     for key in sorted(static_weights):
         s = static_weights.get(key, 0.0)
-        a = (adapted_weights or {}).get(key) if adapted_weights else None
+        a = (base_weights or {}).get(key) if base_weights else None
+        t = (tuned_weights or {}).get(key) if tuned_weights else None
         e = effective_weights.get(key, s)
-        a_str = f"{a:.4f}" if a is not None else "    —   "
-        print(f"  {key:<24}  {s:>8.4f}  {a_str:>8}  {e:>9.4f}")
+        a_str = f"{a:.4f}" if a is not None else "   n/a  "
+        t_str = f"{t:.4f}" if t is not None else "   n/a  "
+        print(f"  {key:<24}  {s:>8.4f}  {a_str:>8}  {t_str:>8}  {e:>9.4f}")
 
-    if adapted_weights:
-        print("\n  Adaptation is active (playlist has adapted_weights).")
+    if weight_source == "feedback_tuned_weights":
+        print("\n  Feedback tuning is active and overrides the heuristic base weights.")
+    elif weight_source == "adapted_weights":
+        print("\n  Heuristic playlist adaptation is active (no tuned override yet).")
     else:
-        print("\n  No adaptation — using static weights.")
+        print("\n  No playlist-specific weights are active; using static defaults.")
 
+    return 0
+
+
+def _feedback_public_payload(summary: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "playlist_id": summary["playlist_id"],
+        "playlist_name": summary["playlist_name"],
+        "window": dict(summary["window"]),
+        "metrics": dict(summary["metrics"]),
+        "weights": dict(summary["weights"]),
+        "tuning": dict(summary["tuning"]),
+    }
+
+
+def handle_feedback_summary(args: argparse.Namespace) -> int:
+    from cuemate_analysis.feedback import build_feedback_summary, open_database
+
+    settings = load_runtime_settings()
+    with open_database(settings) as database:
+        playlist_row = database.get_playlist(args.playlist)
+        if playlist_row is None:
+            raise SystemExit(f"Playlist '{args.playlist}' was not found.")
+        summary = build_feedback_summary(
+            database,
+            settings,
+            playlist_id=str(playlist_row["id"]),
+            playlist_name=str(playlist_row["name"]),
+            since=args.since,
+            until=args.until,
+        )
+    payload = _feedback_public_payload(summary)
+    if args.json:
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    metrics = payload["metrics"]
+    weights = payload["weights"]
+    tuning = payload["tuning"]
+    print(f"\nFeedback summary for '{args.playlist}'\n")
+    print(f"  Total events:            {metrics['total_events']}")
+    print(f"  Contributory events:     {metrics['contributory_events']}")
+    print(f"  Pairwise comparisons:    {metrics['pairwise_comparison_count']}")
+    print(f"  Chosen in top 1:         {metrics['chosen_top1_rate']:.2%}")
+    print(f"  Chosen in top 3:         {metrics['chosen_top3_rate']:.2%}")
+    print(f"  Chosen in top 5:         {metrics['chosen_top5_rate']:.2%}")
+    print(f"  Mean chosen rank:        {metrics['mean_chosen_rank'] if metrics['mean_chosen_rank'] is not None else 'n/a'}")
+    print(f"  Active weight source:    {weights['source']}")
+    print(f"  Last tuned at:           {tuning['last_tuned_at'] or 'never'}")
+    print(f"  Tuned event count:       {tuning['feedback_event_count']}")
+
+    print("\n  Lane acceptance counts:")
+    lane_counts = metrics["lane_acceptance_counts"] or {}
+    if not lane_counts:
+        print("    none")
+    for lane_name, count in lane_counts.items():
+        print(f"    {lane_name:<12} {count}")
+
+    print("\n  Higher-scored lane skips:")
+    skip_counts = metrics["higher_scored_lane_skip_counts"] or {}
+    if not skip_counts:
+        print("    none")
+    for lane_name, count in skip_counts.items():
+        print(f"    {lane_name:<12} {count}")
+
+    for label in ("static", "base", "tuned", "effective"):
+        values = weights.get(label)
+        print(f"\n  {label.title()} weights:")
+        if not values:
+            print("    none")
+            continue
+        for key, value in sorted(values.items()):
+            print(f"    {key:<24} {value:.4f}")
+    return 0
+
+
+def handle_feedback_tune(args: argparse.Namespace) -> int:
+    from cuemate_analysis.analysis import utc_now
+    from cuemate_analysis.feedback import (
+        apply_feedback_tuning,
+        build_feedback_summary,
+        compute_feedback_tuning,
+        open_database,
+    )
+
+    settings = load_runtime_settings()
+    applied_at = utc_now()
+    with open_database(settings) as database:
+        playlist_row = database.get_playlist(args.playlist)
+        if playlist_row is None:
+            raise SystemExit(f"Playlist '{args.playlist}' was not found.")
+        playlist_id = str(playlist_row["id"])
+        summary = build_feedback_summary(
+            database,
+            settings,
+            playlist_id=playlist_id,
+            playlist_name=str(playlist_row["name"]),
+        )
+        tuning_result = compute_feedback_tuning(summary, settings, force=args.force)
+        if tuning_result["should_apply"] and not args.preview_only:
+            apply_feedback_tuning(
+                database,
+                playlist_id=playlist_id,
+                tuning_result=tuning_result,
+                applied_at=applied_at,
+            )
+            summary["tuning"]["last_tuned_at"] = applied_at
+            summary["tuning"]["feedback_event_count"] = tuning_result["feedback_event_count"]
+            summary["tuning"]["notes"] = list(tuning_result["notes"])
+            summary["tuning"]["metrics"] = dict(tuning_result["metrics"])
+            summary["weights"]["tuned"] = dict(tuning_result["tuned_weights"])
+            summary["weights"]["effective"] = dict(tuning_result["tuned_weights"])
+            summary["weights"]["source"] = "feedback_tuned_weights"
+    payload = {
+        "summary": _feedback_public_payload(summary),
+        "tuning_result": {
+            "should_apply": bool(tuning_result["should_apply"]),
+            "thresholds_met": bool(tuning_result["thresholds_met"]),
+            "force": bool(tuning_result["force"]),
+            "preview_only": bool(args.preview_only),
+            "feedback_event_count": int(tuning_result["feedback_event_count"]),
+            "pairwise_comparison_count": int(tuning_result["pairwise_comparison_count"]),
+            "new_contributory_events": int(tuning_result["new_contributory_events"]),
+            "notes": list(tuning_result["notes"]),
+            "base_weights": dict(tuning_result["base_weights"]),
+            "tuned_weights": dict(tuning_result["tuned_weights"]),
+            "metrics": dict(tuning_result["metrics"]),
+        },
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    action = "Previewed" if args.preview_only else ("Applied" if tuning_result["should_apply"] else "Skipped")
+    print(f"\n{action} feedback tuning for '{args.playlist}'\n")
+    print(f"  Thresholds met:         {tuning_result['thresholds_met']}")
+    print(f"  Pairwise comparisons:   {tuning_result['pairwise_comparison_count']}")
+    print(f"  Contributory events:    {tuning_result['feedback_event_count']}")
+    print(f"  New contributory events:{tuning_result['new_contributory_events']}")
+    print("\n  Notes:")
+    for note in tuning_result["notes"]:
+        print(f"    {note}")
+    print("\n  Tuned weights:")
+    for key, value in sorted(tuning_result["tuned_weights"].items()):
+        print(f"    {key:<24} {value:.4f}")
+    return 0
+
+
+def handle_run_feedback_worker(args: argparse.Namespace) -> int:
+    from cuemate_analysis.analysis import utc_now
+    from cuemate_analysis.feedback import open_database, run_feedback_worker
+
+    settings = load_runtime_settings()
+    with open_database(settings) as database:
+        results = run_feedback_worker(
+            database,
+            settings,
+            limit=max(1, int(args.limit)),
+            started_at=utc_now(),
+        )
+
+    print(f"Processed {len(results)} feedback tuning job(s).")
+    for result in results:
+        if result.get("error"):
+            print(f"- job {result['job_id']} playlist={result['playlist_id']} error={result['error']}")
+            continue
+        print(
+            f"- job {result['job_id']} playlist={result['playlist_name']} "
+            f"applied={result['applied']} events={result['feedback_event_count']} "
+            f"pairwise={result['pairwise_comparison_count']}"
+        )
     return 0
 
 
@@ -3156,6 +3423,10 @@ def main(argv: list[str] | None = None) -> int:
             return handle_refresh_relative_playlist(args)
         if args.command == "run-analysis-worker":
             return handle_run_analysis_worker(args)
+        if args.command == "clear-analysis-queue":
+            return handle_clear_analysis_queue(args)
+        if args.command == "run-feedback-worker":
+            return handle_run_feedback_worker(args)
         if args.command == "prewarm-model-services":
             return handle_prewarm_model_services(args)
         if args.command == "analyze-energy-playlist":
@@ -3174,6 +3445,10 @@ def main(argv: list[str] | None = None) -> int:
             return handle_score_pair(args)
         if args.command == "inspect-scoring-weights":
             return handle_inspect_scoring_weights(args)
+        if args.command == "feedback-summary":
+            return handle_feedback_summary(args)
+        if args.command == "feedback-tune":
+            return handle_feedback_tune(args)
         if args.command == "inspect-scoring-metadata":
             return handle_inspect_scoring_metadata(args)
         if args.command == "serve-scoring":

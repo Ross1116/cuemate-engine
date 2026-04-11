@@ -65,7 +65,6 @@ enum WeightSource {
 message PlaylistStatsContext {
   optional double energy_spread = 1;
   map<string, double> adapted_weights = 2;
-  string weight_source = 3 [deprecated = true];
   WeightSource weight_source_enum = 4;
 }
 

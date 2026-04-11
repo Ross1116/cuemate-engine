@@ -29,6 +29,7 @@ Current scope:
 - a small `scoringctl` smoke CLI for metadata and fixture-driven score calls
 
 The Go layer still does not own scoring semantics. Python remains the authoritative scorer, while Go now owns the local API/orchestration path on top of SQLite + gRPC.
+These shipped local HTTP and snapshot/outbox surfaces are the current mobile/bootstrap contract for the repository's local-first architecture.
 
 ## Smoke workflow
 
@@ -65,6 +66,8 @@ Weight precedence in live recommendations:
 - `feedback_tuned_weights`
 - `adapted_weights`
 - static scoring weights
+
+The scorer transport now uses the protobuf `WeightSource` enum on the gRPC boundary; HTTP and CLI/operator payloads continue to expose the string labels above.
 
 Configuration defaults:
 

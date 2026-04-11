@@ -866,10 +866,8 @@ func buildRecommendationsRequest(
 		if len(weights) > 0 {
 			req.PlaylistStats.AdaptedWeights = weights
 		}
-		req.PlaylistStats.WeightSource = source
 		req.PlaylistStats.WeightSourceEnum = playlistWeightSourceEnum(source)
 	} else {
-		req.PlaylistStats.WeightSource = "static"
 		req.PlaylistStats.WeightSourceEnum = scoringv1.WeightSource_WEIGHT_SOURCE_STATIC
 	}
 	return req

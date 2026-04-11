@@ -617,9 +617,6 @@ func TestBuildRecommendationsRequestSetsWeightSourceStringAndEnum(t *testing.T) 
 	}
 
 	req := buildRecommendationsRequest(hydrated, "maintain", 3)
-	if req.PlaylistStats.GetWeightSource() != "feedback_tuned_weights" {
-		t.Fatalf("weight_source = %q", req.PlaylistStats.GetWeightSource())
-	}
 	if req.PlaylistStats.GetWeightSourceEnum() != scoringv1.WeightSource_WEIGHT_SOURCE_FEEDBACK_TUNED {
 		t.Fatalf("weight_source_enum = %v", req.PlaylistStats.GetWeightSourceEnum())
 	}

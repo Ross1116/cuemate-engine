@@ -11,7 +11,7 @@ The repository is centered on a **Python-first analysis engine** with:
 - live recommendation/scoring lanes and pair diagnostics
 - Docker-backed model workers for BPM, key, and semantic mood/intensity analysis, with TempoCNN and Essentia semantics sharing one TensorFlow/Essentia service
 
-The Go and protobuf layers are now present as the service boundary for the scorer, but the current working core still lives in the Python analysis plane.
+The Go and protobuf layers now define the shipped local API and scorer boundary, while the scoring semantics still live in the Python analysis plane.
 
 ## Current State
 
@@ -42,7 +42,7 @@ Implemented:
   - immutable recommendation event item capture for returned candidates
   - `/events/played` outcome capture plus queued `feedback_tuning_jobs`
   - playlist-level feedback summaries and per-playlist tuned weights
-  - local feedback worker for deferred auto-tuning
+  - local feedback worker for automatic per-playlist retuning
 - staged analysis pipeline:
   - `fast_pass`
   - `staged` (default)
@@ -52,9 +52,9 @@ Deferred for now:
 
 - windowed intro/outro analysis
 
-Follow-on work:
+Broader follow-on work:
 
-- mobile/API integration on top of the current local-first recommendation and sync surfaces
+- multi-device/authenticated sync on top of the shipped local-first recommendation and snapshot/outbox surfaces
 
 ## Architecture
 
@@ -430,7 +430,7 @@ Invoke-RestMethod -Method Post `
   ConvertTo-Json -Depth 10
 ```
 
-Sync/mobile-facing primitives:
+Local mobile/bootstrap sync primitives:
 
 ```powershell
 Invoke-RestMethod -Method Post `
@@ -597,7 +597,7 @@ python -m cuemate_analysis benchmark-dsp --path "D:\Music\track.flac"
 
 ## Known Boundaries
 
-- Go decision plane now serves the live recommendations API, event capture, feedback summary surfaces, and single-consumer snapshot/outbox sync primitives; actual mobile consumption remains follow-on work
+- Go decision plane now serves the shipped local recommendations API, event capture, feedback summary surfaces, and single-consumer snapshot/outbox sync primitives that a local mobile/bootstrap client can consume
 - windowed intro/outro analysis is intentionally deferred
 - `transition_support`, `vocal_transition`, and `rhythmic_continuity` are still explicit stubs and are excluded from weighted scoring
 - `vocals_abs` / `vocals_rel` are not populated by the current analysis pipeline yet, so vocal-dependent recommendation logic remains limited
@@ -613,10 +613,6 @@ Done:
 - Milestone 3 Python recommendation/scoring core
 - Milestone 4 local service/API bootstrap, write-side cleanup, and explicit-ack sync protocol
 - Milestone 5 per-playlist feedback loop and auto-tuned weights
-
-Next:
-
-- mobile/API integration
 
 Later:
 

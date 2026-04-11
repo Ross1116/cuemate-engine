@@ -614,8 +614,9 @@ def history_fit_score(
 ) -> float:
     """Baseline history signal: short-term key repetition + energy stagnation.
 
-    This is a conservative placeholder. Expansion (artist repetition, BPM
-    staleness, intensity-band reuse) is deferred to Milestone 5.
+    This is a conservative placeholder. Expansion can still add artist
+    repetition, BPM staleness, and intensity-band reuse on top of the current
+    shipped Milestone 5 behavior.
     """
     recent = history[-window:]
     if not recent:

@@ -125,10 +125,6 @@ def _weight_source_from_proto(message: Any) -> str:
         return "adapted_weights"
     if enum_value == 1:
         return "static"
-
-    legacy = str(getattr(message, "weight_source", "") or "").strip()
-    if legacy in {"static", "adapted_weights", "feedback_tuned_weights"}:
-        return legacy
     return ""
 
 

@@ -41,6 +41,8 @@ The shipped local feedback loop is also part of the current scope:
 - per-playlist tuned weights that override heuristic playlist adaptation
 - a local worker that applies tuned weights from queued `feedback_tuning_jobs`
 
+The CLI remains the operator/debug surface, while the Go local HTTP API and snapshot/outbox flow are the shipped local integration contract for other consumers.
+
 ## Install
 
 From the repository root:
@@ -169,6 +171,8 @@ Feedback-tuning weight precedence:
 - `feedback_tuned_weights`
 - `adapted_weights`
 - static scoring weights
+
+The gRPC scorer contract uses the protobuf `WeightSource` enum on the wire. Human-facing CLI and HTTP payloads still use the string labels above.
 
 Manual Docker debug for one track:
 

@@ -57,6 +57,7 @@
       "rhythmic_continuity": 0.02
     },
     "harmonic_confidence_floor": 0.15,
+    "key_confidence_threshold": 0.5,
     "thresholds": {
       "bpm_hard": 8.0,
       "bpm_hard_by_target": {
@@ -90,5 +91,12 @@
   "weight_adaptation": {
     "mode": "auto",
     "adaptation_strength": 0.7
+  },
+  "feedback": {
+    "learning_rate": 0.35,
+    "max_component_shift": 0.25,
+    "min_contributory_events": 20,
+    "min_pairwise_comparisons": 40,
+    "min_new_events_since_last_tune": 5
   }
 }

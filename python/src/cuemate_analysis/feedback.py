@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from collections import defaultdict
 from collections.abc import Mapping
 from datetime import datetime, timezone
@@ -294,6 +295,13 @@ def compute_feedback_tuning(
     *,
     force: bool = False,
 ) -> dict[str, Any]:
+    feedback_cfg = getattr(settings, "feedback", None)
+    learning_rate = feedback_cfg.learning_rate if feedback_cfg else LEARNING_RATE
+    max_component_shift = feedback_cfg.max_component_shift if feedback_cfg else MAX_COMPONENT_SHIFT
+    min_contributory_events = feedback_cfg.min_contributory_events if feedback_cfg else MIN_CONTRIBUTORY_EVENTS
+    min_pairwise_comparisons = feedback_cfg.min_pairwise_comparisons if feedback_cfg else MIN_PAIRWISE_COMPARISONS
+    min_new_events_since_last_tune = feedback_cfg.min_new_events_since_last_tune if feedback_cfg else MIN_NEW_EVENTS_SINCE_LAST_TUNE
+
     weights_payload = summary["weights"]
     base_weights = dict(weights_payload["base"])
     static_weights = dict(weights_payload["static"])
@@ -341,11 +349,11 @@ def compute_feedback_tuning(
                 component_counts[component] += 1
 
     thresholds_met = (
-        contributory_events >= MIN_CONTRIBUTORY_EVENTS
-        and pairwise_count >= MIN_PAIRWISE_COMPARISONS
+        contributory_events >= min_contributory_events
+        and pairwise_count >= min_pairwise_comparisons
         and (
             last_tuned_at is None
-            or new_contributory_events >= MIN_NEW_EVENTS_SINCE_LAST_TUNE
+            or new_contributory_events >= min_new_events_since_last_tune
         )
     )
     should_apply = force or thresholds_met
@@ -356,9 +364,9 @@ def compute_feedback_tuning(
             mean_signal = component_sums[component] / component_counts[component] if component_counts[component] else 0.0
             clipped_signal = max(-1.0, min(1.0, mean_signal))
             component_signals[component] = round(clipped_signal, 6)
-            proposed = base_weight * (1.0 + (LEARNING_RATE * clipped_signal))
-            lower = base_weight * (1.0 - MAX_COMPONENT_SHIFT)
-            upper = base_weight * (1.0 + MAX_COMPONENT_SHIFT)
+            proposed = base_weight * (1.0 + (learning_rate * clipped_signal))
+            lower = base_weight * (1.0 - max_component_shift)
+            upper = base_weight * (1.0 + max_component_shift)
             tuned_weights[component] = max(lower, min(upper, proposed))
         floors = settings.scoring.weight_floors
         for component, floor in floors.items():
@@ -374,8 +382,8 @@ def compute_feedback_tuning(
     if not thresholds_met and not force:
         notes.append(
             "Thresholds not met for auto-apply "
-            f"(needs {MIN_CONTRIBUTORY_EVENTS} contributory events, {MIN_PAIRWISE_COMPARISONS} pairwise comparisons, "
-            f"and {MIN_NEW_EVENTS_SINCE_LAST_TUNE} new contributory events since last tune)."
+            f"(needs {min_contributory_events} contributory events, {min_pairwise_comparisons} pairwise comparisons, "
+            f"and {min_new_events_since_last_tune} new contributory events since last tune)."
         )
     if force:
         notes.append("Force mode bypassed automatic apply thresholds.")
@@ -383,8 +391,8 @@ def compute_feedback_tuning(
         "contributory_event_count": contributory_events,
         "pairwise_comparison_count": pairwise_count,
         "new_contributory_events": new_contributory_events,
-        "learning_rate": LEARNING_RATE,
-        "max_component_shift": MAX_COMPONENT_SHIFT,
+        "learning_rate": learning_rate,
+        "max_component_shift": max_component_shift,
         "component_mean_signal": component_signals,
         "applied": bool(should_apply and pairwise_count > 0),
     }
@@ -463,7 +471,7 @@ def run_feedback_worker(
                     "notes": list(tuning_result["notes"]),
                 }
             )
-        except Exception as exc:
+        except (KeyError, ValueError, TypeError, sqlite3.Error) as exc:
             finished_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
             database.mark_feedback_tuning_job_failed(job_id, error_message=str(exc), finished_at=finished_at)
             results.append(

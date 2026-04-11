@@ -37,29 +37,10 @@ RATIO_DISTANCE_FLOOR: dict[str, float] = {
     "three_four": 2.0,
 }
 
-# Loaded from config/default.json in Phase 2; kept here as module-level fallback
-# so scoring functions work without any config wiring in tests.
-STATIC_WEIGHTS: dict[str, float] = {
-    "target_energy": 0.22,
-    "transition_support": 0.18,
-    "bass_transition": 0.15,
-    "vocal_transition": 0.13,
-    "harmonic": 0.12,
-    "tempo": 0.10,
-    "history_fit": 0.06,
-    "rhythmic_continuity": 0.04,
-}
-
-WEIGHT_FLOORS: dict[str, float] = {
-    "target_energy": 0.08,
-    "transition_support": 0.05,
-    "bass_transition": 0.04,
-    "vocal_transition": 0.03,
-    "harmonic": 0.04,
-    "tempo": 0.03,
-    "history_fit": 0.03,
-    "rhythmic_continuity": 0.02,
-}
+# Canonical source is config.py; aliased here for backward compatibility with
+# tests and code that import from scoring directly.
+from cuemate_analysis.config import DEFAULT_STATIC_WEIGHTS as STATIC_WEIGHTS  # noqa: E402
+from cuemate_analysis.config import DEFAULT_WEIGHT_FLOORS as WEIGHT_FLOORS  # noqa: E402
 
 # Sentinel for scoring components that are not yet implemented.
 # compute_weighted_score skips these entirely and renormalizes over active components.

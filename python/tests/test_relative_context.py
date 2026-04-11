@@ -5,6 +5,7 @@ from pathlib import Path
 from cuemate_analysis.cli import main
 from cuemate_analysis.config import (
     AnalysisSettings,
+    FeedbackSettings,
     RuntimeSettings,
     ScoringSettings,
     SemanticCalibrationSettings,
@@ -277,6 +278,7 @@ def _settings_for_database(database_path: Path) -> RuntimeSettings:
         thresholds=thresholds,
         scoring=scoring,
         weight_adaptation=weight_adaptation,
+        feedback=FeedbackSettings(),
         semantic_calibration=semantic_calibration,
     )
 

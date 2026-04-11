@@ -140,7 +140,7 @@ def handle_score_pair(args: argparse.Namespace) -> int:
     )
 
     if args.json:
-        print(json.dumps(_serialize(result), indent=2))
+        _emit_console(json.dumps(_serialize(result), indent=2))
         return 0
 
     def _track_label(t) -> str:

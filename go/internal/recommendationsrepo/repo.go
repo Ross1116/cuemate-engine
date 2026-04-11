@@ -737,7 +737,9 @@ func (r *Repository) insertRecommendationEvent(ctx context.Context, exec execCon
 }
 
 func (r *Repository) InsertRecommendationEventItems(ctx context.Context, items []RecommendationEventItemRecord) error {
-	return r.insertRecommendationEventItems(ctx, r.db, items)
+	return r.RunInTx(ctx, func(tx *sql.Tx) error {
+		return r.insertRecommendationEventItems(ctx, tx, items)
+	})
 }
 
 func (r *Repository) InsertRecommendationEventItemsTx(ctx context.Context, tx *sql.Tx, items []RecommendationEventItemRecord) error {
@@ -1079,7 +1081,16 @@ func (r *Repository) UpsertFeedbackTuningJob(
 	triggerEventID *string,
 	createdAt string,
 ) (int64, error) {
-	return r.upsertFeedbackTuningJob(ctx, r.db, playlistID, triggerEventID, createdAt)
+	var jobID int64
+	err := r.RunInTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		jobID, err = r.upsertFeedbackTuningJob(ctx, tx, playlistID, triggerEventID, createdAt)
+		return err
+	})
+	if err != nil {
+		return 0, err
+	}
+	return jobID, nil
 }
 
 func (r *Repository) UpsertFeedbackTuningJobTx(

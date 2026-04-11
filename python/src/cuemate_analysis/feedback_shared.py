@@ -13,7 +13,10 @@ def decode_json_object(raw_value: Any) -> dict[str, Any]:
     if not raw_value:
         return {}
     if isinstance(raw_value, str):
-        decoded = json.loads(raw_value)
+        try:
+            decoded = json.loads(raw_value)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return {}
         return decoded if isinstance(decoded, dict) else {}
     return {}
 
@@ -24,7 +27,10 @@ def decode_json_array(raw_value: Any) -> list[Any]:
     if not raw_value:
         return []
     if isinstance(raw_value, str):
-        decoded = json.loads(raw_value)
+        try:
+            decoded = json.loads(raw_value)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return []
         return decoded if isinstance(decoded, list) else []
     return []
 

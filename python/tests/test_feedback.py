@@ -9,7 +9,7 @@ from cuemate_analysis.cli import main
 from cuemate_analysis.config import build_relative_experiment_signature
 from cuemate_analysis.config import load_runtime_settings
 from cuemate_analysis.database import Database
-from cuemate_analysis.feedback import build_feedback_summary, compute_feedback_tuning
+from cuemate_analysis.feedback import build_feedback_summary, compute_feedback_tuning, run_feedback_worker
 from cuemate_analysis.feedback_shared import (
     build_feedback_weight_layers,
     canonicalize_event_items,
@@ -182,6 +182,8 @@ def test_compute_feedback_tuning_skips_apply_when_thresholds_not_met():
 def test_feedback_shared_helpers_decode_and_canonicalize():
     assert decode_json_object('{"harmonic": 0.8}') == {"harmonic": 0.8}
     assert decode_json_array('["build", "jump"]') == ["build", "jump"]
+    assert decode_json_object("{bad json") == {}
+    assert decode_json_array("[bad json") == []
     canonical = canonicalize_event_items(
         [
             {"candidate_track_id": "trk_b", "final_score": 0.6},
@@ -339,3 +341,78 @@ def test_cli_clear_analysis_queue_can_include_running_jobs(tmp_path: Path, monke
         remaining = database.connection.execute("SELECT COUNT(*) FROM analysis_jobs").fetchone()[0]
 
     assert remaining == 0
+
+
+def test_update_playlist_feedback_tuning_raises_when_playlist_stats_missing(tmp_path: Path):
+    repo_root = Path(__file__).resolve().parents[2]
+    schema_sql = (repo_root / "db" / "schema.sql").read_text(encoding="utf-8")
+    db_path = tmp_path / "missing_playlist_stats.db"
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.executescript(schema_sql)
+        connection.commit()
+    finally:
+        connection.close()
+
+    with Database(db_path) as database:
+        try:
+            database.update_playlist_feedback_tuning(
+                playlist_id="missing",
+                feedback_tuned_weights={"harmonic": 0.2},
+                feedback_tuning_notes=[],
+                feedback_event_count=1,
+                feedback_last_tuned_at="2026-04-10T03:00:00Z",
+                feedback_tuning_metrics={"pairwise_comparison_count": 4},
+            )
+        except RuntimeError as exc:
+            assert "playlist_stats row was not found" in str(exc)
+        else:
+            raise AssertionError("Expected RuntimeError when playlist_stats row is missing")
+
+
+def test_run_feedback_worker_records_actual_finish_time(tmp_path: Path):
+    settings = load_runtime_settings()
+    with _seed_feedback_db(tmp_path) as database:
+        database.connection.executescript(
+            """
+            INSERT INTO recommendation_events (
+              id, playlist_id, current_track_id, target, candidate_count, recommendation_confidence,
+              recommendations_status, lanes_returned, track_chosen, chosen_was_recommended,
+              skipped_over, adapted_weights, scoring_contract_id, timestamp
+            ) VALUES (
+              'evt_worker_1', 'pl_1', 'trk_current', 'maintain', 1, 0.8,
+              'available', '{}', 'trk_a', 1, '[]', '{"harmonic":0.12}', 'm3-v1', '2026-04-10T01:00:00Z'
+            );
+
+            INSERT INTO recommendation_event_items (
+              event_id, lane_id, lane_rank, candidate_track_id, final_score, raw_score, penalty_multiplier,
+              move, move_confidence, risk, risk_score, primary_lane, secondary_lane,
+              component_scores_json, confidences_json, weights_used_json, transition_features_json
+            ) VALUES (
+              'evt_worker_1', 'maintain', 1, 'trk_a', 0.80, 0.80, 1.0, 'maintain', 0.9, 'low', 0.1, 'maintain', 0,
+              '{"harmonic":0.9}', '{"harmonic":1.0}', '{"harmonic":0.12}', '{"effective_bpm_distance":1.0}'
+            );
+            """
+        )
+        job_id = database.upsert_feedback_tuning_job(
+            playlist_id="pl_1",
+            trigger_event_id="evt_worker_1",
+            created_at="2026-04-10T01:05:00Z",
+        )
+        results = run_feedback_worker(
+            database,
+            settings,
+            limit=10,
+            started_at="2026-04-10T01:10:00Z",
+        )
+
+        assert results
+        row = database.connection.execute(
+            "SELECT status, started_at, finished_at FROM feedback_tuning_jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+
+    assert row["status"] == "completed"
+    assert row["started_at"] == "2026-04-10T01:10:00Z"
+    assert row["finished_at"] is not None
+    assert row["finished_at"] != "2026-04-10T01:10:00Z"

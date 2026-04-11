@@ -1000,15 +1000,28 @@ class Database:
             ).fetchone()
             if existing is not None:
                 return int(existing["id"])
-            cursor = self.connection.execute(
+            self.connection.execute(
                 """
-                INSERT INTO feedback_tuning_jobs (
+                INSERT OR IGNORE INTO feedback_tuning_jobs (
                   playlist_id, status, trigger_event_id, created_at
                 ) VALUES (?, 'pending', ?, ?)
                 """,
                 (playlist_id, trigger_event_id, created_at),
             )
-            return int(cursor.lastrowid)
+            existing = self.connection.execute(
+                """
+                SELECT id
+                FROM feedback_tuning_jobs
+                WHERE playlist_id = ?
+                  AND status IN ('pending', 'running')
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (playlist_id,),
+            ).fetchone()
+            if existing is None:
+                raise RuntimeError(f"Failed to upsert feedback_tuning_jobs row for playlist '{playlist_id}'.")
+            return int(existing["id"])
 
     def claim_pending_feedback_tuning_jobs(
         self,
@@ -1074,7 +1087,7 @@ class Database:
         feedback_tuning_metrics: dict[str, Any],
     ) -> None:
         with self.connection:
-            self.connection.execute(
+            cursor = self.connection.execute(
                 """
                 UPDATE playlist_stats
                 SET feedback_tuned_weights = ?,
@@ -1093,3 +1106,7 @@ class Database:
                     playlist_id,
                 ),
             )
+            if cursor.rowcount == 0:
+                raise RuntimeError(
+                    f"Failed to persist feedback tuning for playlist '{playlist_id}': playlist_stats row was not found."
+                )

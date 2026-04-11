@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS recommendation_event_items (
   event_id TEXT NOT NULL REFERENCES recommendation_events(id) ON DELETE CASCADE,
   lane_id TEXT NOT NULL,
   lane_rank INTEGER NOT NULL,
-  candidate_track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+  candidate_track_id TEXT NOT NULL REFERENCES tracks(id),
   final_score REAL NOT NULL,
   raw_score REAL NOT NULL,
   penalty_multiplier REAL NOT NULL,
@@ -54,4 +54,5 @@ DROP INDEX IF EXISTS idx_recommendation_event_items_candidate_track;
 DROP INDEX IF EXISTS idx_recommendation_event_items_event_id;
 DROP TABLE IF EXISTS feedback_tuning_jobs;
 DROP TABLE IF EXISTS recommendation_event_items;
-SELECT RAISE(FAIL, 'Irreversible migration: cannot safely remove feedback columns from playlist_stats without rebuilding playlist_stats');
+-- Irreversible migration: cannot safely remove feedback columns from playlist_stats without rebuilding playlist_stats.
+SELECT cueMate_irreversible_feedback_loop_migration();

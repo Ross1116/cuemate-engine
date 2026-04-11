@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Mapping
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -449,7 +450,8 @@ def run_feedback_worker(
                     tuning_result=tuning_result,
                     applied_at=started_at,
                 )
-            database.mark_feedback_tuning_job_completed(job_id, finished_at=started_at)
+            finished_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            database.mark_feedback_tuning_job_completed(job_id, finished_at=finished_at)
             results.append(
                 {
                     "job_id": job_id,
@@ -462,7 +464,8 @@ def run_feedback_worker(
                 }
             )
         except Exception as exc:
-            database.mark_feedback_tuning_job_failed(job_id, error_message=str(exc), finished_at=started_at)
+            finished_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            database.mark_feedback_tuning_job_failed(job_id, error_message=str(exc), finished_at=finished_at)
             results.append(
                 {
                     "job_id": job_id,

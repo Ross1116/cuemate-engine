@@ -1234,6 +1234,11 @@ func (s *server) handleFeedbackSummary(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON request"})
 		return
 	}
+	since, until, err := validateFeedbackSummaryWindow(req.Since, req.Until)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
 	playlist, err := s.repo.ResolvePlaylist(r.Context(), req.PlaylistID, req.PlaylistName)
 	if err != nil {
 		status := http.StatusBadRequest
@@ -1243,7 +1248,7 @@ func (s *server) handleFeedbackSummary(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, status, map[string]string{"error": err.Error()})
 		return
 	}
-	events, err := s.repo.ListRecommendationEventsByPlaylistWindow(r.Context(), playlist.ID, req.Since, req.Until)
+	events, err := s.repo.ListRecommendationEventsByPlaylistWindow(r.Context(), playlist.ID, since, until)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -1262,7 +1267,7 @@ func (s *server) handleFeedbackSummary(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	rpcReq, err := buildFeedbackSummaryRPCRequest(playlist, events, itemsByEvent, stats, req.Since, req.Until)
+	rpcReq, err := buildFeedbackSummaryRPCRequest(playlist, events, itemsByEvent, stats, since, until)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -1282,12 +1287,43 @@ func (s *server) handleFeedbackSummary(w http.ResponseWriter, r *http.Request) {
 	if metadataErr != nil {
 		metadata = s.runtime.CachedMetadata()
 	}
-	payload, buildErr := buildFeedbackSummaryFallbackPayload(playlist, events, itemsByEvent, stats, metadata, req.Since, req.Until)
+	payload, buildErr := buildFeedbackSummaryFallbackPayload(playlist, events, itemsByEvent, stats, metadata, since, until)
 	if buildErr != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": buildErr.Error()})
 		return
 	}
 	writeJSON(w, http.StatusOK, payload)
+}
+
+func validateFeedbackSummaryWindow(rawSince, rawUntil string) (string, string, error) {
+	since := strings.TrimSpace(rawSince)
+	until := strings.TrimSpace(rawUntil)
+	var parsedSince time.Time
+	var parsedUntil time.Time
+	var hasSince bool
+	var hasUntil bool
+	if since != "" {
+		value, err := time.Parse(time.RFC3339, since)
+		if err != nil {
+			return "", "", fmt.Errorf("since must be a valid RFC3339 timestamp")
+		}
+		parsedSince = value
+		hasSince = true
+		since = value.Format(time.RFC3339)
+	}
+	if until != "" {
+		value, err := time.Parse(time.RFC3339, until)
+		if err != nil {
+			return "", "", fmt.Errorf("until must be a valid RFC3339 timestamp")
+		}
+		parsedUntil = value
+		hasUntil = true
+		until = value.Format(time.RFC3339)
+	}
+	if hasSince && hasUntil && parsedSince.After(parsedUntil) {
+		return "", "", fmt.Errorf("since must be before or equal to until")
+	}
+	return since, until, nil
 }
 
 func buildFeedbackSummaryRPCRequest(

@@ -218,7 +218,17 @@ def _copy_map(target: Any, payload: dict[str, float | None]) -> None:
 
 def _copy_int_map(target: Any, payload: dict[str, Any]) -> None:
     for key, value in payload.items():
-        target[key] = int(value)
+        if value is None:
+            continue
+        try:
+            target[key] = int(value)
+            continue
+        except (TypeError, ValueError):
+            pass
+        try:
+            target[key] = int(float(value))
+        except (TypeError, ValueError):
+            continue
 
 
 def _struct_to_dict(value: Any) -> dict[str, Any]:

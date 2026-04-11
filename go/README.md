@@ -48,7 +48,7 @@ With the API server running:
 Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8080/recommendations -ContentType "application/json" -Body '{"playlist_name":"Fred again","current_track_id":"trk_example123","target":"build"}'
 ```
 
-Additional write/snapshot surfaces:
+Additional API surfaces:
 
 ```powershell
 Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8080/events/played -ContentType "application/json" -Body '{"recommendation_event_id":"evt_123","chosen_track_id":"trk_next"}'

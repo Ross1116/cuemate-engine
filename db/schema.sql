@@ -204,7 +204,7 @@ CREATE TABLE recommendation_event_items (
   event_id TEXT NOT NULL REFERENCES recommendation_events(id) ON DELETE CASCADE,
   lane_id TEXT NOT NULL,
   lane_rank INTEGER NOT NULL,
-  candidate_track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+  candidate_track_id TEXT NOT NULL REFERENCES tracks(id),
   final_score REAL NOT NULL,
   raw_score REAL NOT NULL,
   penalty_multiplier REAL NOT NULL,

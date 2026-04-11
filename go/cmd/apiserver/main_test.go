@@ -470,6 +470,32 @@ func TestFeedbackSummaryHonorsWindowFilters(t *testing.T) {
 	}
 }
 
+func TestFeedbackSummaryRejectsInvalidWindow(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/feedback/summary", bytes.NewBufferString(`{"playlist_name":"Test Playlist","since":"not-a-timestamp"}`))
+	srv.handleFeedbackSummary(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestFeedbackSummaryRejectsInvertedWindow(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/feedback/summary", bytes.NewBufferString(`{"playlist_name":"Test Playlist","since":"2026-04-11T00:00:00Z","until":"2026-04-10T00:00:00Z"}`))
+	srv.handleFeedbackSummary(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestRecommendationsReportFeedbackTunedWeightSource(t *testing.T) {
 	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
 		metadataResp: fakeMetadata("rel_sig_current"),

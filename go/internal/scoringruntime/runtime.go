@@ -85,7 +85,9 @@ func (r *Runtime) GetRecommendations(ctx context.Context, req *scoringv1.GetReco
 	}
 	resp, err := r.client.GetRecommendations(ctx, req)
 	if err != nil {
-		r.recordFailure(err)
+		if !IsUnimplemented(err) {
+			r.recordFailure(err)
+		}
 		return nil, err
 	}
 	r.resetFailures()
@@ -98,7 +100,9 @@ func (r *Runtime) GetFeedbackSummary(ctx context.Context, req *scoringv1.GetFeed
 	}
 	resp, err := r.client.GetFeedbackSummary(ctx, req)
 	if err != nil {
-		r.recordFailure(err)
+		if !IsUnimplemented(err) {
+			r.recordFailure(err)
+		}
 		return nil, err
 	}
 	r.resetFailures()

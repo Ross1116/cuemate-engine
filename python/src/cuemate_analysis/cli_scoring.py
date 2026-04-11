@@ -70,7 +70,7 @@ def handle_recommend_next(args: argparse.Namespace) -> int:
     )
 
     if args.json:
-        _emit_console(json.dumps(_serialize(result), indent=2))
+        _emit_console(json.dumps(_serialize(result), indent=2, sort_keys=True))
         return 0
 
     conf = result["recommendation_confidence"]
@@ -140,7 +140,7 @@ def handle_score_pair(args: argparse.Namespace) -> int:
     )
 
     if args.json:
-        _emit_console(json.dumps(_serialize(result), indent=2))
+        _emit_console(json.dumps(_serialize(result), indent=2, sort_keys=True))
         return 0
 
     def _track_label(t) -> str:
@@ -227,7 +227,7 @@ def handle_inspect_scoring_weights(args: argparse.Namespace) -> int:
             "effective_weights": effective_weights,
             "weight_source": weight_source,
             "weight_floors": config["weight_floors"],
-        }, indent=2))
+        }, indent=2, sort_keys=True))
         return 0
 
     print(f"\nScoring weights for '{args.playlist}'\n")
@@ -276,7 +276,7 @@ def handle_inspect_scoring_metadata(args: argparse.Namespace) -> int:
         payload: dict[str, object] = {"metadata": metadata}
         if compatibility is not None:
             payload["compatibility"] = compatibility
-        print(json.dumps(payload, indent=2))
+        print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
 
     active = metadata["active_signatures"]

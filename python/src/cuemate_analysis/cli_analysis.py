@@ -105,7 +105,6 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
                         config_signature=settings.config_signature,
                         source_file_hash=track.file_hash,
                         priority=total - index,
-                        created_at=utc_now(),
                     )
                     fast_started = time.perf_counter()
                     database.mark_analysis_job_started(fast_job_id, utc_now())
@@ -171,7 +170,6 @@ def handle_analyze_playlist(args: argparse.Namespace) -> int:
                     config_signature=settings.config_signature,
                     source_file_hash=track.file_hash,
                     priority=total - index,
-                    created_at=utc_now(),
                 )
                 pending_enrichment_items.append(
                     {

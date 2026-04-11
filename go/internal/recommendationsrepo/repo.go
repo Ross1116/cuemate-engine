@@ -150,6 +150,10 @@ type execContexter interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }
 
+type prepareContexter interface {
+	PrepareContext(ctx context.Context, query string) (*sql.Stmt, error)
+}
+
 type queryRowContexter interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
@@ -741,21 +745,35 @@ func (r *Repository) InsertRecommendationEventItemsTx(ctx context.Context, tx *s
 }
 
 func (r *Repository) insertRecommendationEventItems(ctx context.Context, exec execContexter, items []RecommendationEventItemRecord) error {
+	if len(items) == 0 {
+		return nil
+	}
+	preparer, ok := exec.(prepareContexter)
+	if !ok {
+		return errors.New("exec context does not support prepared statements")
+	}
+	stmt, err := preparer.PrepareContext(
+		ctx,
+		`
+		INSERT INTO recommendation_event_items (
+		  event_id, lane_id, lane_rank, candidate_track_id, final_score, raw_score,
+		  penalty_multiplier, move, move_confidence, risk, risk_score, primary_lane,
+		  secondary_lane, component_scores_json, confidences_json, weights_used_json,
+		  transition_features_json
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`,
+	)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
 	for _, item := range items {
 		secondaryLane := int64(0)
 		if item.SecondaryLane {
 			secondaryLane = 1
 		}
-		_, err := exec.ExecContext(
+		if _, err := stmt.ExecContext(
 			ctx,
-			`
-			INSERT INTO recommendation_event_items (
-			  event_id, lane_id, lane_rank, candidate_track_id, final_score, raw_score,
-			  penalty_multiplier, move, move_confidence, risk, risk_score, primary_lane,
-			  secondary_lane, component_scores_json, confidences_json, weights_used_json,
-			  transition_features_json
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-			`,
 			item.EventID,
 			item.LaneID,
 			item.LaneRank,
@@ -773,8 +791,7 @@ func (r *Repository) insertRecommendationEventItems(ctx context.Context, exec ex
 			item.ConfidencesJSON,
 			item.WeightsUsedJSON,
 			item.TransitionFeaturesJSON,
-		)
-		if err != nil {
+		); err != nil {
 			return err
 		}
 	}
@@ -841,26 +858,38 @@ func (r *Repository) GetRecommendationEvent(ctx context.Context, eventID string)
 }
 
 func (r *Repository) GetRecommendationEventItems(ctx context.Context, eventID string) ([]RecommendationEventItemRecord, error) {
+	itemsByEvent, err := r.ListRecommendationEventItemsByEventIDs(ctx, []string{eventID})
+	if err != nil {
+		return nil, err
+	}
+	return itemsByEvent[eventID], nil
+}
+
+func (r *Repository) ListRecommendationEventItemsByEventIDs(ctx context.Context, eventIDs []string) (map[string][]RecommendationEventItemRecord, error) {
+	itemsByEvent := make(map[string][]RecommendationEventItemRecord, len(eventIDs))
+	if len(eventIDs) == 0 {
+		return itemsByEvent, nil
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(eventIDs)), ",")
 	rows, err := r.db.QueryContext(
 		ctx,
-		`
+		fmt.Sprintf(`
 		SELECT
 		  event_id, lane_id, lane_rank, candidate_track_id, final_score, raw_score,
 		  penalty_multiplier, move, move_confidence, risk, risk_score, primary_lane,
 		  secondary_lane, component_scores_json, confidences_json, weights_used_json,
 		  transition_features_json
 		FROM recommendation_event_items
-		WHERE event_id = ?
-		ORDER BY lane_id ASC, lane_rank ASC, candidate_track_id ASC
-		`,
-		eventID,
+		WHERE event_id IN (%s)
+		ORDER BY event_id ASC, lane_id ASC, lane_rank ASC, candidate_track_id ASC
+		`, placeholders),
+		stringSliceArgs(eventIDs)...,
 	)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var items []RecommendationEventItemRecord
 	for rows.Next() {
 		var item RecommendationEventItemRecord
 		var primaryLane sql.NullString
@@ -890,24 +919,41 @@ func (r *Repository) GetRecommendationEventItems(ctx context.Context, eventID st
 			item.PrimaryLane = &primaryLane.String
 		}
 		item.SecondaryLane = secondaryLane != 0
-		items = append(items, item)
+		itemsByEvent[item.EventID] = append(itemsByEvent[item.EventID], item)
 	}
-	return items, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return itemsByEvent, nil
 }
 
 func (r *Repository) ListRecommendationEventsByPlaylist(ctx context.Context, playlistID string) ([]RecommendationEventRecord, error) {
+	return r.ListRecommendationEventsByPlaylistWindow(ctx, playlistID, "", "")
+}
+
+func (r *Repository) ListRecommendationEventsByPlaylistWindow(ctx context.Context, playlistID, since, until string) ([]RecommendationEventRecord, error) {
+	where := []string{"playlist_id = ?"}
+	args := []any{playlistID}
+	if strings.TrimSpace(since) != "" {
+		where = append(where, "timestamp >= ?")
+		args = append(args, since)
+	}
+	if strings.TrimSpace(until) != "" {
+		where = append(where, "timestamp <= ?")
+		args = append(args, until)
+	}
 	rows, err := r.db.QueryContext(
 		ctx,
-		`
+		fmt.Sprintf(`
 		SELECT
 		  id, playlist_id, current_track_id, target, candidate_count,
 		  recommendation_confidence, recommendations_status, lanes_returned, track_chosen,
 		  chosen_was_recommended, skipped_over, adapted_weights, scoring_contract_id, timestamp
 		FROM recommendation_events
-		WHERE playlist_id = ?
+		WHERE %s
 		ORDER BY timestamp ASC, id ASC
-		`,
-		playlistID,
+		`, strings.Join(where, " AND ")),
+		args...,
 	)
 	if err != nil {
 		return nil, err
@@ -959,6 +1005,14 @@ func (r *Repository) ListRecommendationEventsByPlaylist(ctx context.Context, pla
 		items = append(items, record)
 	}
 	return items, rows.Err()
+}
+
+func stringSliceArgs(values []string) []any {
+	args := make([]any, 0, len(values))
+	for _, value := range values {
+		args = append(args, value)
+	}
+	return args
 }
 
 func (r *Repository) UpdateRecommendationEventChoice(

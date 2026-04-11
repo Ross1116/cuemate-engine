@@ -3025,7 +3025,7 @@ def handle_score_pair(args: argparse.Namespace) -> int:
 
 def handle_inspect_scoring_weights(args: argparse.Namespace) -> int:
     from cuemate_analysis.config import build_scoring_config
-    from cuemate_analysis.scoring import resolve_effective_weights
+    from cuemate_analysis.scoring import resolve_effective_weights, resolve_weight_source
 
     settings = load_runtime_settings()
     config = build_scoring_config(settings, target="maintain")
@@ -3040,32 +3040,42 @@ def handle_inspect_scoring_weights(args: argparse.Namespace) -> int:
 
     static_weights = config["static_weights"]
     adapted_weights = (playlist_stats or {}).get("adapted_weights") if playlist_stats else None
+    tuned_weights = (playlist_stats or {}).get("feedback_tuned_weights") if playlist_stats else None
+    base_weights = adapted_weights or static_weights
     effective_weights = resolve_effective_weights(playlist_stats, config)
+    weight_source = resolve_weight_source(playlist_stats)
 
     if args.json:
         print(json.dumps({
             "playlist": args.playlist,
             "static_weights": static_weights,
-            "adapted_weights": adapted_weights,
+            "base_weights": base_weights,
+            "tuned_weights": tuned_weights,
             "effective_weights": effective_weights,
+            "weight_source": weight_source,
             "weight_floors": config["weight_floors"],
         }, indent=2))
         return 0
 
     print(f"\nScoring weights for '{args.playlist}'\n")
-    print(f"  {'Component':<24}  {'Static':>8}  {'Adapted':>8}  {'Effective':>9}")
-    print(f"  {'-'*24}  {'-'*8}  {'-'*8}  {'-'*9}")
+    print(f"  Active weight source:    {weight_source}")
+    print(f"  {'Component':<24}  {'Static':>8}  {'Base':>8}  {'Tuned':>8}  {'Effective':>9}")
+    print(f"  {'-'*24}  {'-'*8}  {'-'*8}  {'-'*8}  {'-'*9}")
     for key in sorted(static_weights):
         s = static_weights.get(key, 0.0)
-        a = (adapted_weights or {}).get(key) if adapted_weights else None
+        a = (base_weights or {}).get(key) if base_weights else None
+        t = (tuned_weights or {}).get(key) if tuned_weights else None
         e = effective_weights.get(key, s)
-        a_str = f"{a:.4f}" if a is not None else "    —   "
-        print(f"  {key:<24}  {s:>8.4f}  {a_str:>8}  {e:>9.4f}")
+        a_str = f"{a:.4f}" if a is not None else "   n/a  "
+        t_str = f"{t:.4f}" if t is not None else "   n/a  "
+        print(f"  {key:<24}  {s:>8.4f}  {a_str:>8}  {t_str:>8}  {e:>9.4f}")
 
-    if adapted_weights:
-        print("\n  Adaptation is active (playlist has adapted_weights).")
+    if weight_source == "feedback_tuned_weights":
+        print("\n  Feedback tuning is active and overrides the heuristic base weights.")
+    elif weight_source == "adapted_weights":
+        print("\n  Heuristic playlist adaptation is active (no tuned override yet).")
     else:
-        print("\n  No adaptation — using static weights.")
+        print("\n  No playlist-specific weights are active; using static defaults.")
 
     return 0
 
@@ -3131,9 +3141,14 @@ def handle_feedback_summary(args: argparse.Namespace) -> int:
     for lane_name, count in skip_counts.items():
         print(f"    {lane_name:<12} {count}")
 
-    print("\n  Effective weights:")
-    for key, value in sorted(weights["effective"].items()):
-        print(f"    {key:<24} {value:.4f}")
+    for label in ("static", "base", "tuned", "effective"):
+        values = weights.get(label)
+        print(f"\n  {label.title()} weights:")
+        if not values:
+            print("    none")
+            continue
+        for key, value in sorted(values.items()):
+            print(f"    {key:<24} {value:.4f}")
     return 0
 
 

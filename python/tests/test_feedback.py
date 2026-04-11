@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import json
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 
+from cuemate_analysis.cli import main
+from cuemate_analysis.config import build_relative_experiment_signature
 from cuemate_analysis.config import load_runtime_settings
 from cuemate_analysis.database import Database
 from cuemate_analysis.feedback import build_feedback_summary, compute_feedback_tuning
@@ -167,3 +171,75 @@ def test_compute_feedback_tuning_skips_apply_when_thresholds_not_met():
 
     assert result["should_apply"] is False
     assert result["thresholds_met"] is False
+
+
+def test_cli_feedback_summary_and_inspect_weights_report_weight_layers(tmp_path: Path, monkeypatch, capsys):
+    settings = replace(load_runtime_settings(), database_path=tmp_path / "feedback.db")
+    expected_relative_signature = build_relative_experiment_signature(settings, energy_source="canonical")
+
+    with _seed_feedback_db(tmp_path) as database:
+        database.connection.execute(
+            """
+            UPDATE playlist_stats
+            SET relative_signature = ?,
+                feedback_tuned_weights = ?,
+                feedback_tuning_notes = ?,
+                feedback_event_count = ?,
+                feedback_last_tuned_at = ?,
+                feedback_tuning_metrics = ?
+            WHERE playlist_id = 'pl_1'
+            """,
+            (
+                expected_relative_signature,
+                json.dumps({
+                    "harmonic": 0.20,
+                    "target_energy": 0.18,
+                    "bass_transition": 0.14,
+                    "tempo": 0.08,
+                    "history_fit": 0.06,
+                    "transition_support": 0.16,
+                    "vocal_transition": 0.12,
+                    "rhythmic_continuity": 0.06,
+                }),
+                json.dumps(["applied tuned weights"]),
+                24,
+                "2026-04-10T03:00:00Z",
+                json.dumps({"pairwise_comparison_count": 44}),
+            ),
+        )
+        database.connection.executescript(
+            """
+            INSERT INTO recommendation_events (
+              id, playlist_id, current_track_id, target, candidate_count, recommendation_confidence,
+              recommendations_status, lanes_returned, track_chosen, chosen_was_recommended,
+              skipped_over, adapted_weights, scoring_contract_id, timestamp
+            ) VALUES (
+              'evt_cli_1', 'pl_1', 'trk_current', 'reset', 2, 0.75,
+              'available', '{}', 'trk_a', 1, '[]', '{"harmonic":0.12}', 'm3-v1', '2026-04-10T01:00:00Z'
+            );
+
+            INSERT INTO recommendation_event_items (
+              event_id, lane_id, lane_rank, candidate_track_id, final_score, raw_score, penalty_multiplier,
+              move, move_confidence, risk, risk_score, primary_lane, secondary_lane,
+              component_scores_json, confidences_json, weights_used_json, transition_features_json
+            ) VALUES
+              ('evt_cli_1', 'reset', 1, 'trk_a', 0.70, 0.70, 1.0, 'reset', 0.9, 'low', 0.1, 'reset', 0, '{"harmonic":0.9}', '{"harmonic":1.0}', '{"harmonic":0.12}', '{"effective_bpm_distance":1.0}'),
+              ('evt_cli_1', 'build', 1, 'trk_b', 0.80, 0.80, 1.0, 'build', 0.9, 'low', 0.1, 'build', 0, '{"harmonic":0.3}', '{"harmonic":1.0}', '{"harmonic":0.12}', '{"effective_bpm_distance":1.0}');
+            """
+        )
+        database.connection.commit()
+
+    monkeypatch.setattr("cuemate_analysis.cli.load_runtime_settings", lambda: settings)
+
+    assert main(["feedback-summary", "--playlist", "Feedback Playlist", "--json"]) == 0
+    summary_payload = json.loads(capsys.readouterr().out)
+    assert summary_payload["weights"]["source"] == "feedback_tuned_weights"
+    assert set(summary_payload["weights"]) == {"source", "static", "base", "tuned", "effective"}
+    assert summary_payload["metrics"]["pairwise_comparison_count"] == 1
+
+    assert main(["inspect-scoring-weights", "--playlist", "Feedback Playlist", "--json"]) == 0
+    inspect_payload = json.loads(capsys.readouterr().out)
+    assert inspect_payload["weight_source"] == "feedback_tuned_weights"
+    assert inspect_payload["base_weights"]["harmonic"] == 0.12
+    assert inspect_payload["tuned_weights"]["harmonic"] == 0.20
+    assert inspect_payload["effective_weights"]["harmonic"] == 0.20

@@ -1242,20 +1242,19 @@ func (s *server) handleFeedbackSummary(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, status, map[string]string{"error": err.Error()})
 		return
 	}
-	events, err := s.repo.ListRecommendationEventsByPlaylist(r.Context(), playlist.ID)
+	events, err := s.repo.ListRecommendationEventsByPlaylistWindow(r.Context(), playlist.ID, req.Since, req.Until)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	filteredEvents := make([]recommendationsrepo.RecommendationEventRecord, 0, len(events))
+	eventIDs := make([]string, 0, len(events))
 	for _, event := range events {
-		if strings.TrimSpace(req.Since) != "" && event.Timestamp < req.Since {
-			continue
-		}
-		if strings.TrimSpace(req.Until) != "" && event.Timestamp > req.Until {
-			continue
-		}
-		filteredEvents = append(filteredEvents, event)
+		eventIDs = append(eventIDs, event.ID)
+	}
+	itemsByEvent, err := s.repo.ListRecommendationEventItemsByEventIDs(r.Context(), eventIDs)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
 	}
 	stats, err := s.repo.GetPlaylistStats(r.Context(), playlist.ID)
 	if err != nil {
@@ -1266,7 +1265,7 @@ func (s *server) handleFeedbackSummary(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		metadata = s.runtime.CachedMetadata()
 	}
-	payload, err := buildFeedbackSummaryPayload(r.Context(), s.repo, playlist, filteredEvents, stats, metadata, req.Since, req.Until)
+	payload, err := buildFeedbackSummaryPayload(playlist, events, itemsByEvent, stats, metadata, req.Since, req.Until)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -1275,10 +1274,9 @@ func (s *server) handleFeedbackSummary(w http.ResponseWriter, r *http.Request) {
 }
 
 func buildFeedbackSummaryPayload(
-	ctx context.Context,
-	repo *recommendationsrepo.Repository,
 	playlist recommendationsrepo.PlaylistRef,
 	events []recommendationsrepo.RecommendationEventRecord,
+	itemsByEvent map[string][]recommendationsrepo.RecommendationEventItemRecord,
 	stats *recommendationsrepo.PlaylistStats,
 	metadata *scoringv1.GetScoringMetadataResponse,
 	since, until string,
@@ -1313,10 +1311,7 @@ func buildFeedbackSummaryPayload(
 	higherScoredLaneSkips := map[string]int{}
 
 	for _, event := range events {
-		items, err := repo.GetRecommendationEventItems(ctx, event.ID)
-		if err != nil {
-			return nil, err
-		}
+		items := itemsByEvent[event.ID]
 		canonicalItems := canonicalizeRecommendationEventItems(items)
 		chosenTrackID := stringValue(event.TrackChosen)
 		chosenItem := findChosenEventItem(canonicalItems, chosenTrackID)

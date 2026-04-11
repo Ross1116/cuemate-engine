@@ -559,6 +559,58 @@ def test_refresh_relative_playlist_persists_canonical_tables(tmp_path: Path, mon
     assert stats_row == (0, "canonical", "ok")
 
 
+def test_refresh_relative_playlist_preserves_feedback_tuning_fields(tmp_path: Path, monkeypatch, capsys) -> None:
+    database_path = _create_relative_test_db(tmp_path, "Preserve", 12)
+    monkeypatch.setattr("cuemate_analysis.cli.load_runtime_settings", lambda: _settings_for_database(database_path))
+
+    assert main(["refresh-relative-playlist", "--playlist", "Preserve", "--json"]) == 0
+    capsys.readouterr()
+
+    connection = sqlite3.connect(database_path)
+    connection.execute(
+        """
+        UPDATE playlist_stats
+        SET feedback_tuned_weights = ?,
+            feedback_tuning_notes = ?,
+            feedback_event_count = ?,
+            feedback_last_tuned_at = ?,
+            feedback_tuning_metrics = ?
+        WHERE playlist_id = 'plt_test'
+        """,
+        (
+            json.dumps({"harmonic": 0.2, "target_energy": 0.18}),
+            json.dumps(["kept across refresh"]),
+            23,
+            "2026-04-10T04:00:00Z",
+            json.dumps({"pairwise_comparison_count": 55}),
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+    assert main(["refresh-relative-playlist", "--playlist", "Preserve", "--json"]) == 0
+    capsys.readouterr()
+
+    connection = sqlite3.connect(database_path)
+    preserved = connection.execute(
+        """
+        SELECT feedback_tuned_weights, feedback_tuning_notes, feedback_event_count,
+               feedback_last_tuned_at, feedback_tuning_metrics
+        FROM playlist_stats
+        WHERE playlist_id = 'plt_test'
+        """
+    ).fetchone()
+    connection.close()
+
+    assert preserved == (
+        '{"harmonic": 0.2, "target_energy": 0.18}',
+        '["kept across refresh"]',
+        23,
+        "2026-04-10T04:00:00Z",
+        '{"pairwise_comparison_count": 55}',
+    )
+
+
 def test_canonical_relative_auto_refreshes_when_missing(tmp_path: Path, monkeypatch, capsys) -> None:
     database_path = _create_relative_test_db(tmp_path, "Auto", 12)
     monkeypatch.setattr("cuemate_analysis.cli.load_runtime_settings", lambda: _settings_for_database(database_path))

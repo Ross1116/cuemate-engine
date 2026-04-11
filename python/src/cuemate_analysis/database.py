@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from pathlib import Path
 import re
 import sqlite3
@@ -953,6 +954,29 @@ class Database:
                 raise ValueError(
                     f"Expected {key} to decode to a list for playlist '{result.get('playlist_id')}'."
                 )
+            if key in {"adapted_weights", "feedback_tuned_weights"}:
+                validated: dict[str, float] = {}
+                for raw_key, raw_item in decoded.items():
+                    if not isinstance(raw_key, str):
+                        raise ValueError(
+                            f"Invalid {key} entry for playlist '{result.get('playlist_id')}': non-string key {raw_key!r}."
+                        )
+                    if isinstance(raw_item, bool):
+                        raise ValueError(
+                            f"Invalid {key} entry for playlist '{result.get('playlist_id')}', key '{raw_key}': boolean value {raw_item!r}."
+                        )
+                    try:
+                        coerced = float(raw_item)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(
+                            f"Invalid {key} entry for playlist '{result.get('playlist_id')}', key '{raw_key}': {raw_item!r}."
+                        ) from exc
+                    if not math.isfinite(coerced):
+                        raise ValueError(
+                            f"Invalid {key} entry for playlist '{result.get('playlist_id')}', key '{raw_key}': non-finite value {raw_item!r}."
+                        )
+                    validated[raw_key] = coerced
+                decoded = validated
             result[key] = decoded
         return result
 
@@ -983,7 +1007,7 @@ class Database:
                 UPDATE feedback_tuning_jobs
                 SET trigger_event_id = COALESCE(?, trigger_event_id)
                 WHERE playlist_id = ?
-                  AND status IN ('pending', 'running')
+                  AND status = 'pending'
                 """,
                 (trigger_event_id, playlist_id),
             )
@@ -992,7 +1016,7 @@ class Database:
                 SELECT id
                 FROM feedback_tuning_jobs
                 WHERE playlist_id = ?
-                  AND status IN ('pending', 'running')
+                  AND status = 'pending'
                 ORDER BY id DESC
                 LIMIT 1
                 """,
@@ -1013,7 +1037,7 @@ class Database:
                 SELECT id
                 FROM feedback_tuning_jobs
                 WHERE playlist_id = ?
-                  AND status IN ('pending', 'running')
+                  AND status = 'pending'
                 ORDER BY id DESC
                 LIMIT 1
                 """,

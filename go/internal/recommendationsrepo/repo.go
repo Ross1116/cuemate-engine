@@ -86,6 +86,7 @@ type RecommendationEventRecord struct {
 	AdaptedWeightsJSON       *string
 	ScoringContractID        string
 	Timestamp                string
+	PlayedAt                 *string
 }
 
 type RecommendationEventItemRecord struct {
@@ -715,8 +716,8 @@ func (r *Repository) insertRecommendationEvent(ctx context.Context, exec execCon
 		INSERT INTO recommendation_events (
 		  id, user_id, playlist_id, current_track_id, target, candidate_count,
 		  recommendation_confidence, recommendations_status, lanes_returned, track_chosen,
-		  chosen_was_recommended, skipped_over, adapted_weights, scoring_contract_id, timestamp
-		) VALUES (?, 'local', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		  chosen_was_recommended, skipped_over, adapted_weights, scoring_contract_id, timestamp, played_at
+		) VALUES (?, 'local', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		`,
 		record.ID,
 		record.PlaylistID,
@@ -732,6 +733,7 @@ func (r *Repository) insertRecommendationEvent(ctx context.Context, exec execCon
 		nullString(record.AdaptedWeightsJSON),
 		record.ScoringContractID,
 		record.Timestamp,
+		nullString(record.PlayedAt),
 	)
 	return err
 }
@@ -807,7 +809,7 @@ func (r *Repository) GetRecommendationEvent(ctx context.Context, eventID string)
 		SELECT
 		  id, playlist_id, current_track_id, target, candidate_count,
 		  recommendation_confidence, recommendations_status, lanes_returned, track_chosen,
-		  chosen_was_recommended, skipped_over, adapted_weights, scoring_contract_id, timestamp
+		  chosen_was_recommended, skipped_over, adapted_weights, scoring_contract_id, timestamp, played_at
 		FROM recommendation_events
 		WHERE id = ?
 		`,
@@ -819,6 +821,7 @@ func (r *Repository) GetRecommendationEvent(ctx context.Context, eventID string)
 	var chosenWasRecommended sql.NullInt64
 	var skippedOver sql.NullString
 	var adaptedWeights sql.NullString
+	var playedAt sql.NullString
 	if err := row.Scan(
 		&record.ID,
 		&record.PlaylistID,
@@ -834,6 +837,7 @@ func (r *Repository) GetRecommendationEvent(ctx context.Context, eventID string)
 		&adaptedWeights,
 		&record.ScoringContractID,
 		&record.Timestamp,
+		&playedAt,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrRecommendationEventNotFound
@@ -855,6 +859,9 @@ func (r *Repository) GetRecommendationEvent(ctx context.Context, eventID string)
 	}
 	if adaptedWeights.Valid {
 		record.AdaptedWeightsJSON = &adaptedWeights.String
+	}
+	if playedAt.Valid {
+		record.PlayedAt = &playedAt.String
 	}
 	return &record, nil
 }
@@ -937,11 +944,11 @@ func (r *Repository) ListRecommendationEventsByPlaylistWindow(ctx context.Contex
 	where := []string{"playlist_id = ?"}
 	args := []any{playlistID}
 	if strings.TrimSpace(since) != "" {
-		where = append(where, "timestamp >= ?")
+		where = append(where, "played_at >= ?")
 		args = append(args, since)
 	}
 	if strings.TrimSpace(until) != "" {
-		where = append(where, "timestamp <= ?")
+		where = append(where, "played_at <= ?")
 		args = append(args, until)
 	}
 	rows, err := r.db.QueryContext(
@@ -950,10 +957,10 @@ func (r *Repository) ListRecommendationEventsByPlaylistWindow(ctx context.Contex
 		SELECT
 		  id, playlist_id, current_track_id, target, candidate_count,
 		  recommendation_confidence, recommendations_status, lanes_returned, track_chosen,
-		  chosen_was_recommended, skipped_over, adapted_weights, scoring_contract_id, timestamp
+		  chosen_was_recommended, skipped_over, adapted_weights, scoring_contract_id, timestamp, played_at
 		FROM recommendation_events
 		WHERE %s
-		ORDER BY timestamp ASC, id ASC
+		ORDER BY COALESCE(played_at, timestamp) ASC, id ASC
 		`, strings.Join(where, " AND ")),
 		args...,
 	)
@@ -970,6 +977,7 @@ func (r *Repository) ListRecommendationEventsByPlaylistWindow(ctx context.Contex
 		var chosenWasRecommended sql.NullInt64
 		var skippedOver sql.NullString
 		var adaptedWeights sql.NullString
+		var playedAt sql.NullString
 		if err := rows.Scan(
 			&record.ID,
 			&record.PlaylistID,
@@ -985,6 +993,7 @@ func (r *Repository) ListRecommendationEventsByPlaylistWindow(ctx context.Contex
 			&adaptedWeights,
 			&record.ScoringContractID,
 			&record.Timestamp,
+			&playedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -1003,6 +1012,9 @@ func (r *Repository) ListRecommendationEventsByPlaylistWindow(ctx context.Contex
 		}
 		if adaptedWeights.Valid {
 			record.AdaptedWeightsJSON = &adaptedWeights.String
+		}
+		if playedAt.Valid {
+			record.PlayedAt = &playedAt.String
 		}
 		items = append(items, record)
 	}
@@ -1023,8 +1035,9 @@ func (r *Repository) UpdateRecommendationEventChoice(
 	chosenTrackID string,
 	chosenWasRecommended bool,
 	skippedOverJSON string,
+	playedAt string,
 ) error {
-	return r.updateRecommendationEventChoice(ctx, r.db, eventID, chosenTrackID, chosenWasRecommended, skippedOverJSON)
+	return r.updateRecommendationEventChoice(ctx, r.db, eventID, chosenTrackID, chosenWasRecommended, skippedOverJSON, playedAt)
 }
 
 func (r *Repository) UpdateRecommendationEventChoiceTx(
@@ -1034,8 +1047,9 @@ func (r *Repository) UpdateRecommendationEventChoiceTx(
 	chosenTrackID string,
 	chosenWasRecommended bool,
 	skippedOverJSON string,
+	playedAt string,
 ) error {
-	return r.updateRecommendationEventChoice(ctx, tx, eventID, chosenTrackID, chosenWasRecommended, skippedOverJSON)
+	return r.updateRecommendationEventChoice(ctx, tx, eventID, chosenTrackID, chosenWasRecommended, skippedOverJSON, playedAt)
 }
 
 func (r *Repository) updateRecommendationEventChoice(
@@ -1045,6 +1059,7 @@ func (r *Repository) updateRecommendationEventChoice(
 	chosenTrackID string,
 	chosenWasRecommended bool,
 	skippedOverJSON string,
+	playedAt string,
 ) error {
 	value := int64(0)
 	if chosenWasRecommended {
@@ -1054,12 +1069,13 @@ func (r *Repository) updateRecommendationEventChoice(
 		ctx,
 		`
 		UPDATE recommendation_events
-		SET track_chosen = ?, chosen_was_recommended = ?, skipped_over = ?
+		SET track_chosen = ?, chosen_was_recommended = ?, skipped_over = ?, played_at = ?
 		WHERE id = ?
 		`,
 		chosenTrackID,
 		value,
 		skippedOverJSON,
+		playedAt,
 		eventID,
 	)
 	if err != nil {
@@ -1116,7 +1132,7 @@ func (r *Repository) upsertFeedbackTuningJob(
 		UPDATE feedback_tuning_jobs
 		SET trigger_event_id = COALESCE(?, trigger_event_id)
 		WHERE playlist_id = ?
-		  AND status IN ('pending', 'running')
+		  AND status = 'pending'
 		`,
 		nullString(triggerEventID),
 		playlistID,
@@ -1134,7 +1150,7 @@ func (r *Repository) upsertFeedbackTuningJob(
 		SELECT id
 		FROM feedback_tuning_jobs
 		WHERE playlist_id = ?
-		  AND status IN ('pending', 'running')
+		  AND status = 'pending'
 		ORDER BY id DESC
 		LIMIT 1
 		`,

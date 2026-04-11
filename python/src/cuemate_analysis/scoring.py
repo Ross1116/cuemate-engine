@@ -682,23 +682,29 @@ def resolve_effective_weights(
     3. config-provided static weights
     4. module STATIC_WEIGHTS fallback
     """
-    if playlist_stats and playlist_stats.get("feedback_tuned_weights"):
-        return dict(playlist_stats["feedback_tuned_weights"])
-    if playlist_stats and playlist_stats.get("adapted_weights"):
-        return dict(playlist_stats["adapted_weights"])
-    if config and config.get("static_weights"):
-        return dict(config["static_weights"])
-    return dict(STATIC_WEIGHTS)
+    _, weights = _select_weight_payload(playlist_stats, config)
+    return dict(weights)
 
 
 def resolve_weight_source(
     playlist_stats: dict[str, Any] | None,
+    config: dict[str, Any] | None = None,
 ) -> str:
+    source, _ = _select_weight_payload(playlist_stats, config)
+    return source
+
+
+def _select_weight_payload(
+    playlist_stats: dict[str, Any] | None,
+    config: dict[str, Any] | None = None,
+) -> tuple[str, dict[str, float]]:
     if playlist_stats and playlist_stats.get("feedback_tuned_weights"):
-        return "feedback_tuned_weights"
+        return "feedback_tuned_weights", dict(playlist_stats["feedback_tuned_weights"])
     if playlist_stats and playlist_stats.get("adapted_weights"):
-        return "adapted_weights"
-    return "static"
+        return "adapted_weights", dict(playlist_stats["adapted_weights"])
+    if config and config.get("static_weights"):
+        return "static", dict(config["static_weights"])
+    return "static", dict(STATIC_WEIGHTS)
 
 
 # ---------------------------------------------------------------------------

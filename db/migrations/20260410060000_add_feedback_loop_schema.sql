@@ -45,7 +45,7 @@ CREATE INDEX IF NOT EXISTS idx_feedback_tuning_jobs_status_created
   ON feedback_tuning_jobs (status, created_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_feedback_tuning_jobs_playlist_pending
   ON feedback_tuning_jobs (playlist_id)
-  WHERE status IN ('pending', 'running');
+  WHERE status = 'pending';
 
 -- migrate:down
 DROP INDEX IF EXISTS idx_feedback_tuning_jobs_playlist_pending;
@@ -55,4 +55,4 @@ DROP INDEX IF EXISTS idx_recommendation_event_items_event_id;
 DROP TABLE IF EXISTS feedback_tuning_jobs;
 DROP TABLE IF EXISTS recommendation_event_items;
 -- Irreversible migration: cannot safely remove feedback columns from playlist_stats without rebuilding playlist_stats.
-SELECT cueMate_irreversible_feedback_loop_migration();
+SELECT cueMate_irreversible_feedback_loop_migration_blocked();

@@ -73,6 +73,10 @@ DISPLAY_MOJIBAKE_REPLACEMENTS = {
 }
 
 
+DISPLAY_MOJIBAKE_REPLACEMENTS[b"\xe2\x80\x94".decode("cp1252", errors="ignore")] = "-"
+DISPLAY_MOJIBAKE_REPLACEMENTS[b"\xe2\x80\x93".decode("cp1252", errors="ignore")] = "-"
+
+
 @dataclass(frozen=True)
 class PreparedTrack:
     row: object

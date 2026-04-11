@@ -604,13 +604,11 @@ def test_refresh_relative_playlist_preserves_feedback_tuning_fields(tmp_path: Pa
     ).fetchone()
     connection.close()
 
-    assert preserved == (
-        '{"harmonic": 0.2, "target_energy": 0.18}',
-        '["kept across refresh"]',
-        23,
-        "2026-04-10T04:00:00Z",
-        '{"pairwise_comparison_count": 55}',
-    )
+    assert json.loads(preserved[0]) == {"harmonic": 0.2, "target_energy": 0.18}
+    assert json.loads(preserved[1]) == ["kept across refresh"]
+    assert preserved[2] == 23
+    assert preserved[3] == "2026-04-10T04:00:00Z"
+    assert json.loads(preserved[4]) == {"pairwise_comparison_count": 55}
 
 
 def test_canonical_relative_auto_refreshes_when_missing(tmp_path: Path, monkeypatch, capsys) -> None:

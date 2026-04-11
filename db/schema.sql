@@ -198,13 +198,14 @@ CREATE TABLE recommendation_events (
   skipped_over TEXT,
   adapted_weights TEXT,
   scoring_contract_id TEXT NOT NULL,
-  timestamp TEXT NOT NULL
+  timestamp TEXT NOT NULL,
+  played_at TEXT
 );
 CREATE TABLE recommendation_event_items (
   event_id TEXT NOT NULL REFERENCES recommendation_events(id) ON DELETE CASCADE,
   lane_id TEXT NOT NULL,
   lane_rank INTEGER NOT NULL,
-  candidate_track_id TEXT NOT NULL REFERENCES tracks(id),
+  candidate_track_id TEXT NOT NULL REFERENCES tracks(id) ON DELETE RESTRICT,
   final_score REAL NOT NULL,
   raw_score REAL NOT NULL,
   penalty_multiplier REAL NOT NULL,
@@ -249,13 +250,14 @@ CREATE TABLE playlist_sync_state (
 CREATE INDEX idx_manual_corrections_track_id ON manual_corrections (track_id);
 CREATE INDEX idx_recommendation_events_playlist_id ON recommendation_events (playlist_id);
 CREATE INDEX idx_recommendation_events_timestamp ON recommendation_events (timestamp);
+CREATE INDEX idx_recommendation_events_played_at ON recommendation_events (played_at);
 CREATE INDEX idx_recommendation_events_status ON recommendation_events (recommendations_status);
 CREATE INDEX idx_recommendation_event_items_event_id ON recommendation_event_items (event_id, lane_id, lane_rank);
 CREATE INDEX idx_recommendation_event_items_candidate_track ON recommendation_event_items (candidate_track_id);
 CREATE INDEX idx_feedback_tuning_jobs_status_created ON feedback_tuning_jobs (status, created_at);
 CREATE UNIQUE INDEX idx_feedback_tuning_jobs_playlist_pending
   ON feedback_tuning_jobs (playlist_id)
-  WHERE status IN ('pending', 'running');
+  WHERE status = 'pending';
 CREATE INDEX idx_sync_outbox_unsynced ON sync_outbox (synced_at, id);
 -- Dbmate schema migrations
 INSERT INTO "schema_migrations" (version) VALUES
@@ -270,4 +272,5 @@ INSERT INTO "schema_migrations" (version) VALUES
   ('20260405093000'),
   ('20260409183000'),
   ('20260410030000'),
-  ('20260410060000');
+  ('20260410060000'),
+  ('20260412101500');

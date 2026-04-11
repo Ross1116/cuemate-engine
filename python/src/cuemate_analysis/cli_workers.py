@@ -156,15 +156,24 @@ def handle_run_analysis_worker(args: argparse.Namespace) -> int:
                 )
                 continue
 
-            track = read_track_metadata_with_overrides(
-                Path(str(track_row["file_path"])),
-                bpm_imported=track_row["imported_bpm"],
-                key_imported=track_row["imported_key"],
-                title_override=track_row["title"],
-                artist_override=track_row["artist"],
-                genre_override=track_row["genre"],
-                import_source=track_row["import_source"] or "local_files",
-            )
+            try:
+                track = read_track_metadata_with_overrides(
+                    Path(str(track_row["file_path"])),
+                    bpm_imported=track_row["imported_bpm"],
+                    key_imported=track_row["imported_key"],
+                    title_override=track_row["title"],
+                    artist_override=track_row["artist"],
+                    genre_override=track_row["genre"],
+                    import_source=track_row["import_source"] or "local_files",
+                )
+            except Exception as exc:
+                database.mark_analysis_job_failed(
+                    int(job["id"]),
+                    f"Metadata reconstruction failed: {str(exc)}",
+                    0.0,
+                    utc_now(),
+                )
+                continue
             prepared = _cli.PreparedTrack(
                 row={
                     "playlist_id": job["playlist_id"],
@@ -261,13 +270,14 @@ def handle_prewarm_model_services(args: argparse.Namespace) -> int:
             device=settings.analysis.key_device,
             policy=settings.analysis.key_policy,
         )
-        estimate_essentia_semantic_batch(
-            [warm_path],
-            model_root=settings.analysis.essentia_semantic_model_root,
-            image_name=settings.analysis.essentia_semantic_image,
-            device=settings.analysis.essentia_semantic_device,
-            family_policy=settings.analysis.essentia_semantic_model_family_policy,
-        )
+        if settings.analysis.essentia_semantics_enabled:
+            estimate_essentia_semantic_batch(
+                [warm_path],
+                model_root=settings.analysis.essentia_semantic_model_root,
+                image_name=settings.analysis.essentia_semantic_image,
+                device=settings.analysis.essentia_semantic_device,
+                family_policy=settings.analysis.essentia_semantic_model_family_policy,
+            )
     else:
         tempocnn_ready, tempocnn_notes = ensure_tempocnn_service(
             drive_letters=[],

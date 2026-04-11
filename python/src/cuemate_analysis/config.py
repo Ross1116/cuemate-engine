@@ -567,6 +567,7 @@ def build_scoring_config(settings: RuntimeSettings, *, target: str = "maintain")
         "static_weights": s.static_weights,
         "weight_floors": s.weight_floors,
         "harmonic_confidence_floor": s.harmonic_confidence_floor,
+        "key_confidence_threshold": s.key_confidence_threshold,
         "thresholds": s.thresholds,
         "move_types": s.move_types,
         "penalties": s.penalties,

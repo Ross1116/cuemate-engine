@@ -330,6 +330,7 @@ func (s *server) handlePlayedEvent(w http.ResponseWriter, r *http.Request) {
 			req.ChosenTrackID,
 			wasRecommended,
 			string(skippedJSONBytes),
+			playedAt,
 		); err != nil {
 			return err
 		}
@@ -862,9 +863,12 @@ func buildRecommendationsRequest(
 		if hydrated.Stats.EnergySpread != nil {
 			req.PlaylistStats.EnergySpread = hydrated.Stats.EnergySpread
 		}
-		weights, source := effectivePlaylistWeights(hydrated.Stats)
-		if len(weights) > 0 {
-			req.PlaylistStats.AdaptedWeights = weights
+		_, source := effectivePlaylistWeights(hydrated.Stats)
+		if len(hydrated.Stats.AdaptedWeights) > 0 {
+			req.PlaylistStats.AdaptedWeights = copyWeightMap(hydrated.Stats.AdaptedWeights)
+		}
+		if len(hydrated.Stats.FeedbackTunedWeights) > 0 {
+			req.PlaylistStats.FeedbackTunedWeights = copyWeightMap(hydrated.Stats.FeedbackTunedWeights)
 		}
 		req.PlaylistStats.WeightSourceEnum = playlistWeightSourceEnum(source)
 	} else {
@@ -1357,7 +1361,7 @@ func buildFeedbackSummaryRPCRequest(
 	for _, event := range events {
 		pbEvent := &scoringv1.FeedbackSummaryEvent{
 			EventId:              event.ID,
-			Timestamp:            event.Timestamp,
+			Timestamp:            firstNonEmpty(stringValue(event.PlayedAt), event.Timestamp),
 			ChosenWasRecommended: event.ChosenWasRecommended != nil && *event.ChosenWasRecommended,
 			Items:                make([]*scoringv1.FeedbackSummaryEventItem, 0, len(itemsByEvent[event.ID])),
 		}
@@ -1409,7 +1413,7 @@ func translateFeedbackSummaryResponse(resp *scoringv1.GetFeedbackSummaryResponse
 			"higher_scored_lane_skip_counts": int32MapToAnyMap(metrics.GetHigherScoredLaneSkipCounts()),
 		},
 		"weights": map[string]any{
-			"source":    weights.GetSource(),
+			"source":    feedbackSummaryWeightSource(weights.GetSource()),
 			"static":    float64MapToAnyMap(weights.GetStaticWeights()),
 			"base":      float64MapToAnyMap(weights.GetBaseWeights()),
 			"tuned":     nilIfEmptyWeightMap(weights.GetTunedWeights()),
@@ -1421,6 +1425,19 @@ func translateFeedbackSummaryResponse(resp *scoringv1.GetFeedbackSummaryResponse
 			"notes":                append([]string{}, tuning.GetNotes()...),
 			"metrics":              tuningMetrics,
 		},
+	}
+}
+
+func feedbackSummaryWeightSource(source scoringv1.WeightSource) string {
+	switch source {
+	case scoringv1.WeightSource_WEIGHT_SOURCE_FEEDBACK_TUNED:
+		return "feedback_tuned_weights"
+	case scoringv1.WeightSource_WEIGHT_SOURCE_ADAPTED:
+		return "adapted_weights"
+	case scoringv1.WeightSource_WEIGHT_SOURCE_STATIC:
+		return "static"
+	default:
+		return ""
 	}
 }
 

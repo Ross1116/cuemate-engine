@@ -111,6 +111,8 @@ def _playlist_stats_from_proto(message: Any) -> dict[str, Any] | None:
         payload["energy_spread"] = float(message.energy_spread)
     if message.adapted_weights:
         payload["adapted_weights"] = dict(message.adapted_weights)
+    if getattr(message, "feedback_tuned_weights", None):
+        payload["feedback_tuned_weights"] = dict(message.feedback_tuned_weights)
     weight_source = _weight_source_from_proto(message)
     if weight_source:
         payload["weight_source"] = weight_source
@@ -126,6 +128,17 @@ def _weight_source_from_proto(message: Any) -> str:
     if enum_value == 1:
         return "static"
     return ""
+
+
+def _weight_source_enum_from_string(source: Any) -> int:
+    normalized = str(source or "").strip()
+    if normalized == "feedback_tuned_weights":
+        return 3
+    if normalized == "adapted_weights":
+        return 2
+    if normalized == "static":
+        return 1
+    return 0
 
 
 def _active_signatures_payload(settings: Any) -> dict[str, str]:
@@ -415,7 +428,7 @@ def _set_feedback_summary_response(target: Any, payload: dict[str, Any]) -> None
     _copy_int_map(target.metrics.higher_scored_lane_skip_counts, metrics.get("higher_scored_lane_skip_counts", {}))
 
     weights = payload.get("weights", {})
-    target.weights.source = str(weights.get("source", "") or "")
+    target.weights.source = _weight_source_enum_from_string(weights.get("source"))
     _copy_map(target.weights.static_weights, weights.get("static", {}))
     _copy_map(target.weights.base_weights, weights.get("base", {}))
     _copy_map(target.weights.tuned_weights, weights.get("tuned") or {})

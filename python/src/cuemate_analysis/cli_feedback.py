@@ -154,8 +154,10 @@ def handle_run_feedback_worker(args: argparse.Namespace) -> int:
         )
 
     print(f"Processed {len(results)} feedback tuning job(s).")
+    exit_code = 0
     for result in results:
         if result.get("error"):
+            exit_code = 1
             print(f"- job {result['job_id']} playlist={result['playlist_id']} error={result['error']}")
             continue
         print(
@@ -163,4 +165,4 @@ def handle_run_feedback_worker(args: argparse.Namespace) -> int:
             f"applied={result['applied']} events={result['feedback_event_count']} "
             f"pairwise={result['pairwise_comparison_count']}"
         )
-    return 0
+    return exit_code

@@ -165,10 +165,10 @@ def _load_feedback_events(
     params: list[Any] = [playlist_id]
     where = ["playlist_id = ?"]
     if since:
-        where.append("timestamp >= ?")
+        where.append("played_at >= ?")
         params.append(since)
     if until:
-        where.append("timestamp <= ?")
+        where.append("played_at <= ?")
         params.append(until)
     event_rows = database.connection.execute(
         f"""
@@ -182,10 +182,11 @@ def _load_feedback_events(
           chosen_was_recommended,
           skipped_over,
           adapted_weights,
-          timestamp
+          timestamp,
+          played_at
         FROM recommendation_events
         WHERE {' AND '.join(where)}
-        ORDER BY timestamp ASC, id ASC
+        ORDER BY COALESCE(played_at, timestamp) ASC, id ASC
         """,
         params,
     ).fetchall()
@@ -236,7 +237,7 @@ def _load_feedback_events(
                 "risk": str(row["risk"]),
                 "risk_score": float(row["risk_score"]),
                 "primary_lane": str(row["primary_lane"] or row["lane_id"]),
-                "secondary_lane": bool(row["secondary_lane"]),
+                "secondary_lane": row["secondary_lane"],
                 "component_scores": decode_json_object(row["component_scores_json"]),
                 "confidences": decode_json_object(row["confidences_json"]),
                 "weights_used": decode_json_object(row["weights_used_json"]),
@@ -259,12 +260,58 @@ def _load_feedback_events(
                 "chosen_was_recommended": bool(row["chosen_was_recommended"]) if row["chosen_was_recommended"] is not None else False,
                 "skipped_over": decode_json_array(row["skipped_over"]),
                 "adapted_weights": decode_json_object(row["adapted_weights"]),
-                "timestamp": str(row["timestamp"]),
+                "timestamp": str(row["played_at"] or row["timestamp"]),
+                "recommended_at": str(row["timestamp"]),
                 "items": items,
                 "canonical_items": canonicalize_event_items(items),
             }
         )
     return events
+
+
+def _parse_utc_timestamp(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    normalized = text.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _normalize_weights_with_floors(
+    tuned_weights: dict[str, float],
+    floors: Mapping[str, float],
+) -> dict[str, float]:
+    floor_values = {component: float(floors.get(component, 0.0) or 0.0) for component in tuned_weights}
+    for component, floor in floor_values.items():
+        tuned_weights[component] = max(float(tuned_weights.get(component, 0.0) or 0.0), floor)
+
+    floor_sum = sum(floor_values.values())
+    if floor_sum >= 1.0:
+        if floor_sum <= 0:
+            return tuned_weights
+        return {component: floor / floor_sum for component, floor in floor_values.items()}
+
+    remaining = 1.0 - floor_sum
+    excess_values = {
+        component: max(0.0, float(tuned_weights.get(component, 0.0) or 0.0) - floor_values.get(component, 0.0))
+        for component in tuned_weights
+    }
+    excess_sum = sum(excess_values.values())
+    normalized: dict[str, float] = {}
+    if excess_sum <= 0:
+        share = remaining / max(1, len(tuned_weights))
+        for component, floor in floor_values.items():
+            normalized[component] = floor + share
+    else:
+        for component, floor in floor_values.items():
+            normalized[component] = floor + (excess_values[component] / excess_sum) * remaining
+    return normalized
 
 
 def build_feedback_summary(
@@ -308,6 +355,7 @@ def compute_feedback_tuning(
     metrics = dict(summary["metrics"])
     events = list(summary["events"])
     last_tuned_at = summary["tuning"].get("last_tuned_at")
+    parsed_last_tuned_at = _parse_utc_timestamp(last_tuned_at)
 
     component_sums: dict[str, float] = defaultdict(float)
     component_counts: dict[str, int] = defaultdict(int)
@@ -327,7 +375,8 @@ def compute_feedback_tuning(
         if chosen_item is None:
             continue
         contributory_events += 1
-        if last_tuned_at and str(event.get("timestamp") or "") > str(last_tuned_at):
+        parsed_event_ts = _parse_utc_timestamp(event.get("timestamp"))
+        if parsed_last_tuned_at is not None and parsed_event_ts is not None and parsed_event_ts > parsed_last_tuned_at:
             new_contributory_events += 1
         chosen_score = float(chosen_item.get("final_score", 0.0) or 0.0)
         chosen_components = decode_json_object(chosen_item.get("component_scores"))
@@ -368,12 +417,7 @@ def compute_feedback_tuning(
             lower = base_weight * (1.0 - max_component_shift)
             upper = base_weight * (1.0 + max_component_shift)
             tuned_weights[component] = max(lower, min(upper, proposed))
-        floors = settings.scoring.weight_floors
-        for component, floor in floors.items():
-            tuned_weights[component] = max(tuned_weights.get(component, 0.0), float(floor))
-        total = sum(tuned_weights.values())
-        if total > 0:
-            tuned_weights = {component: value / total for component, value in tuned_weights.items()}
+        tuned_weights = _normalize_weights_with_floors(tuned_weights, settings.scoring.weight_floors)
     notes = [
         f"contributory_events={contributory_events}",
         f"pairwise_comparison_count={pairwise_count}",

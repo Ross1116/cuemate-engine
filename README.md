@@ -389,7 +389,26 @@ Start the local scorer and API:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\compile-proto.ps1
+```
+
+Run the scorer and the API in separate terminals because `python -m cuemate_analysis serve-scoring` is a long-running server process.
+
+Terminal 1:
+
+```powershell
 python -m cuemate_analysis serve-scoring --host 127.0.0.1 --port 47834
+```
+
+Terminal 2:
+
+```powershell
+go run ./go/cmd/apiserver
+```
+
+PowerShell background alternative:
+
+```powershell
+Start-Process powershell -ArgumentList '-NoExit','-Command','python -m cuemate_analysis serve-scoring --host 127.0.0.1 --port 47834'
 go run ./go/cmd/apiserver
 ```
 

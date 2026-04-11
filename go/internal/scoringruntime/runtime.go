@@ -83,7 +83,9 @@ func (r *Runtime) GetRecommendations(ctx context.Context, req *scoringv1.GetReco
 	if open, _ := r.State(); open {
 		return nil, ErrCircuitOpen
 	}
-	resp, err := r.client.GetRecommendations(ctx, req)
+	rpcCtx, cancel := context.WithTimeout(ctx, scoringclient.DefaultScoringRPCTimeout)
+	defer cancel()
+	resp, err := r.client.GetRecommendations(rpcCtx, req)
 	if err != nil {
 		if !IsUnimplemented(err) {
 			r.recordFailure(err)
@@ -98,7 +100,9 @@ func (r *Runtime) GetFeedbackSummary(ctx context.Context, req *scoringv1.GetFeed
 	if open, _ := r.State(); open {
 		return nil, ErrCircuitOpen
 	}
-	resp, err := r.client.GetFeedbackSummary(ctx, req)
+	rpcCtx, cancel := context.WithTimeout(ctx, scoringclient.DefaultScoringRPCTimeout)
+	defer cancel()
+	resp, err := r.client.GetFeedbackSummary(rpcCtx, req)
 	if err != nil {
 		if !IsUnimplemented(err) {
 			r.recordFailure(err)

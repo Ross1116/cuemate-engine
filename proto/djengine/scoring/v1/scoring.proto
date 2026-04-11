@@ -65,6 +65,7 @@ enum WeightSource {
 message PlaylistStatsContext {
   optional double energy_spread = 1;
   map<string, double> adapted_weights = 2;
+  map<string, double> feedback_tuned_weights = 3;
   WeightSource weight_source_enum = 4;
 }
 
@@ -301,7 +302,7 @@ message FeedbackSummaryMetrics {
 }
 
 message FeedbackSummaryWeights {
-  string source = 1;
+  WeightSource source = 1;
   map<string, double> static_weights = 2;
   map<string, double> base_weights = 3;
   map<string, double> tuned_weights = 4;

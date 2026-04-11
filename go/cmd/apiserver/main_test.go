@@ -338,7 +338,7 @@ func TestFeedbackSummaryReturnsPlaylistMetrics(t *testing.T) {
 				},
 			},
 			Weights: &scoringv1.FeedbackSummaryWeights{
-				Source:           "adapted_weights",
+				Source:           scoringv1.WeightSource_WEIGHT_SOURCE_ADAPTED,
 				StaticWeights:    map[string]float64{"harmonic": 0.12},
 				BaseWeights:      map[string]float64{"harmonic": 0.14},
 				EffectiveWeights: map[string]float64{"harmonic": 0.14},
@@ -364,6 +364,7 @@ func TestFeedbackSummaryReturnsPlaylistMetrics(t *testing.T) {
 		ChosenWasRecommended:  boolPtr(true),
 		ScoringContractID:     "m3-v1",
 		Timestamp:             "2026-04-10T00:00:00Z",
+		PlayedAt:              stringPtr("2026-04-10T00:00:00Z"),
 	})
 	if err != nil {
 		t.Fatalf("InsertRecommendationEvent() error = %v", err)
@@ -434,7 +435,7 @@ func TestFeedbackSummaryHonorsWindowFilters(t *testing.T) {
 				PairwiseComparisonCount: 1,
 			},
 			Weights: &scoringv1.FeedbackSummaryWeights{
-				Source:           "adapted_weights",
+				Source:           scoringv1.WeightSource_WEIGHT_SOURCE_ADAPTED,
 				StaticWeights:    map[string]float64{"harmonic": 0.12},
 				BaseWeights:      map[string]float64{"harmonic": 0.14},
 				EffectiveWeights: map[string]float64{"harmonic": 0.14},
@@ -464,6 +465,7 @@ func TestFeedbackSummaryHonorsWindowFilters(t *testing.T) {
 			ChosenWasRecommended:  boolPtr(true),
 			ScoringContractID:     "m3-v1",
 			Timestamp:             event.timestamp,
+			PlayedAt:              stringPtr(event.timestamp),
 		})
 		if err != nil {
 			t.Fatalf("InsertRecommendationEvent(%s) error = %v", event.id, err)

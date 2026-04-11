@@ -310,6 +310,8 @@ def handle_analyze_bpm_playlist(args: argparse.Namespace) -> int:
         rows = rows[: args.limit]
 
     payload_rows: list[dict[str, object]] = []
+    fieldname_order: list[str] = []
+    fieldname_seen: set[str] = set()
     diagnostics_estimates: list[TempoEstimate] = []
     total = len(rows)
     if not args.json:
@@ -658,6 +660,10 @@ def handle_analyze_energy_playlist(args: argparse.Namespace) -> int:
             payload["mood_aggressive_abs"] = row["mood_aggressive_abs"]
             payload["mood_party_abs"] = row["mood_party_abs"]
             payload["mood_relaxed_abs"] = row["mood_relaxed_abs"]
+        for key in payload:
+            if key not in fieldname_seen:
+                fieldname_seen.add(key)
+                fieldname_order.append(key)
         payload_rows.append(payload)
         if not args.json:
             title = row["title"] or path.stem
@@ -695,7 +701,7 @@ def handle_analyze_energy_playlist(args: argparse.Namespace) -> int:
     if args.output:
         output_path = Path(args.output).expanduser().resolve()
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        fieldnames = list(payload_rows[0].keys()) if payload_rows else [
+        fieldnames = fieldname_order if payload_rows else [
             "position", "track_id", "title", "artist", "file_path", "stored_energy_abs",
             "baseline", "loudness_fusion", "club_fusion", "pressure_fusion", "consensus",
             "energy_sustained", "energy_peak", "loudness_norm", "loudness_lufs",
@@ -721,6 +727,8 @@ def handle_analyze_essentia_playlist(args: argparse.Namespace) -> int:
         rows = rows[: args.limit]
 
     payload_rows: list[dict[str, object]] = []
+    fieldname_order: list[str] = []
+    fieldname_seen: set[str] = set()
     diagnostics_estimates: list[EssentiaSemanticEstimate] = []
     total = len(rows)
     if not args.json:
@@ -751,6 +759,10 @@ def handle_analyze_essentia_playlist(args: argparse.Namespace) -> int:
                 "energy_essentia_bucket": estimate.energy_essentia_bucket if estimate is not None else None,
                 "notes": [] if estimate is None else estimate.notes,
             }
+            for key in payload:
+                if key not in fieldname_seen:
+                    fieldname_seen.add(key)
+                    fieldname_order.append(key)
             payload_rows.append(payload)
             if not args.json:
                 title = row["title"] or path.stem
@@ -776,7 +788,7 @@ def handle_analyze_essentia_playlist(args: argparse.Namespace) -> int:
     if args.output:
         output_path = Path(args.output).expanduser().resolve()
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        fieldnames = list(payload_rows[0].keys()) if payload_rows else [
+        fieldnames = fieldname_order if payload_rows else [
             "position", "track_id", "title", "artist", "file_path", "available",
             "danceability_abs", "arousal_abs", "valence_abs", "mood_aggressive_abs",
             "mood_party_abs", "mood_relaxed_abs", "energy_essentia_fused", "energy_essentia_bucket", "notes",

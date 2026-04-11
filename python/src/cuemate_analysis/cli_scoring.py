@@ -8,6 +8,18 @@ import cuemate_analysis.cli as _cli
 from cuemate_analysis.feedback_shared import build_feedback_weight_layers
 
 
+def _serialize(obj):
+    from cuemate_analysis.scoring import ScoringTrackContext
+
+    if isinstance(obj, ScoringTrackContext):
+        return obj.track_id
+    if isinstance(obj, dict):
+        return {k: _serialize(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_serialize(i) for i in obj]
+    return obj
+
+
 def handle_recommend_next(args: argparse.Namespace) -> int:
     from cuemate_analysis.config import build_scoring_config
     from cuemate_analysis.scoring import get_recommendations, row_to_scoring_track_context
@@ -53,16 +65,6 @@ def handle_recommend_next(args: argparse.Namespace) -> int:
     )
 
     if args.json:
-        def _serialize(obj):
-            from cuemate_analysis.scoring import ScoringTrackContext
-            if isinstance(obj, ScoringTrackContext):
-                return obj.track_id
-            if isinstance(obj, dict):
-                return {k: _serialize(v) for k, v in obj.items()}
-            if isinstance(obj, list):
-                return [_serialize(i) for i in obj]
-            return obj
-
         print(json.dumps(_serialize(result), indent=2))
         return 0
 
@@ -133,16 +135,6 @@ def handle_score_pair(args: argparse.Namespace) -> int:
     )
 
     if args.json:
-        def _serialize(obj):
-            from cuemate_analysis.scoring import ScoringTrackContext
-            if isinstance(obj, ScoringTrackContext):
-                return obj.track_id
-            if isinstance(obj, dict):
-                return {k: _serialize(v) for k, v in obj.items()}
-            if isinstance(obj, list):
-                return [_serialize(i) for i in obj]
-            return obj
-
         print(json.dumps(_serialize(result), indent=2))
         return 0
 
@@ -302,10 +294,10 @@ def handle_inspect_scoring_metadata(args: argparse.Namespace) -> int:
     print("\n  Components:")
     for component in metadata["components"]:
         available = component.get("available")
-        active = component.get("active")
+        component_active = component.get("active")
         if available is False:
             state = "stubbed"
-        elif active is False:
+        elif component_active is False:
             state = "inactive"
         else:
             state = "active"

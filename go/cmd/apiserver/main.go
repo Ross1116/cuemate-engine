@@ -862,10 +862,15 @@ func buildRecommendationsRequest(
 		if hydrated.Stats.EnergySpread != nil {
 			req.PlaylistStats.EnergySpread = hydrated.Stats.EnergySpread
 		}
-		if weights, source := effectivePlaylistWeights(hydrated.Stats); len(weights) > 0 {
+		weights, source := effectivePlaylistWeights(hydrated.Stats)
+		if len(weights) > 0 {
 			req.PlaylistStats.AdaptedWeights = weights
-			req.PlaylistStats.WeightSource = source
 		}
+		req.PlaylistStats.WeightSource = source
+		req.PlaylistStats.WeightSourceEnum = playlistWeightSourceEnum(source)
+	} else {
+		req.PlaylistStats.WeightSource = "static"
+		req.PlaylistStats.WeightSourceEnum = scoringv1.WeightSource_WEIGHT_SOURCE_STATIC
 	}
 	return req
 }
@@ -1277,22 +1282,11 @@ func (s *server) handleFeedbackSummary(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, translateFeedbackSummaryResponse(rpcResp))
 		return
 	}
-	if !scoringruntime.IsUnavailable(err) && !scoringruntime.IsUnimplemented(err) {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+	if scoringruntime.IsUnavailable(err) {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": scoringruntime.DescribeUnavailable(err)})
 		return
 	}
-
-	log.Printf("feedback summary fallback for playlist %s: %v", playlist.ID, err)
-	metadata, metadataErr := s.runtime.RefreshMetadata(r.Context())
-	if metadataErr != nil {
-		metadata = s.runtime.CachedMetadata()
-	}
-	payload, buildErr := buildFeedbackSummaryFallbackPayload(playlist, events, itemsByEvent, stats, metadata, since, until)
-	if buildErr != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": buildErr.Error()})
-		return
-	}
-	writeJSON(w, http.StatusOK, payload)
+	writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 }
 
 func validateFeedbackSummaryWindow(rawSince, rawUntil string) (string, string, error) {
@@ -1364,10 +1358,10 @@ func buildFeedbackSummaryRPCRequest(
 	req.Events = make([]*scoringv1.FeedbackSummaryEvent, 0, len(events))
 	for _, event := range events {
 		pbEvent := &scoringv1.FeedbackSummaryEvent{
-			EventId:               event.ID,
-			Timestamp:             event.Timestamp,
-			ChosenWasRecommended:  event.ChosenWasRecommended != nil && *event.ChosenWasRecommended,
-			Items:                 make([]*scoringv1.FeedbackSummaryEventItem, 0, len(itemsByEvent[event.ID])),
+			EventId:              event.ID,
+			Timestamp:            event.Timestamp,
+			ChosenWasRecommended: event.ChosenWasRecommended != nil && *event.ChosenWasRecommended,
+			Items:                make([]*scoringv1.FeedbackSummaryEventItem, 0, len(itemsByEvent[event.ID])),
 		}
 		if event.TrackChosen != nil {
 			pbEvent.TrackChosen = *event.TrackChosen
@@ -1432,176 +1426,6 @@ func translateFeedbackSummaryResponse(resp *scoringv1.GetFeedbackSummaryResponse
 	}
 }
 
-func buildFeedbackSummaryFallbackPayload(
-	playlist recommendationsrepo.PlaylistRef,
-	events []recommendationsrepo.RecommendationEventRecord,
-	itemsByEvent map[string][]recommendationsrepo.RecommendationEventItemRecord,
-	stats *recommendationsrepo.PlaylistStats,
-	metadata *scoringv1.GetScoringMetadataResponse,
-	since, until string,
-) (map[string]any, error) {
-	staticWeights := componentWeightsFromMetadata(metadata)
-	baseWeights := map[string]float64{}
-	if len(staticWeights) > 0 {
-		baseWeights = copyWeightMap(staticWeights)
-	}
-	if stats != nil && len(stats.AdaptedWeights) > 0 {
-		baseWeights = copyWeightMap(stats.AdaptedWeights)
-	}
-	var tunedWeights map[string]float64
-	if stats != nil && len(stats.FeedbackTunedWeights) > 0 {
-		tunedWeights = copyWeightMap(stats.FeedbackTunedWeights)
-	}
-	effectiveWeights := baseWeights
-	if tunedWeights != nil {
-		effectiveWeights = copyWeightMap(tunedWeights)
-	}
-	weightSource := playlistWeightSource(stats)
-
-	totalEvents := len(events)
-	contributoryEvents := 0
-	rankedEvents := 0
-	chosenTop1 := 0
-	chosenTop3 := 0
-	chosenTop5 := 0
-	chosenRankTotal := 0.0
-	pairwiseComparisons := 0
-	laneAcceptanceCounts := map[string]int{}
-	higherScoredLaneSkips := map[string]int{}
-
-	for _, event := range events {
-		items := itemsByEvent[event.ID]
-		canonicalItems := canonicalizeRecommendationEventItems(items)
-		chosenTrackID := stringValue(event.TrackChosen)
-		chosenItem := findChosenEventItem(canonicalItems, chosenTrackID)
-		if chosenItem == nil {
-			continue
-		}
-		rankedEvents++
-		chosenRank := 0
-		for idx, item := range canonicalItems {
-			if item.CandidateTrackID == chosenTrackID {
-				chosenRank = idx + 1
-				break
-			}
-		}
-		if chosenRank > 0 {
-			chosenRankTotal += float64(chosenRank)
-			if chosenRank <= 1 {
-				chosenTop1++
-			}
-			if chosenRank <= 3 {
-				chosenTop3++
-			}
-			if chosenRank <= 5 {
-				chosenTop5++
-			}
-		}
-		if event.ChosenWasRecommended == nil || !*event.ChosenWasRecommended {
-			continue
-		}
-		contributoryEvents++
-		chosenLane := firstNonEmpty(stringValue(chosenItem.PrimaryLane), chosenItem.LaneID, "unknown")
-		laneAcceptanceCounts[chosenLane]++
-		chosenScore := chosenItem.FinalScore
-		for _, item := range canonicalItems {
-			if item.FinalScore > chosenScore {
-				pairwiseComparisons++
-			}
-		}
-		bestScoreByLane := map[string]float64{}
-		for _, item := range items {
-			laneID := firstNonEmpty(item.LaneID, stringValue(item.PrimaryLane), "unknown")
-			if current, ok := bestScoreByLane[laneID]; !ok || item.FinalScore > current {
-				bestScoreByLane[laneID] = item.FinalScore
-			}
-		}
-		for laneID, score := range bestScoreByLane {
-			if laneID != chosenLane && score > chosenScore {
-				higherScoredLaneSkips[laneID]++
-			}
-		}
-	}
-
-	topDenominator := totalEvents
-	if topDenominator == 0 {
-		topDenominator = 1
-	}
-	var meanChosenRank any = nil
-	if rankedEvents > 0 {
-		meanChosenRank = roundFloat(chosenRankTotal/float64(rankedEvents), 4)
-	}
-	tuningMetrics := map[string]any{}
-	if stats != nil && len(stats.FeedbackTuningMetrics) > 0 {
-		tuningMetrics = stats.FeedbackTuningMetrics
-	}
-
-	return map[string]any{
-		"playlist_id":   playlist.ID,
-		"playlist_name": playlist.Name,
-		"window": map[string]any{
-			"since": nullIfEmpty(since),
-			"until": nullIfEmpty(until),
-		},
-		"metrics": map[string]any{
-			"total_events":                   totalEvents,
-			"contributory_events":            contributoryEvents,
-			"ranked_events":                  rankedEvents,
-			"pairwise_comparison_count":      pairwiseComparisons,
-			"chosen_top1_rate":               roundFloat(float64(chosenTop1)/float64(topDenominator), 4),
-			"chosen_top3_rate":               roundFloat(float64(chosenTop3)/float64(topDenominator), 4),
-			"chosen_top5_rate":               roundFloat(float64(chosenTop5)/float64(topDenominator), 4),
-			"mean_chosen_rank":               meanChosenRank,
-			"lane_acceptance_counts":         laneAcceptanceCounts,
-			"higher_scored_lane_skip_counts": higherScoredLaneSkips,
-		},
-		"weights": map[string]any{
-			"source":    weightSource,
-			"static":    staticWeights,
-			"base":      baseWeights,
-			"tuned":     tunedWeights,
-			"effective": effectiveWeights,
-		},
-		"tuning": map[string]any{
-			"last_tuned_at":        stringOrNil(statsFieldString(stats, "feedback_last_tuned_at")),
-			"feedback_event_count": statsFieldInt(stats),
-			"notes":                statsFieldNotes(stats),
-			"metrics":              tuningMetrics,
-		},
-	}, nil
-}
-
-func canonicalizeRecommendationEventItems(items []recommendationsrepo.RecommendationEventItemRecord) []recommendationsrepo.RecommendationEventItemRecord {
-	byCandidate := map[string]recommendationsrepo.RecommendationEventItemRecord{}
-	for _, item := range items {
-		existing, ok := byCandidate[item.CandidateTrackID]
-		if !ok || item.FinalScore > existing.FinalScore {
-			byCandidate[item.CandidateTrackID] = item
-		}
-	}
-	out := make([]recommendationsrepo.RecommendationEventItemRecord, 0, len(byCandidate))
-	for _, item := range byCandidate {
-		out = append(out, item)
-	}
-	for i := 0; i < len(out); i++ {
-		for j := i + 1; j < len(out); j++ {
-			if out[j].FinalScore > out[i].FinalScore || (out[j].FinalScore == out[i].FinalScore && out[j].CandidateTrackID < out[i].CandidateTrackID) {
-				out[i], out[j] = out[j], out[i]
-			}
-		}
-	}
-	return out
-}
-
-func findChosenEventItem(items []recommendationsrepo.RecommendationEventItemRecord, chosenTrackID string) *recommendationsrepo.RecommendationEventItemRecord {
-	for idx := range items {
-		if items[idx].CandidateTrackID == chosenTrackID {
-			return &items[idx]
-		}
-	}
-	return nil
-}
-
 func parseCorrectionBPM(value any) (float64, bool) {
 	switch typed := value.(type) {
 	case float64:
@@ -1621,6 +1445,19 @@ func playlistWeightSource(stats *recommendationsrepo.PlaylistStats) string {
 		return "adapted_weights"
 	}
 	return "static"
+}
+
+func playlistWeightSourceEnum(source string) scoringv1.WeightSource {
+	switch strings.TrimSpace(source) {
+	case "feedback_tuned_weights":
+		return scoringv1.WeightSource_WEIGHT_SOURCE_FEEDBACK_TUNED
+	case "adapted_weights":
+		return scoringv1.WeightSource_WEIGHT_SOURCE_ADAPTED
+	case "static":
+		return scoringv1.WeightSource_WEIGHT_SOURCE_STATIC
+	default:
+		return scoringv1.WeightSource_WEIGHT_SOURCE_UNSPECIFIED
+	}
 }
 
 func effectivePlaylistWeights(stats *recommendationsrepo.PlaylistStats) (map[string]float64, string) {
@@ -1645,17 +1482,6 @@ func applyPlaylistWeightSource(payload map[string]any, stats *recommendationsrep
 	source := playlistWeightSource(stats)
 	weightAdaptation["mode"] = source
 	weightAdaptation["source"] = source
-}
-
-func componentWeightsFromMetadata(metadata *scoringv1.GetScoringMetadataResponse) map[string]float64 {
-	out := map[string]float64{}
-	if metadata == nil {
-		return out
-	}
-	for _, component := range metadata.GetComponents() {
-		out[component.GetComponentId()] = component.GetWeight()
-	}
-	return out
 }
 
 func copyWeightMap(source map[string]float64) map[string]float64 {
@@ -1698,17 +1524,6 @@ func nilIfEmptyWeightMap(source map[string]float64) any {
 	return float64MapToAnyMap(source)
 }
 
-func roundFloat(value float64, digits int) float64 {
-	pow := 1.0
-	for i := 0; i < digits; i++ {
-		pow *= 10
-	}
-	if value >= 0 {
-		return float64(int(value*pow+0.5)) / pow
-	}
-	return float64(int(value*pow-0.5)) / pow
-}
-
 func valueOrNil(value *float64) any {
 	if value == nil {
 		return nil
@@ -1724,32 +1539,6 @@ func transitionVocalValue(features *scoringv1.TransitionFeatures, current bool) 
 		return valueOrNil(features.CurrentVocalsRel)
 	}
 	return valueOrNil(features.CandidateVocalsRel)
-}
-
-func statsFieldString(stats *recommendationsrepo.PlaylistStats, field string) *string {
-	if stats == nil {
-		return nil
-	}
-	switch field {
-	case "feedback_last_tuned_at":
-		return stats.FeedbackLastTunedAt
-	default:
-		return nil
-	}
-}
-
-func statsFieldInt(stats *recommendationsrepo.PlaylistStats) int {
-	if stats == nil {
-		return 0
-	}
-	return stats.FeedbackEventCount
-}
-
-func statsFieldNotes(stats *recommendationsrepo.PlaylistStats) []string {
-	if stats == nil {
-		return []string{}
-	}
-	return append([]string{}, stats.FeedbackTuningNotes...)
 }
 
 func parseCorrectionKey(value any) (string, bool) {

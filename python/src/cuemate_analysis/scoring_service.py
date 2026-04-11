@@ -111,10 +111,25 @@ def _playlist_stats_from_proto(message: Any) -> dict[str, Any] | None:
         payload["energy_spread"] = float(message.energy_spread)
     if message.adapted_weights:
         payload["adapted_weights"] = dict(message.adapted_weights)
-    weight_source = str(getattr(message, "weight_source", "") or "")
+    weight_source = _weight_source_from_proto(message)
     if weight_source:
         payload["weight_source"] = weight_source
     return payload or None
+
+
+def _weight_source_from_proto(message: Any) -> str:
+    enum_value = int(getattr(message, "weight_source_enum", 0) or 0)
+    if enum_value == 3:
+        return "feedback_tuned_weights"
+    if enum_value == 2:
+        return "adapted_weights"
+    if enum_value == 1:
+        return "static"
+
+    legacy = str(getattr(message, "weight_source", "") or "").strip()
+    if legacy in {"static", "adapted_weights", "feedback_tuned_weights"}:
+        return legacy
+    return ""
 
 
 def _active_signatures_payload(settings: Any) -> dict[str, str]:

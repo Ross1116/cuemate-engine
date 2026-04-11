@@ -55,10 +55,18 @@ message HistoryEntry {
   optional double elapsed_since_play_seconds = 6;
 }
 
+enum WeightSource {
+  WEIGHT_SOURCE_UNSPECIFIED = 0;
+  WEIGHT_SOURCE_STATIC = 1;
+  WEIGHT_SOURCE_ADAPTED = 2;
+  WEIGHT_SOURCE_FEEDBACK_TUNED = 3;
+}
+
 message PlaylistStatsContext {
   optional double energy_spread = 1;
   map<string, double> adapted_weights = 2;
-  string weight_source = 3;
+  string weight_source = 3 [deprecated = true];
+  WeightSource weight_source_enum = 4;
 }
 
 message LaneGroup {

@@ -333,3 +333,30 @@ def test_service_rejects_missing_signatures(scoring_proto_runtime):
         server.stop(0.5)
 
     assert exc_info.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+
+
+def test_playlist_stats_proto_prefers_weight_source_enum(scoring_proto_runtime):
+    pb2, _ = scoring_proto_runtime
+    from cuemate_analysis.scoring_service import _playlist_stats_from_proto
+
+    message = pb2.PlaylistStatsContext()
+    message.weight_source = "static"
+    message.weight_source_enum = pb2.WEIGHT_SOURCE_FEEDBACK_TUNED
+
+    payload = _playlist_stats_from_proto(message)
+
+    assert payload is not None
+    assert payload["weight_source"] == "feedback_tuned_weights"
+
+
+def test_playlist_stats_proto_falls_back_to_legacy_weight_source(scoring_proto_runtime):
+    pb2, _ = scoring_proto_runtime
+    from cuemate_analysis.scoring_service import _playlist_stats_from_proto
+
+    message = pb2.PlaylistStatsContext()
+    message.weight_source = "adapted_weights"
+
+    payload = _playlist_stats_from_proto(message)
+
+    assert payload is not None
+    assert payload["weight_source"] == "adapted_weights"

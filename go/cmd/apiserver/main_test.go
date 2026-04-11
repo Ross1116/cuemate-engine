@@ -22,12 +22,14 @@ import (
 )
 
 type fakeRuntimeClient struct {
-	metadataResp *scoringv1.GetScoringMetadataResponse
-	metadataErr  error
-	recResp      *scoringv1.GetRecommendationsResponse
-	recErr       error
-	feedbackResp *scoringv1.GetFeedbackSummaryResponse
-	feedbackErr  error
+	metadataResp    *scoringv1.GetScoringMetadataResponse
+	metadataErr     error
+	recResp         *scoringv1.GetRecommendationsResponse
+	recErr          error
+	feedbackResp    *scoringv1.GetFeedbackSummaryResponse
+	feedbackErr     error
+	lastRecReq      *scoringv1.GetRecommendationsRequest
+	lastFeedbackReq *scoringv1.GetFeedbackSummaryRequest
 }
 
 func (f *fakeRuntimeClient) GetScoringMetadata(context.Context, *scoringv1.GetScoringMetadataRequest, ...grpc.CallOption) (*scoringv1.GetScoringMetadataResponse, error) {
@@ -37,14 +39,16 @@ func (f *fakeRuntimeClient) GetScoringMetadata(context.Context, *scoringv1.GetSc
 	return f.metadataResp, nil
 }
 
-func (f *fakeRuntimeClient) GetRecommendations(context.Context, *scoringv1.GetRecommendationsRequest, ...grpc.CallOption) (*scoringv1.GetRecommendationsResponse, error) {
+func (f *fakeRuntimeClient) GetRecommendations(ctx context.Context, req *scoringv1.GetRecommendationsRequest, _ ...grpc.CallOption) (*scoringv1.GetRecommendationsResponse, error) {
+	f.lastRecReq = req
 	if f.recErr != nil {
 		return nil, f.recErr
 	}
 	return f.recResp, nil
 }
 
-func (f *fakeRuntimeClient) GetFeedbackSummary(context.Context, *scoringv1.GetFeedbackSummaryRequest, ...grpc.CallOption) (*scoringv1.GetFeedbackSummaryResponse, error) {
+func (f *fakeRuntimeClient) GetFeedbackSummary(ctx context.Context, req *scoringv1.GetFeedbackSummaryRequest, _ ...grpc.CallOption) (*scoringv1.GetFeedbackSummaryResponse, error) {
+	f.lastFeedbackReq = req
 	if f.feedbackErr != nil {
 		return nil, f.feedbackErr
 	}
@@ -313,9 +317,39 @@ func TestPlayedEventKeepsSinglePendingFeedbackJobPerPlaylist(t *testing.T) {
 }
 
 func TestFeedbackSummaryReturnsPlaylistMetrics(t *testing.T) {
-	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+	client := &fakeRuntimeClient{
 		metadataResp: fakeMetadata("rel_sig_current"),
-	})
+		feedbackResp: &scoringv1.GetFeedbackSummaryResponse{
+			PlaylistId:   "pl_1",
+			PlaylistName: "Test Playlist",
+			Window:       &scoringv1.FeedbackSummaryWindow{},
+			Metrics: &scoringv1.FeedbackSummaryMetrics{
+				TotalEvents:             1,
+				ContributoryEvents:      1,
+				RankedEvents:            1,
+				PairwiseComparisonCount: 1,
+				ChosenTop1Rate:          1.0,
+				ChosenTop3Rate:          1.0,
+				ChosenTop5Rate:          1.0,
+				MeanChosenRank:          float64Ptr(1.0),
+				LaneAcceptanceCounts:    map[string]int32{"reset": 1},
+				HigherScoredLaneSkipCounts: map[string]int32{
+					"build": 1,
+				},
+			},
+			Weights: &scoringv1.FeedbackSummaryWeights{
+				Source:           "adapted_weights",
+				StaticWeights:    map[string]float64{"harmonic": 0.12},
+				BaseWeights:      map[string]float64{"harmonic": 0.14},
+				EffectiveWeights: map[string]float64{"harmonic": 0.14},
+			},
+			Tuning: &scoringv1.FeedbackSummaryTuning{
+				FeedbackEventCount: 1,
+				Notes:              []string{"Warm start"},
+			},
+		},
+	}
+	srv := newTestServer(t, false, "rel_sig_current", client)
 	ctx := context.Background()
 	eventID := "evt_feedback_1"
 	err := srv.repo.InsertRecommendationEvent(ctx, recommendationsrepo.RecommendationEventRecord{
@@ -377,12 +411,38 @@ func TestFeedbackSummaryReturnsPlaylistMetrics(t *testing.T) {
 	if weights["source"] != "adapted_weights" {
 		t.Fatalf("weights source = %#v", weights["source"])
 	}
+	if client.lastFeedbackReq == nil {
+		t.Fatalf("expected feedback summary RPC request to be sent")
+	}
+	if client.lastFeedbackReq.PlaylistId != "pl_1" || len(client.lastFeedbackReq.Events) != 1 {
+		t.Fatalf("feedback request = %#v", client.lastFeedbackReq)
+	}
 }
 
 func TestFeedbackSummaryHonorsWindowFilters(t *testing.T) {
-	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+	client := &fakeRuntimeClient{
 		metadataResp: fakeMetadata("rel_sig_current"),
-	})
+		feedbackResp: &scoringv1.GetFeedbackSummaryResponse{
+			PlaylistId:   "pl_1",
+			PlaylistName: "Test Playlist",
+			Window: &scoringv1.FeedbackSummaryWindow{
+				Since: "2026-04-10T12:00:00Z",
+			},
+			Metrics: &scoringv1.FeedbackSummaryMetrics{
+				TotalEvents:             1,
+				ContributoryEvents:      1,
+				PairwiseComparisonCount: 1,
+			},
+			Weights: &scoringv1.FeedbackSummaryWeights{
+				Source:           "adapted_weights",
+				StaticWeights:    map[string]float64{"harmonic": 0.12},
+				BaseWeights:      map[string]float64{"harmonic": 0.14},
+				EffectiveWeights: map[string]float64{"harmonic": 0.14},
+			},
+			Tuning: &scoringv1.FeedbackSummaryTuning{},
+		},
+	}
+	srv := newTestServer(t, false, "rel_sig_current", client)
 	ctx := context.Background()
 	events := []struct {
 		id        string
@@ -468,6 +528,15 @@ func TestFeedbackSummaryHonorsWindowFilters(t *testing.T) {
 	if metrics["pairwise_comparison_count"] != float64(1) {
 		t.Fatalf("pairwise_comparison_count = %#v", metrics["pairwise_comparison_count"])
 	}
+	if client.lastFeedbackReq == nil || len(client.lastFeedbackReq.Events) != 1 {
+		t.Fatalf("feedback request events = %#v", client.lastFeedbackReq)
+	}
+	if client.lastFeedbackReq.Window.GetSince() != "2026-04-10T12:00:00Z" {
+		t.Fatalf("feedback request window = %#v", client.lastFeedbackReq.Window)
+	}
+	if client.lastFeedbackReq.Events[0].EventId != "evt_new" {
+		t.Fatalf("filtered event = %#v", client.lastFeedbackReq.Events[0])
+	}
 }
 
 func TestFeedbackSummaryRejectsInvalidWindow(t *testing.T) {
@@ -483,6 +552,34 @@ func TestFeedbackSummaryRejectsInvalidWindow(t *testing.T) {
 	}
 }
 
+func TestFeedbackSummaryReturns503OnTransientScorerFailure(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+		feedbackErr:  status.Error(codes.Unavailable, "scorer down"),
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/feedback/summary", bytes.NewBufferString(`{"playlist_name":"Test Playlist"}`))
+	srv.handleFeedbackSummary(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestFeedbackSummaryReturns500OnUnimplemented(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+		feedbackErr:  status.Error(codes.Unimplemented, "not rolled out"),
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/feedback/summary", bytes.NewBufferString(`{"playlist_name":"Test Playlist"}`))
+	srv.handleFeedbackSummary(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestFeedbackSummaryRejectsInvertedWindow(t *testing.T) {
 	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
 		metadataResp: fakeMetadata("rel_sig_current"),
@@ -493,6 +590,38 @@ func TestFeedbackSummaryRejectsInvertedWindow(t *testing.T) {
 	srv.handleFeedbackSummary(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestBuildRecommendationsRequestSetsWeightSourceStringAndEnum(t *testing.T) {
+	energySpread := 0.18
+	bpm := 128.0
+	key := "8A"
+	analysisSig := "m1-ebd25381ebad"
+	configSig := "default"
+	contractID := "m3-v1"
+	hydrated := &recommendationsrepo.HydratedRecommendations{
+		Current: recommendationsrepo.TrackContextRecord{
+			TrackID:                   "trk_current",
+			BPM:                       &bpm,
+			Key:                       &key,
+			EnergyRel:                 &energySpread,
+			AnalysisSignature:         &analysisSig,
+			ConfigSignature:           &configSig,
+			ScoringContractAtAnalysis: &contractID,
+		},
+		Stats: &recommendationsrepo.PlaylistStats{
+			EnergySpread:         &energySpread,
+			FeedbackTunedWeights: map[string]float64{"harmonic": 0.18},
+		},
+	}
+
+	req := buildRecommendationsRequest(hydrated, "maintain", 3)
+	if req.PlaylistStats.GetWeightSource() != "feedback_tuned_weights" {
+		t.Fatalf("weight_source = %q", req.PlaylistStats.GetWeightSource())
+	}
+	if req.PlaylistStats.GetWeightSourceEnum() != scoringv1.WeightSource_WEIGHT_SOURCE_FEEDBACK_TUNED {
+		t.Fatalf("weight_source_enum = %v", req.PlaylistStats.GetWeightSourceEnum())
 	}
 }
 
@@ -826,5 +955,9 @@ func stringPtr(value string) *string {
 }
 
 func boolPtr(value bool) *bool {
+	return &value
+}
+
+func float64Ptr(value float64) *float64 {
 	return &value
 }

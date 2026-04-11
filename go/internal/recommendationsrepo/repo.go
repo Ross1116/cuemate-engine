@@ -1126,7 +1126,7 @@ func (r *Repository) upsertFeedbackTuningJob(
 	}
 	queryer, ok := exec.(queryRowContexter)
 	if !ok {
-		queryer = r.db
+		return 0, fmt.Errorf("feedback tuning job upsert requires query-capable exec context")
 	}
 	row := queryer.QueryRowContext(
 		ctx,

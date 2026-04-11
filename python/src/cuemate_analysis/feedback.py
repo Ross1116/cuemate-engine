@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,137 @@ MAX_COMPONENT_SHIFT = 0.25
 MIN_CONTRIBUTORY_EVENTS = 20
 MIN_PAIRWISE_COMPARISONS = 40
 MIN_NEW_EVENTS_SINCE_LAST_TUNE = 5
+
+
+def build_feedback_summary_from_payload(
+    *,
+    settings: RuntimeSettings,
+    playlist_id: str,
+    playlist_name: str,
+    playlist_stats: dict[str, Any] | None,
+    events: list[dict[str, Any]],
+    since: str | None = None,
+    until: str | None = None,
+) -> dict[str, Any]:
+    normalized_events = normalize_feedback_summary_events(events)
+    weight_layers = build_feedback_weight_layers(playlist_stats, settings)
+
+    total_events = len(normalized_events)
+    contributory_events = 0
+    ranked_events = 0
+    chosen_top1 = 0
+    chosen_top3 = 0
+    chosen_top5 = 0
+    chosen_rank_total = 0.0
+    pairwise_comparison_count = 0
+    lane_acceptance_counts: dict[str, int] = defaultdict(int)
+    higher_scored_lane_skips: dict[str, int] = defaultdict(int)
+
+    for event in normalized_events:
+        canonical_items = list(event["canonical_items"])
+        chosen_track_id = str(event.get("track_chosen") or "")
+        chosen_item = next(
+            (item for item in canonical_items if str(item.get("candidate_track_id") or "") == chosen_track_id),
+            None,
+        )
+        if chosen_item is None:
+            continue
+        ranked_events += 1
+        chosen_rank = next(
+            (
+                index
+                for index, item in enumerate(canonical_items, start=1)
+                if str(item.get("candidate_track_id") or "") == chosen_track_id
+            ),
+            None,
+        )
+        if chosen_rank is not None:
+            chosen_rank_total += float(chosen_rank)
+            if chosen_rank <= 1:
+                chosen_top1 += 1
+            if chosen_rank <= 3:
+                chosen_top3 += 1
+            if chosen_rank <= 5:
+                chosen_top5 += 1
+
+        if not bool(event.get("chosen_was_recommended")):
+            continue
+        contributory_events += 1
+        chosen_lane = str(chosen_item.get("primary_lane") or chosen_item.get("lane_id") or "unknown")
+        lane_acceptance_counts[chosen_lane] += 1
+        chosen_score = float(chosen_item.get("final_score", 0.0) or 0.0)
+        pairwise_comparison_count += sum(
+            1
+            for item in canonical_items
+            if float(item.get("final_score", 0.0) or 0.0) > chosen_score
+        )
+
+        best_score_by_lane: dict[str, float] = {}
+        for item in event["items"]:
+            lane_id = str(item.get("lane_id") or item.get("primary_lane") or "unknown")
+            score = float(item.get("final_score", 0.0) or 0.0)
+            best_score_by_lane[lane_id] = max(best_score_by_lane.get(lane_id, score), score)
+        for lane_id, lane_score in best_score_by_lane.items():
+            if lane_id != chosen_lane and lane_score > chosen_score:
+                higher_scored_lane_skips[lane_id] += 1
+
+    top_denominator = total_events if total_events > 0 else 1
+    mean_chosen_rank = (chosen_rank_total / ranked_events) if ranked_events > 0 else None
+    feedback_metrics = (playlist_stats or {}).get("feedback_tuning_metrics") or {}
+    return {
+        "playlist_id": playlist_id,
+        "playlist_name": playlist_name,
+        "window": {"since": since, "until": until},
+        "metrics": {
+            "total_events": total_events,
+            "contributory_events": contributory_events,
+            "ranked_events": ranked_events,
+            "pairwise_comparison_count": pairwise_comparison_count,
+            "chosen_top1_rate": round(chosen_top1 / top_denominator, 4),
+            "chosen_top3_rate": round(chosen_top3 / top_denominator, 4),
+            "chosen_top5_rate": round(chosen_top5 / top_denominator, 4),
+            "mean_chosen_rank": None if mean_chosen_rank is None else round(mean_chosen_rank, 4),
+            "lane_acceptance_counts": dict(sorted(lane_acceptance_counts.items())),
+            "higher_scored_lane_skip_counts": dict(sorted(higher_scored_lane_skips.items())),
+        },
+        "weights": {
+            **weight_layers,
+        },
+        "tuning": {
+            "last_tuned_at": (playlist_stats or {}).get("feedback_last_tuned_at"),
+            "feedback_event_count": int((playlist_stats or {}).get("feedback_event_count") or 0),
+            "notes": list((playlist_stats or {}).get("feedback_tuning_notes") or []),
+            "metrics": feedback_metrics,
+        },
+        "events": normalized_events,
+    }
+
+
+def normalize_feedback_summary_events(events: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    normalized_events: list[dict[str, Any]] = []
+    for event in events or []:
+        items_payload = event.get("items")
+        items: list[dict[str, Any]] = []
+        if isinstance(items_payload, list):
+            for item in items_payload:
+                if isinstance(item, Mapping):
+                    items.append(dict(item))
+        canonical_payload = event.get("canonical_items")
+        if isinstance(canonical_payload, list):
+            canonical_items = [dict(item) for item in canonical_payload if isinstance(item, Mapping)]
+        else:
+            canonical_items = canonicalize_event_items(items)
+        normalized_events.append(
+            {
+                **dict(event),
+                "items": items,
+                "canonical_items": canonical_items,
+                "track_chosen": None if event.get("track_chosen") is None else str(event.get("track_chosen") or ""),
+                "chosen_was_recommended": bool(event.get("chosen_was_recommended")),
+                "timestamp": None if event.get("timestamp") is None else str(event.get("timestamp") or ""),
+            }
+        )
+    return normalized_events
 
 
 def _load_feedback_events(
@@ -144,98 +276,16 @@ def build_feedback_summary(
     until: str | None = None,
 ) -> dict[str, Any]:
     playlist_stats = database.get_playlist_stats_for_scoring(playlist_id)
-    weight_layers = build_feedback_weight_layers(playlist_stats, settings)
-
     events = _load_feedback_events(database, playlist_id, since=since, until=until)
-    total_events = len(events)
-    contributory_events = 0
-    ranked_events = 0
-    chosen_top1 = 0
-    chosen_top3 = 0
-    chosen_top5 = 0
-    chosen_rank_total = 0.0
-    pairwise_comparison_count = 0
-    lane_acceptance_counts: dict[str, int] = defaultdict(int)
-    higher_scored_lane_skips: dict[str, int] = defaultdict(int)
-
-    for event in events:
-        canonical_items = list(event["canonical_items"])
-        chosen_track_id = str(event.get("track_chosen") or "")
-        chosen_item = next(
-            (item for item in canonical_items if str(item.get("candidate_track_id") or "") == chosen_track_id),
-            None,
-        )
-        if chosen_item is None:
-            continue
-        ranked_events += 1
-        chosen_rank = next(
-            (
-                index
-                for index, item in enumerate(canonical_items, start=1)
-                if str(item.get("candidate_track_id") or "") == chosen_track_id
-            ),
-            None,
-        )
-        if chosen_rank is not None:
-            chosen_rank_total += float(chosen_rank)
-            if chosen_rank <= 1:
-                chosen_top1 += 1
-            if chosen_rank <= 3:
-                chosen_top3 += 1
-            if chosen_rank <= 5:
-                chosen_top5 += 1
-
-        if not bool(event.get("chosen_was_recommended")):
-            continue
-        contributory_events += 1
-        chosen_lane = str(chosen_item.get("primary_lane") or chosen_item.get("lane_id") or "unknown")
-        lane_acceptance_counts[chosen_lane] += 1
-        chosen_score = float(chosen_item.get("final_score", 0.0) or 0.0)
-        pairwise_comparison_count += sum(
-            1
-            for item in canonical_items
-            if float(item.get("final_score", 0.0) or 0.0) > chosen_score
-        )
-
-        best_score_by_lane: dict[str, float] = {}
-        for item in event["items"]:
-            lane_id = str(item.get("lane_id") or item.get("primary_lane") or "unknown")
-            score = float(item.get("final_score", 0.0) or 0.0)
-            best_score_by_lane[lane_id] = max(best_score_by_lane.get(lane_id, score), score)
-        for lane_id, lane_score in best_score_by_lane.items():
-            if lane_id != chosen_lane and lane_score > chosen_score:
-                higher_scored_lane_skips[lane_id] += 1
-
-    top_denominator = total_events if total_events > 0 else 1
-    mean_chosen_rank = (chosen_rank_total / ranked_events) if ranked_events > 0 else None
-    feedback_metrics = (playlist_stats or {}).get("feedback_tuning_metrics") or {}
-    return {
-        "playlist_id": playlist_id,
-        "playlist_name": playlist_name,
-        "window": {"since": since, "until": until},
-        "metrics": {
-            "total_events": total_events,
-            "contributory_events": contributory_events,
-            "ranked_events": ranked_events,
-            "pairwise_comparison_count": pairwise_comparison_count,
-            "chosen_top1_rate": round(chosen_top1 / top_denominator, 4),
-            "chosen_top3_rate": round(chosen_top3 / top_denominator, 4),
-            "chosen_top5_rate": round(chosen_top5 / top_denominator, 4),
-            "mean_chosen_rank": None if mean_chosen_rank is None else round(mean_chosen_rank, 4),
-            "lane_acceptance_counts": dict(sorted(lane_acceptance_counts.items())),
-            "higher_scored_lane_skip_counts": dict(sorted(higher_scored_lane_skips.items())),
-        },
-        "weights": {
-            **weight_layers,
-        },
-        "tuning": {
-            "last_tuned_at": (playlist_stats or {}).get("feedback_last_tuned_at"),
-            "feedback_event_count": int((playlist_stats or {}).get("feedback_event_count") or 0),
-            "notes": list((playlist_stats or {}).get("feedback_tuning_notes") or []),
-            "metrics": feedback_metrics,
-        },
-        "events": events,
-    }
+    return build_feedback_summary_from_payload(
+        settings=settings,
+        playlist_id=playlist_id,
+        playlist_name=playlist_name,
+        playlist_stats=playlist_stats,
+        events=events,
+        since=since,
+        until=until,
+    )
 
 
 def compute_feedback_tuning(

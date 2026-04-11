@@ -31,6 +31,7 @@ type Client interface {
 	GetScoringMetadata(ctx context.Context, req *scoringv1.GetScoringMetadataRequest, opts ...grpc.CallOption) (*scoringv1.GetScoringMetadataResponse, error)
 	ScoreCandidate(ctx context.Context, req *scoringv1.ScoreCandidateRequest, opts ...grpc.CallOption) (*scoringv1.ScoreCandidateResponse, error)
 	GetRecommendations(ctx context.Context, req *scoringv1.GetRecommendationsRequest, opts ...grpc.CallOption) (*scoringv1.GetRecommendationsResponse, error)
+	GetFeedbackSummary(ctx context.Context, req *scoringv1.GetFeedbackSummaryRequest, opts ...grpc.CallOption) (*scoringv1.GetFeedbackSummaryResponse, error)
 	Close() error
 }
 
@@ -118,6 +119,13 @@ func (c *grpcClient) GetRecommendations(ctx context.Context, req *scoringv1.GetR
 	ctx, cancel := c.withTimeout(ctx)
 	defer cancel()
 	resp, err := c.client.GetRecommendations(ctx, req, opts...)
+	return resp, mapRPCError(err)
+}
+
+func (c *grpcClient) GetFeedbackSummary(ctx context.Context, req *scoringv1.GetFeedbackSummaryRequest, opts ...grpc.CallOption) (*scoringv1.GetFeedbackSummaryResponse, error) {
+	ctx, cancel := c.withTimeout(ctx)
+	defer cancel()
+	resp, err := c.client.GetFeedbackSummary(ctx, req, opts...)
 	return resp, mapRPCError(err)
 }
 

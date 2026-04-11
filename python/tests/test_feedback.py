@@ -278,3 +278,64 @@ def test_feedback_weight_layers_match_expected_precedence(tmp_path: Path):
     assert layers["base"]["harmonic"] == 0.12
     assert layers["tuned"]["harmonic"] > layers["base"]["harmonic"]
     assert layers["effective"]["harmonic"] == 0.20
+
+
+def test_cli_clear_analysis_queue_removes_pending_only_by_default(tmp_path: Path, monkeypatch, capsys):
+    settings = replace(load_runtime_settings(), database_path=tmp_path / "feedback.db")
+    with _seed_feedback_db(tmp_path) as database:
+        database.connection.executescript(
+            """
+            INSERT INTO analysis_jobs (
+              playlist_id, track_id, track_path, job_kind, status, priority, analysis_mode,
+              analysis_signature, config_signature, source_file_hash, created_at
+            ) VALUES
+              ('pl_1', 'trk_a', '/music/a.flac', 'enrichment', 'pending', 10, 'staged', 'm1-test', 'default', 'hash_a', '2026-04-10T01:00:00Z'),
+              ('pl_1', 'trk_b', '/music/b.flac', 'fast_pass', 'pending', 5, 'fast_pass', 'm1-test', 'default', 'hash_b', '2026-04-10T01:05:00Z'),
+              ('pl_1', 'trk_current', '/music/current.flac', 'enrichment', 'running', 9, 'staged', 'm1-test', 'default', 'hash_current', '2026-04-10T01:10:00Z');
+            """
+        )
+        database.connection.commit()
+
+    monkeypatch.setattr("cuemate_analysis.cli.load_runtime_settings", lambda: settings)
+
+    assert main(["clear-analysis-queue", "--job-kind", "enrichment"]) == 0
+    output = capsys.readouterr().out
+    assert "Removed 1 analysis job(s)" in output
+
+    with Database(settings.database_path) as database:
+        remaining = database.connection.execute(
+            "SELECT job_kind, status FROM analysis_jobs ORDER BY created_at ASC"
+        ).fetchall()
+
+    assert [(row["job_kind"], row["status"]) for row in remaining] == [
+        ("fast_pass", "pending"),
+        ("enrichment", "running"),
+    ]
+
+
+def test_cli_clear_analysis_queue_can_include_running_jobs(tmp_path: Path, monkeypatch, capsys):
+    settings = replace(load_runtime_settings(), database_path=tmp_path / "feedback.db")
+    with _seed_feedback_db(tmp_path) as database:
+        database.connection.executescript(
+            """
+            INSERT INTO analysis_jobs (
+              playlist_id, track_id, track_path, job_kind, status, priority, analysis_mode,
+              analysis_signature, config_signature, source_file_hash, created_at
+            ) VALUES
+              ('pl_1', 'trk_a', '/music/a.flac', 'enrichment', 'pending', 10, 'staged', 'm1-test', 'default', 'hash_a', '2026-04-10T01:00:00Z'),
+              ('pl_1', 'trk_current', '/music/current.flac', 'enrichment', 'running', 9, 'staged', 'm1-test', 'default', 'hash_current', '2026-04-10T01:10:00Z');
+            """
+        )
+        database.connection.commit()
+
+    monkeypatch.setattr("cuemate_analysis.cli.load_runtime_settings", lambda: settings)
+
+    assert main(["clear-analysis-queue", "--job-kind", "enrichment", "--include-running"]) == 0
+    output = capsys.readouterr().out
+    assert "Removed 2 analysis job(s)" in output
+    assert "Running jobs were included" in output
+
+    with Database(settings.database_path) as database:
+        remaining = database.connection.execute("SELECT COUNT(*) FROM analysis_jobs").fetchone()[0]
+
+    assert remaining == 0

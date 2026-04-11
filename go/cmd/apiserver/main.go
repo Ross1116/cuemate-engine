@@ -18,6 +18,7 @@ import (
 	"github.com/Ross1116/cuemate-engine/go/internal/recommendationsrepo"
 	"github.com/Ross1116/cuemate-engine/go/internal/scoringruntime"
 	"github.com/google/uuid"
+	"google.golang.org/protobuf/types/known/structpb"
 )
 
 const (
@@ -1261,19 +1262,141 @@ func (s *server) handleFeedbackSummary(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	metadata, err := s.runtime.RefreshMetadata(r.Context())
-	if err != nil {
-		metadata = s.runtime.CachedMetadata()
-	}
-	payload, err := buildFeedbackSummaryPayload(playlist, events, itemsByEvent, stats, metadata, req.Since, req.Until)
+	rpcReq, err := buildFeedbackSummaryRPCRequest(playlist, events, itemsByEvent, stats, req.Since, req.Until)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	rpcResp, err := s.runtime.GetFeedbackSummary(r.Context(), rpcReq)
+	if err == nil {
+		writeJSON(w, http.StatusOK, translateFeedbackSummaryResponse(rpcResp))
+		return
+	}
+	if !scoringruntime.IsUnavailable(err) && !scoringruntime.IsUnimplemented(err) {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	log.Printf("feedback summary fallback for playlist %s: %v", playlist.ID, err)
+	metadata, metadataErr := s.runtime.RefreshMetadata(r.Context())
+	if metadataErr != nil {
+		metadata = s.runtime.CachedMetadata()
+	}
+	payload, buildErr := buildFeedbackSummaryFallbackPayload(playlist, events, itemsByEvent, stats, metadata, req.Since, req.Until)
+	if buildErr != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": buildErr.Error()})
 		return
 	}
 	writeJSON(w, http.StatusOK, payload)
 }
 
-func buildFeedbackSummaryPayload(
+func buildFeedbackSummaryRPCRequest(
+	playlist recommendationsrepo.PlaylistRef,
+	events []recommendationsrepo.RecommendationEventRecord,
+	itemsByEvent map[string][]recommendationsrepo.RecommendationEventItemRecord,
+	stats *recommendationsrepo.PlaylistStats,
+	since, until string,
+) (*scoringv1.GetFeedbackSummaryRequest, error) {
+	req := &scoringv1.GetFeedbackSummaryRequest{
+		PlaylistId:   playlist.ID,
+		PlaylistName: playlist.Name,
+		Window: &scoringv1.FeedbackSummaryWindow{
+			Since: since,
+			Until: until,
+		},
+		PlaylistStats: &scoringv1.FeedbackSummaryPlaylistStats{
+			AdaptedWeights:       map[string]float64{},
+			FeedbackTunedWeights: map[string]float64{},
+		},
+	}
+	if stats != nil {
+		req.PlaylistStats.AdaptedWeights = copyWeightMap(stats.AdaptedWeights)
+		req.PlaylistStats.FeedbackTunedWeights = copyWeightMap(stats.FeedbackTunedWeights)
+		req.PlaylistStats.FeedbackTuningNotes = append([]string{}, stats.FeedbackTuningNotes...)
+		req.PlaylistStats.FeedbackEventCount = int32(stats.FeedbackEventCount)
+		if stats.FeedbackLastTunedAt != nil {
+			req.PlaylistStats.FeedbackLastTunedAt = *stats.FeedbackLastTunedAt
+		}
+		if len(stats.FeedbackTuningMetrics) > 0 {
+			metrics, err := structpb.NewStruct(stats.FeedbackTuningMetrics)
+			if err != nil {
+				return nil, err
+			}
+			req.PlaylistStats.FeedbackTuningMetrics = metrics
+		}
+	}
+	req.Events = make([]*scoringv1.FeedbackSummaryEvent, 0, len(events))
+	for _, event := range events {
+		pbEvent := &scoringv1.FeedbackSummaryEvent{
+			EventId:               event.ID,
+			Timestamp:             event.Timestamp,
+			ChosenWasRecommended:  event.ChosenWasRecommended != nil && *event.ChosenWasRecommended,
+			Items:                 make([]*scoringv1.FeedbackSummaryEventItem, 0, len(itemsByEvent[event.ID])),
+		}
+		if event.TrackChosen != nil {
+			pbEvent.TrackChosen = *event.TrackChosen
+		}
+		for _, item := range itemsByEvent[event.ID] {
+			pbEvent.Items = append(pbEvent.Items, &scoringv1.FeedbackSummaryEventItem{
+				CandidateTrackId: item.CandidateTrackID,
+				FinalScore:       item.FinalScore,
+				LaneId:           item.LaneID,
+				PrimaryLane:      firstNonEmpty(stringValue(item.PrimaryLane), item.LaneID),
+			})
+		}
+		req.Events = append(req.Events, pbEvent)
+	}
+	return req, nil
+}
+
+func translateFeedbackSummaryResponse(resp *scoringv1.GetFeedbackSummaryResponse) map[string]any {
+	metrics := resp.GetMetrics()
+	weights := resp.GetWeights()
+	tuning := resp.GetTuning()
+	var meanChosenRank any
+	if metrics != nil && metrics.MeanChosenRank != nil {
+		meanChosenRank = metrics.GetMeanChosenRank()
+	}
+	tuningMetrics := map[string]any{}
+	if tuning != nil && tuning.GetMetrics() != nil {
+		tuningMetrics = tuning.GetMetrics().AsMap()
+	}
+	return map[string]any{
+		"playlist_id":   resp.GetPlaylistId(),
+		"playlist_name": resp.GetPlaylistName(),
+		"window": map[string]any{
+			"since": nullIfEmpty(resp.GetWindow().GetSince()),
+			"until": nullIfEmpty(resp.GetWindow().GetUntil()),
+		},
+		"metrics": map[string]any{
+			"total_events":                   metrics.GetTotalEvents(),
+			"contributory_events":            metrics.GetContributoryEvents(),
+			"ranked_events":                  metrics.GetRankedEvents(),
+			"pairwise_comparison_count":      metrics.GetPairwiseComparisonCount(),
+			"chosen_top1_rate":               metrics.GetChosenTop1Rate(),
+			"chosen_top3_rate":               metrics.GetChosenTop3Rate(),
+			"chosen_top5_rate":               metrics.GetChosenTop5Rate(),
+			"mean_chosen_rank":               meanChosenRank,
+			"lane_acceptance_counts":         int32MapToAnyMap(metrics.GetLaneAcceptanceCounts()),
+			"higher_scored_lane_skip_counts": int32MapToAnyMap(metrics.GetHigherScoredLaneSkipCounts()),
+		},
+		"weights": map[string]any{
+			"source":    weights.GetSource(),
+			"static":    float64MapToAnyMap(weights.GetStaticWeights()),
+			"base":      float64MapToAnyMap(weights.GetBaseWeights()),
+			"tuned":     nilIfEmptyWeightMap(weights.GetTunedWeights()),
+			"effective": float64MapToAnyMap(weights.GetEffectiveWeights()),
+		},
+		"tuning": map[string]any{
+			"last_tuned_at":        nullIfEmpty(tuning.GetLastTunedAt()),
+			"feedback_event_count": tuning.GetFeedbackEventCount(),
+			"notes":                append([]string{}, tuning.GetNotes()...),
+			"metrics":              tuningMetrics,
+		},
+	}
+}
+
+func buildFeedbackSummaryFallbackPayload(
 	playlist recommendationsrepo.PlaylistRef,
 	events []recommendationsrepo.RecommendationEventRecord,
 	itemsByEvent map[string][]recommendationsrepo.RecommendationEventItemRecord,
@@ -1508,6 +1631,35 @@ func copyWeightMap(source map[string]float64) map[string]float64 {
 		out[key] = value
 	}
 	return out
+}
+
+func float64MapToAnyMap(source map[string]float64) map[string]any {
+	if len(source) == 0 {
+		return map[string]any{}
+	}
+	out := make(map[string]any, len(source))
+	for key, value := range source {
+		out[key] = value
+	}
+	return out
+}
+
+func int32MapToAnyMap(source map[string]int32) map[string]any {
+	if len(source) == 0 {
+		return map[string]any{}
+	}
+	out := make(map[string]any, len(source))
+	for key, value := range source {
+		out[key] = value
+	}
+	return out
+}
+
+func nilIfEmptyWeightMap(source map[string]float64) any {
+	if len(source) == 0 {
+		return nil
+	}
+	return float64MapToAnyMap(source)
 }
 
 func roundFloat(value float64, digits int) float64 {

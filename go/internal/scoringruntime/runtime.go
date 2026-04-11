@@ -20,6 +20,7 @@ var (
 type Client interface {
 	GetScoringMetadata(ctx context.Context, req *scoringv1.GetScoringMetadataRequest, opts ...grpc.CallOption) (*scoringv1.GetScoringMetadataResponse, error)
 	GetRecommendations(ctx context.Context, req *scoringv1.GetRecommendationsRequest, opts ...grpc.CallOption) (*scoringv1.GetRecommendationsResponse, error)
+	GetFeedbackSummary(ctx context.Context, req *scoringv1.GetFeedbackSummaryRequest, opts ...grpc.CallOption) (*scoringv1.GetFeedbackSummaryResponse, error)
 	Close() error
 }
 
@@ -91,6 +92,19 @@ func (r *Runtime) GetRecommendations(ctx context.Context, req *scoringv1.GetReco
 	return resp, nil
 }
 
+func (r *Runtime) GetFeedbackSummary(ctx context.Context, req *scoringv1.GetFeedbackSummaryRequest) (*scoringv1.GetFeedbackSummaryResponse, error) {
+	if open, _ := r.State(); open {
+		return nil, ErrCircuitOpen
+	}
+	resp, err := r.client.GetFeedbackSummary(ctx, req)
+	if err != nil {
+		r.recordFailure(err)
+		return nil, err
+	}
+	r.resetFailures()
+	return resp, nil
+}
+
 func (r *Runtime) recordSuccess(resp *scoringv1.GetScoringMetadataResponse) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -141,6 +155,14 @@ func IsUnavailable(err error) bool {
 	default:
 		return false
 	}
+}
+
+func IsUnimplemented(err error) bool {
+	st, ok := status.FromError(err)
+	if !ok || st == nil {
+		return false
+	}
+	return st.Code() == codes.Unimplemented
 }
 
 func DescribeUnavailable(err error) string {

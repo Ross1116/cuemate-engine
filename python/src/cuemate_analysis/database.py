@@ -624,6 +624,25 @@ class Database:
             (limit,),
         ).fetchall()
 
+    def clear_analysis_jobs(
+        self,
+        *,
+        statuses: Iterable[str],
+        job_kind: str | None = None,
+    ) -> int:
+        status_list = [str(status).strip() for status in statuses if str(status).strip()]
+        if not status_list:
+            return 0
+        placeholders = ", ".join("?" for _ in status_list)
+        params: list[Any] = list(status_list)
+        query = f"DELETE FROM analysis_jobs WHERE status IN ({placeholders})"
+        if job_kind is not None:
+            query += " AND job_kind = ?"
+            params.append(job_kind)
+        with self.connection:
+            cursor = self.connection.execute(query, params)
+        return int(cursor.rowcount)
+
     # ------------------------------------------------------------------
     # Canonical relative persistence (Phase 2)
     # ------------------------------------------------------------------

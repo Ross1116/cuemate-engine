@@ -49,7 +49,7 @@ From the repository root:
 python -m pip install --user -e ".\python[dev]"
 ```
 
-Build the local TempoCNN Docker image used by the primary BPM backend:
+Build the shared TensorFlow/Essentia Docker image used by the primary BPM backend. The TempoCNN build helper now delegates to this shared image:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\build-tempocnn-image.ps1
@@ -61,13 +61,13 @@ Build the local MusicalKeyCNN Docker image used by the primary key backend:
 powershell -ExecutionPolicy Bypass -File .\scripts\build-musicalkeycnn-image.ps1
 ```
 
-Build the local Essentia semantics Docker image used by the semantic absolute-feature lane:
+Build the same shared TensorFlow/Essentia Docker image through the Essentia-specific helper:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\build-essentia-semantics-image.ps1
 ```
 
-Optional: warm-start the persistent TempoCNN service container yourself. The CLI will auto-start it on demand too.
+Optional: warm-start the shared TensorFlow/Essentia service through the TempoCNN alias helper. The CLI will auto-start it on demand too.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\start-tempocnn-service.ps1
@@ -79,7 +79,7 @@ Optional: warm-start the persistent MusicalKeyCNN service container yourself. Th
 powershell -ExecutionPolicy Bypass -File .\scripts\start-musicalkeycnn-service.ps1
 ```
 
-Optional: warm-start the persistent Essentia semantics service container yourself. The CLI will auto-start it on demand too.
+Optional: warm-start the same shared TensorFlow/Essentia service through the Essentia-specific helper. The CLI will auto-start it on demand too.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\start-essentia-semantics-service.ps1
@@ -87,6 +87,13 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-essentia-semantics-serv
 
 The default TempoCNN graph expected by the CLI lives at `python/models/essentia/deepsquare-k16-3.pb`. Override it with `CUEMATE_TEMPOCNN_MODEL` or `--tempocnn-model` if you want to compare a different `.pb` model.
 The default MusicalKeyCNN checkpoint expected by the CLI lives at `python/models/musicalkeycnn/keynet.pt`. Override it with `CUEMATE_MUSICALKEYCNN_MODEL` or `--musicalkeycnn-model` if you want to compare a different checkpoint.
+
+Current runtime topology:
+
+- one shared TensorFlow/Essentia service for TempoCNN BPM and Essentia semantic inference
+- one separate PyTorch service for MusicalKeyCNN key inference
+
+The `tempocnn` image/start helpers remain for compatibility and discoverability, but they no longer represent a third independent warm service container.
 
 ## CLI entrypoints
 
@@ -140,13 +147,13 @@ Important notes:
 - `serve-scoring` runs the local gRPC scorer after the protobuf contract has been compiled
 - treat vocal-related weights and diagnostics as placeholders for now: `vocal_transition` is stubbed, and `vocals_abs` / `vocals_rel` are currently unavailable in analysis output
 - if TempoCNN is unavailable for a track, analysis falls back to the current librosa baseline automatically and records `baseline_fallback` as the source
-- TempoCNN now runs through Docker and will try GPU before falling back to CPU
+- TempoCNN now runs through the shared TensorFlow/Essentia Docker service and will try GPU before falling back to CPU
 - TempoCNN now handles BPM only; key extraction is no longer part of the TempoCNN container path
 - MusicalKeyCNN now runs through its own warm Docker service and is independent from the TempoCNN worker
 - MusicalKeyCNN now defaults to `full_track`
 - if MusicalKeyCNN is unavailable for a track, analysis now falls back to a tagged key only when one exists
-- repeated requests now go through warm TempoCNN and MusicalKeyCNN service containers when possible
-- the Essentia semantic lane uses the same shared TensorFlow/Essentia warm Docker service as TempoCNN (TempoCNN aliases into that shared service - there is a single shared container, not two)
+- repeated requests now go through the shared TensorFlow/Essentia service and the separate MusicalKeyCNN service when possible
+- the Essentia semantic lane uses the same shared TensorFlow/Essentia warm Docker service as TempoCNN; there is a single shared container for those two paths, not two separate warm services
 - repeated requests for unchanged files are cached inside those warm services, so reruns are much faster than the first pass
 - those persistent model caches are also stored in `data/inference-cache.db`, and `purge-model-cache` clears both the persistent rows and the warm service state
 - playlist analysis batches TempoCNN tracks through the warm service so the model stays loaded

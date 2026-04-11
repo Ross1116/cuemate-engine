@@ -26,6 +26,8 @@ type fakeRuntimeClient struct {
 	metadataErr  error
 	recResp      *scoringv1.GetRecommendationsResponse
 	recErr       error
+	feedbackResp *scoringv1.GetFeedbackSummaryResponse
+	feedbackErr  error
 }
 
 func (f *fakeRuntimeClient) GetScoringMetadata(context.Context, *scoringv1.GetScoringMetadataRequest, ...grpc.CallOption) (*scoringv1.GetScoringMetadataResponse, error) {
@@ -40,6 +42,16 @@ func (f *fakeRuntimeClient) GetRecommendations(context.Context, *scoringv1.GetRe
 		return nil, f.recErr
 	}
 	return f.recResp, nil
+}
+
+func (f *fakeRuntimeClient) GetFeedbackSummary(context.Context, *scoringv1.GetFeedbackSummaryRequest, ...grpc.CallOption) (*scoringv1.GetFeedbackSummaryResponse, error) {
+	if f.feedbackErr != nil {
+		return nil, f.feedbackErr
+	}
+	if f.feedbackResp == nil {
+		return nil, status.Error(codes.Unimplemented, "feedback summary rpc not configured in fake runtime")
+	}
+	return f.feedbackResp, nil
 }
 
 func (f *fakeRuntimeClient) Close() error { return nil }

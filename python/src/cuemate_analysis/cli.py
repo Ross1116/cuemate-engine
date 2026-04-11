@@ -970,6 +970,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print backend diagnostics after processing jobs.",
     )
 
+    clear_analysis_queue_parser = subparsers.add_parser(
+        "clear-analysis-queue",
+        help="Remove queued analysis jobs from the local analysis queue.",
+    )
+    clear_analysis_queue_parser.add_argument(
+        "--include-running",
+        action="store_true",
+        help="Also remove jobs currently marked as running. Use this for stale/stuck workers only.",
+    )
+    clear_analysis_queue_parser.add_argument(
+        "--job-kind",
+        choices=["all", "fast_pass", "enrichment"],
+        default="all",
+        help="Limit queue clearing to one analysis job kind.",
+    )
+
     run_feedback_worker_parser = subparsers.add_parser(
         "run-feedback-worker",
         help="Process pending feedback tuning jobs from recorded recommendation outcomes.",
@@ -2614,6 +2630,27 @@ def handle_purge_model_cache(args: argparse.Namespace) -> int:
     return 0
 
 
+def handle_clear_analysis_queue(args: argparse.Namespace) -> int:
+    settings = load_runtime_settings()
+    statuses = ["pending"]
+    if args.include_running:
+        statuses.append("running")
+    job_kind = None if args.job_kind == "all" else args.job_kind
+
+    with Database(settings.database_path) as database:
+        deleted = database.clear_analysis_jobs(statuses=statuses, job_kind=job_kind)
+
+    scope = f"job kind '{job_kind}'" if job_kind is not None else "all job kinds"
+    status_label = ", ".join(statuses)
+    print(f"Removed {deleted} analysis job(s) from the local queue.")
+    print(f"- Statuses cleared: {status_label}")
+    print(f"- Scope: {scope}")
+    print(f"- Database: {settings.database_path}")
+    if args.include_running:
+        print("- Running jobs were included; make sure no active analysis worker is still using those rows.")
+    return 0
+
+
 def handle_run_analysis_worker(args: argparse.Namespace) -> int:
     settings = load_runtime_settings()
     expected_essentia_semantic_signature = resolve_expected_essentia_semantic_signature(settings)
@@ -3386,6 +3423,8 @@ def main(argv: list[str] | None = None) -> int:
             return handle_refresh_relative_playlist(args)
         if args.command == "run-analysis-worker":
             return handle_run_analysis_worker(args)
+        if args.command == "clear-analysis-queue":
+            return handle_clear_analysis_queue(args)
         if args.command == "run-feedback-worker":
             return handle_run_feedback_worker(args)
         if args.command == "prewarm-model-services":

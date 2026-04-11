@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 
 import cuemate_analysis.cli as _cli
 from cuemate_analysis.feedback_shared import build_feedback_weight_layers
@@ -18,6 +19,10 @@ def _serialize(obj):
     if isinstance(obj, list):
         return [_serialize(i) for i in obj]
     return obj
+
+
+def _emit_console(text: str) -> None:
+    os.write(1, (text + "\n").encode("utf-8", errors="replace"))
 
 
 def handle_recommend_next(args: argparse.Namespace) -> int:
@@ -65,7 +70,7 @@ def handle_recommend_next(args: argparse.Namespace) -> int:
     )
 
     if args.json:
-        print(json.dumps(_serialize(result), indent=2))
+        _emit_console(json.dumps(_serialize(result), indent=2))
         return 0
 
     conf = result["recommendation_confidence"]
@@ -141,38 +146,38 @@ def handle_score_pair(args: argparse.Namespace) -> int:
     def _track_label(t) -> str:
         return _cli.format_track_label(t.track_id, t.artist, t.title)
 
-    print(f"\nScore pair: {_track_label(current)}  ->  {_track_label(candidate)}")
-    print(f"  Final score:      {result['score']:.4f}  (raw: {result['raw_score']:.4f})")
-    print(f"  Penalty:          {result['penalty_multiplier']:.4f}")
-    print(f"  Move:             {result['move']} (confidence={result['move_confidence']:.2f})")
-    print(f"  Risk:             {result['risk']} (score={result['risk_score']:.3f})")
-    print(f"  Contrast score:   {result['contrast_score']:.3f}")
+    _emit_console(f"\nScore pair: {_track_label(current)}  ->  {_track_label(candidate)}")
+    _emit_console(f"  Final score:      {result['score']:.4f}  (raw: {result['raw_score']:.4f})")
+    _emit_console(f"  Penalty:          {result['penalty_multiplier']:.4f}")
+    _emit_console(f"  Move:             {result['move']} (confidence={result['move_confidence']:.2f})")
+    _emit_console(f"  Risk:             {result['risk']} (score={result['risk_score']:.3f})")
+    _emit_console(f"  Contrast score:   {result['contrast_score']:.3f}")
 
-    print("\n  Transition features:")
+    _emit_console("\n  Transition features:")
     for k, v in sorted(result["transition_features"].items()):
-        print(f"    {k:<32}  {v}")
+        _emit_console(f"    {k:<32}  {v}")
 
-    print("\n  Component scores:")
+    _emit_console("\n  Component scores:")
     for k, v in sorted(result["component_scores"].items()):
         w = result["weights_used"].get(k, 0.0)
         c = result["confidences"].get(k, 1.0)
         if v is None:
-            print(f"    {k:<24}  {'stub':<8}  weight={w:.4f}  (not implemented)")
+            _emit_console(f"    {k:<24}  {'stub':<8}  weight={w:.4f}  (not implemented)")
         else:
-            print(f"    {k:<24}  {v:.4f}  weight={w:.4f}  conf={c:.4f}")
+            _emit_console(f"    {k:<24}  {v:.4f}  weight={w:.4f}  conf={c:.4f}")
 
     if result["penalty_factors"]:
-        print("\n  Penalty factors:")
+        _emit_console("\n  Penalty factors:")
         for factor in result["penalty_factors"]:
             name = factor.get("factor", "unknown")
             penalty = factor.get("effective_penalty", factor.get("raw_penalty", ""))
             severity = factor.get("severity", "")
-            print(f"    {name:<28}  penalty={penalty}  severity={severity}")
+            _emit_console(f"    {name:<28}  penalty={penalty}  severity={severity}")
 
     if result["risk_factors"]:
-        print("\n  Risk factors:")
+        _emit_console("\n  Risk factors:")
         for note in result["risk_factors"]:
-            print(f"    {note}")
+            _emit_console(f"    {note}")
 
     stub_components = sorted(
         name for name, value in result["component_scores"].items() if value is None
@@ -180,12 +185,12 @@ def handle_score_pair(args: argparse.Namespace) -> int:
     current_vocals_rel = result["transition_features"].get("current_vocals_rel")
     candidate_vocals_rel = result["transition_features"].get("candidate_vocals_rel")
     if stub_components or current_vocals_rel is None or candidate_vocals_rel is None:
-        print("\n  Notes:")
+        _emit_console("\n  Notes:")
         if stub_components:
             joined = ", ".join(stub_components)
-            print(f"    Stubbed and excluded from weighted scoring: {joined}.")
+            _emit_console(f"    Stubbed and excluded from weighted scoring: {joined}.")
         if current_vocals_rel is None or candidate_vocals_rel is None:
-            print(
+            _emit_console(
                 "    vocals_abs / vocals_rel are not populated yet; missing vocal fields are unknown, not silence."
             )
 

@@ -310,8 +310,6 @@ def handle_analyze_bpm_playlist(args: argparse.Namespace) -> int:
         rows = rows[: args.limit]
 
     payload_rows: list[dict[str, object]] = []
-    fieldname_order: list[str] = []
-    fieldname_seen: set[str] = set()
     diagnostics_estimates: list[TempoEstimate] = []
     total = len(rows)
     if not args.json:
@@ -603,6 +601,8 @@ def handle_analyze_energy_playlist(args: argparse.Namespace) -> int:
         rows = rows[: args.limit]
 
     payload_rows: list[dict[str, object]] = []
+    fieldname_order: list[str] = []
+    fieldname_seen: set[str] = set()
     total = len(rows)
 
     if not args.json:

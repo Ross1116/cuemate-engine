@@ -47,7 +47,7 @@ def handle_recommend_next(args: argparse.Namespace) -> int:
 
         current_id = args.current_track
         if current_id is None:
-            current_id = str(candidate_rows[0]["track_id"])
+            current_id = str(min(candidate_rows, key=lambda row: str(row["track_id"]))["track_id"])
 
         current_row = db.get_track_scoring_context(current_id, playlist_id)
         if current_row is None:
@@ -293,11 +293,11 @@ def handle_inspect_scoring_metadata(args: argparse.Namespace) -> int:
         print(f"    {key:<32} {value}")
 
     print("\n  Supported lanes:")
-    for lane in metadata["supported_lane_groups"]:
+    for lane in sorted(metadata["supported_lane_groups"], key=lambda item: item["lane_id"]):
         print(f"    {lane['lane_id']:<10} {lane['summary']}")
 
     print("\n  Components:")
-    for component in metadata["components"]:
+    for component in sorted(metadata["components"], key=lambda item: item["component_id"]):
         available = component.get("available")
         component_active = component.get("active")
         if available is False:

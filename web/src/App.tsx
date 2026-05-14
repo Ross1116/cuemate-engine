@@ -1408,10 +1408,17 @@ function FeedbackPanel({ feedback }: { feedback?: FeedbackSummary }) {
       <div className="chart">
         <ResponsiveContainer width="100%" height={170}>
           <BarChart data={chartData}>
-            <XAxis dataKey="shortName" tick={{ fill: "#8b98aa", fontSize: 10 }} />
+            <defs>
+              <linearGradient id="playlistWeightBar" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor="#b7bf77" />
+                <stop offset="55%" stopColor="#8f9f66" />
+                <stop offset="100%" stopColor="#657744" />
+              </linearGradient>
+            </defs>
+            <XAxis dataKey="shortName" tick={{ fill: "#8f9f66", fontSize: 10 }} axisLine={{ stroke: "rgba(143, 159, 102, 0.26)" }} tickLine={false} />
             <YAxis hide domain={[0, 100]} />
-            <Bar dataKey="value" fill="#5eead4" radius={[4, 4, 0, 0]}>
-              <LabelList dataKey="value" position="top" formatter={(value: number) => `${value}%`} fill="#eef5ff" fontSize={11} fontWeight={800} />
+            <Bar dataKey="value" fill="url(#playlistWeightBar)" stroke="rgba(231, 236, 235, 0.12)" strokeWidth={1} radius={[4, 4, 0, 0]}>
+              <LabelList dataKey="value" position="top" formatter={(value: number) => `${value}%`} fill="#e7eceb" fontSize={11} fontWeight={800} />
             </Bar>
           </BarChart>
         </ResponsiveContainer>

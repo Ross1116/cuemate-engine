@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -8,7 +9,9 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -88,6 +91,24 @@ type enqueueAnalysisRequest struct {
 	Force        bool   `json:"force"`
 }
 
+type toolCommandRequest struct {
+	Action                  string   `json:"action"`
+	Name                    string   `json:"name"`
+	Paths                   []string `json:"paths"`
+	Source                  string   `json:"source"`
+	Library                 string   `json:"library"`
+	Playlist                string   `json:"playlist"`
+	AnalysisMode            string   `json:"analysis_mode"`
+	Force                   bool     `json:"force"`
+	Limit                   int      `json:"limit"`
+	Path                    string   `json:"path"`
+	PrintBackendDiagnostics bool     `json:"print_backend_diagnostics"`
+}
+
+type pickPathRequest struct {
+	Kind string `json:"kind"`
+}
+
 type server struct {
 	repo    *recommendationsrepo.Repository
 	runtime *scoringruntime.Runtime
@@ -131,6 +152,8 @@ func run() int {
 	mux.HandleFunc("/sync/playlists/snapshot/ack", srv.handleSnapshotAck)
 	mux.HandleFunc("/sync/outbox/pull", srv.handleOutboxPull)
 	mux.HandleFunc("/sync/outbox/ack", srv.handleOutboxAck)
+	mux.HandleFunc("/tools/cli", srv.handleToolCommand)
+	mux.HandleFunc("/tools/pick-path", srv.handlePickPath)
 	mux.HandleFunc("/", handleWebApp(cfg.WebDist))
 
 	httpServer := &http.Server{
@@ -267,6 +290,13 @@ func (s *server) handlePlaylistRoutes(w http.ResponseWriter, r *http.Request) {
 		s.handlePlaylistDetail(w, r, playlistID)
 	case len(parts) == 2 && parts[1] == "tracks":
 		s.handlePlaylistTracks(w, r, playlistID)
+	case len(parts) == 4 && parts[1] == "tracks" && parts[3] == "features":
+		trackID, err := url.PathUnescape(parts[2])
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid track id"})
+			return
+		}
+		s.handleTrackFeatureDetail(w, r, playlistID, trackID)
 	case len(parts) == 3 && parts[1] == "analysis" && parts[2] == "enqueue":
 		s.handlePlaylistAnalysisEnqueue(w, r, playlistID)
 	default:
@@ -323,6 +353,31 @@ func (s *server) handlePlaylistTracks(w http.ResponseWriter, r *http.Request, pl
 		items = append(items, playlistTrackPayload(track))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items, "limit": limit, "offset": offset})
+}
+
+func (s *server) handleTrackFeatureDetail(w http.ResponseWriter, r *http.Request, playlistID string, trackID string) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	if _, err := s.repo.ResolvePlaylist(r.Context(), playlistID, ""); err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, recommendationsrepo.ErrPlaylistNotFound) {
+			status = http.StatusNotFound
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	detail, err := s.repo.GetTrackFeatureDetail(r.Context(), playlistID, trackID)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, recommendationsrepo.ErrTrackNotFound) {
+			status = http.StatusNotFound
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, trackFeatureDetailPayload(detail))
 }
 
 func (s *server) handleTrackSearch(w http.ResponseWriter, r *http.Request) {
@@ -384,6 +439,283 @@ func (s *server) handleRecommendationEvents(w http.ResponseWriter, r *http.Reque
 		items = append(items, recommendationEventPayload(event))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *server) handleToolCommand(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	var req toolCommandRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON request"})
+		return
+	}
+	cliArgs, background, err := buildToolCommand(req)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	command := append([]string{"python"}, cliArgs...)
+	if background {
+		result, err := startBackgroundToolCommand(cliArgs)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		result["command"] = command
+		writeJSON(w, http.StatusAccepted, result)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "python", cliArgs...)
+	output, err := cmd.CombinedOutput()
+	exitCode := 0
+	if err != nil {
+		exitCode = 1
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			exitCode = exitErr.ExitCode()
+		}
+	}
+	status := "completed"
+	if ctx.Err() == context.DeadlineExceeded {
+		status = "timeout"
+	}
+	httpStatus := http.StatusOK
+	if exitCode != 0 || status == "timeout" {
+		httpStatus = http.StatusBadRequest
+	}
+	writeJSON(w, httpStatus, map[string]any{
+		"status":    status,
+		"mode":      "foreground",
+		"command":   command,
+		"exit_code": exitCode,
+		"output":    string(output),
+	})
+}
+
+func (s *server) handlePickPath(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	var req pickPathRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON request"})
+		return
+	}
+	script, err := pickerScript(req.Kind)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "powershell", "-NoProfile", "-STA", "-Command", script)
+	output, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		writeJSON(w, http.StatusRequestTimeout, map[string]string{"error": "file picker timed out"})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": strings.TrimSpace(string(output))})
+		return
+	}
+	var paths []string
+	if err := json.Unmarshal(bytes.TrimSpace(output), &paths); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("parse picker output: %v", err)})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"paths": paths})
+}
+
+func pickerScript(kind string) (string, error) {
+	switch strings.TrimSpace(kind) {
+	case "folder":
+		return `
+Add-Type -AssemblyName System.Windows.Forms
+$dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+$dialog.Description = 'Choose a folder to import into CueMate'
+if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+  @($dialog.SelectedPath) | ConvertTo-Json -Compress
+} else {
+  @() | ConvertTo-Json -Compress
+}
+`, nil
+	case "audio_files":
+		return `
+Add-Type -AssemblyName System.Windows.Forms
+$dialog = New-Object System.Windows.Forms.OpenFileDialog
+$dialog.Title = 'Choose audio files to import into CueMate'
+$dialog.Filter = 'Audio files|*.mp3;*.wav;*.aiff;*.aif;*.flac;*.m4a;*.ogg|All files|*.*'
+$dialog.Multiselect = $true
+if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+  @($dialog.FileNames) | ConvertTo-Json -Compress
+} else {
+  @() | ConvertTo-Json -Compress
+}
+`, nil
+	case "dj_library_file":
+		return `
+Add-Type -AssemblyName System.Windows.Forms
+$dialog = New-Object System.Windows.Forms.OpenFileDialog
+$dialog.Title = 'Choose Rekordbox XML or Traktor NML export'
+$dialog.Filter = 'DJ library exports|*.xml;*.nml|Rekordbox XML|*.xml|Traktor NML|*.nml|All files|*.*'
+$dialog.Multiselect = $false
+if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+  @($dialog.FileName) | ConvertTo-Json -Compress
+} else {
+  @() | ConvertTo-Json -Compress
+}
+`, nil
+	default:
+		return "", errors.New("kind must be folder, audio_files, or dj_library_file")
+	}
+}
+
+func buildToolCommand(req toolCommandRequest) ([]string, bool, error) {
+	action := strings.TrimSpace(req.Action)
+	args := []string{"-m", "cuemate_analysis"}
+	switch action {
+	case "import_playlist":
+		name := strings.TrimSpace(req.Name)
+		if name == "" {
+			return nil, false, errors.New("name is required")
+		}
+		paths := compactStrings(req.Paths)
+		if len(paths) == 0 {
+			return nil, false, errors.New("at least one path is required")
+		}
+		args = append(args, "import-playlist", "--name", name)
+		args = append(args, paths...)
+		return args, true, nil
+	case "list_dj_playlists":
+		source, err := normalizeDJSource(req.Source)
+		if err != nil {
+			return nil, false, err
+		}
+		library := strings.TrimSpace(req.Library)
+		if library == "" {
+			return nil, false, errors.New("library is required")
+		}
+		return append(args, "list-dj-playlists", "--source", source, "--library", library), false, nil
+	case "import_dj_playlist":
+		source, err := normalizeDJSource(req.Source)
+		if err != nil {
+			return nil, false, err
+		}
+		library := strings.TrimSpace(req.Library)
+		playlist := strings.TrimSpace(req.Playlist)
+		if library == "" || playlist == "" {
+			return nil, false, errors.New("library and playlist are required")
+		}
+		args = append(args, "import-dj-playlist", "--source", source, "--library", library, "--playlist", playlist)
+		if name := strings.TrimSpace(req.Name); name != "" {
+			args = append(args, "--name", name)
+		}
+		return args, true, nil
+	case "analyze_playlist":
+		playlist := strings.TrimSpace(req.Playlist)
+		if playlist == "" {
+			return nil, false, errors.New("playlist is required")
+		}
+		mode := strings.TrimSpace(req.AnalysisMode)
+		if mode == "" {
+			mode = "staged"
+		}
+		if mode != "fast_pass" && mode != "staged" && mode != "full" {
+			return nil, false, errors.New("analysis_mode must be fast_pass, staged, or full")
+		}
+		args = append(args, "analyze-playlist", "--playlist", playlist, "--analysis-mode", mode)
+		if req.Force {
+			args = append(args, "--force")
+		}
+		return args, true, nil
+	case "run_analysis_worker":
+		limit := boundedPositive(req.Limit, 100, 1000)
+		args = append(args, "run-analysis-worker", "--limit", strconv.Itoa(limit))
+		if req.PrintBackendDiagnostics {
+			args = append(args, "--print-backend-diagnostics")
+		}
+		return args, true, nil
+	case "run_feedback_worker":
+		limit := boundedPositive(req.Limit, 50, 1000)
+		return append(args, "run-feedback-worker", "--limit", strconv.Itoa(limit)), true, nil
+	case "prewarm_model_services":
+		args = append(args, "prewarm-model-services")
+		if path := strings.TrimSpace(req.Path); path != "" {
+			args = append(args, "--path", path)
+		}
+		return args, true, nil
+	case "download_essentia_models":
+		return append(args, "download-essentia-semantic-models"), true, nil
+	default:
+		return nil, false, fmt.Errorf("unsupported action %q", action)
+	}
+}
+
+func startBackgroundToolCommand(cliArgs []string) (map[string]any, error) {
+	logDir := filepath.Join("tmp", "tool-runs")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		return nil, err
+	}
+	logPath := filepath.Join(logDir, fmt.Sprintf("%s.log", time.Now().UTC().Format("20060102T150405.000000000Z")))
+	logFile, err := os.Create(logPath)
+	if err != nil {
+		return nil, err
+	}
+	cmd := exec.Command("python", cliArgs...)
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	if err := cmd.Start(); err != nil {
+		_ = logFile.Close()
+		return nil, err
+	}
+	go func() {
+		err := cmd.Wait()
+		if err != nil {
+			_, _ = fmt.Fprintf(logFile, "\n[cuemate] command failed: %v\n", err)
+		}
+		_ = logFile.Close()
+	}()
+	return map[string]any{
+		"status":   "started",
+		"mode":     "background",
+		"pid":      cmd.Process.Pid,
+		"log_path": logPath,
+	}, nil
+}
+
+func normalizeDJSource(source string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(source)) {
+	case "rekordbox", "traktor", "serato":
+		return strings.ToLower(strings.TrimSpace(source)), nil
+	default:
+		return "", errors.New("source must be rekordbox, traktor, or serato")
+	}
+}
+
+func compactStrings(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
+}
+
+func boundedPositive(value, fallback, max int) int {
+	if value <= 0 {
+		return fallback
+	}
+	if value > max {
+		return max
+	}
+	return value
 }
 
 func (s *server) handlePlaylistAnalysisEnqueue(w http.ResponseWriter, r *http.Request, playlistID string) {
@@ -1187,16 +1519,25 @@ func translateRecommendationsResponse(resp *scoringv1.GetRecommendationsResponse
 		items := make([]any, 0, len(lane.GetItems()))
 		for _, item := range lane.GetItems() {
 			items = append(items, map[string]any{
-				"track_id":         item.GetCandidate().GetTrackId(),
-				"title":            item.GetCandidate().GetTitle(),
-				"artist":           item.GetCandidate().GetArtist(),
-				"score":            item.GetFinalScore(),
-				"ranking_strength": item.GetRankingStrength(),
-				"move":             item.GetMove(),
-				"move_confidence":  item.GetMoveConfidence(),
-				"move_note":        item.GetMoveNote(),
-				"risk":             item.GetRisk(),
-				"risk_score":       item.GetRiskScore(),
+				"track_id":              item.GetCandidate().GetTrackId(),
+				"title":                 item.GetCandidate().GetTitle(),
+				"artist":                item.GetCandidate().GetArtist(),
+				"score":                 item.GetFinalScore(),
+				"ranking_strength":      item.GetRankingStrength(),
+				"move":                  item.GetMove(),
+				"move_confidence":       item.GetMoveConfidence(),
+				"move_note":             item.GetMoveNote(),
+				"risk":                  item.GetRisk(),
+				"risk_score":            item.GetRiskScore(),
+				"raw_score":             item.GetRawScore(),
+				"penalty_multiplier":    item.GetPenaltyMultiplier(),
+				"primary_lane":          nullIfEmpty(item.GetPrimaryLane()),
+				"secondary_lane":        item.GetSecondaryLane(),
+				"component_scores":      float64MapToAnyMap(item.GetComponentScores()),
+				"component_confidences": float64MapToAnyMap(item.GetComponentConfidences()),
+				"weights_used":          float64MapToAnyMap(item.GetWeightsUsed()),
+				"transition_features":   transitionFeaturesPayload(item.GetTransitionFeatures()),
+				"candidate_features":    trackContextFeaturePayload(item.GetCandidate()),
 				"tempo_key": map[string]any{
 					"tempo_text": item.GetTempoKey().GetTempoText(),
 					"key_text":   item.GetTempoKey().GetKeyText(),
@@ -1761,6 +2102,54 @@ func valueOrNil(value *float64) any {
 	return *value
 }
 
+func int32OrNil(value *int32) any {
+	if value == nil {
+		return nil
+	}
+	return *value
+}
+
+func trackContextFeaturePayload(track *scoringv1.TrackContext) map[string]any {
+	if track == nil {
+		return map[string]any{}
+	}
+	return map[string]any{
+		"bpm":            track.GetBpm(),
+		"key":            nullIfEmpty(track.GetMusicalKey()),
+		"key_confidence": valueOrNil(track.KeyConfidence),
+		"key_source":     nullIfEmpty(track.GetKeySource()),
+		"key_agreement":  int32OrNil(track.KeyAgreement),
+		"energy_rel":     valueOrNil(track.EnergyRel),
+		"bass_rel":       valueOrNil(track.BassRel),
+		"drums_rel":      valueOrNil(track.DrumsRel),
+		"vocals_rel":     valueOrNil(track.VocalsRel),
+		"groove_rel":     valueOrNil(track.GrooveRel),
+		"intensity_band": nullIfEmpty(track.GetIntensityBand()),
+		"role_hints":     append([]string{}, track.GetRoleHints()...),
+	}
+}
+
+func transitionFeaturesPayload(features *scoringv1.TransitionFeatures) map[string]any {
+	if features == nil {
+		return map[string]any{}
+	}
+	return map[string]any{
+		"effective_bpm_distance":   features.GetEffectiveBpmDistance(),
+		"raw_bpm_distance":         features.GetRawBpmDistance(),
+		"bpm_relationship":         features.GetBpmRelationship(),
+		"key_distance":             features.GetKeyDistance(),
+		"key_compat_label":         features.GetKeyCompatLabel(),
+		"key_confidence_current":   features.GetKeyConfidenceCurrent(),
+		"key_confidence_candidate": features.GetKeyConfidenceCandidate(),
+		"delta_energy_rel":         features.GetDeltaEnergyRel(),
+		"delta_bass_rel":           features.GetDeltaBassRel(),
+		"current_vocals_rel":       transitionVocalValue(features, true),
+		"candidate_vocals_rel":     transitionVocalValue(features, false),
+		"current_outro_low_end":    features.GetCurrentOutroLowEnd(),
+		"candidate_intro_low_end":  features.GetCandidateIntroLowEnd(),
+	}
+}
+
 func transitionVocalValue(features *scoringv1.TransitionFeatures, current bool) any {
 	if features == nil {
 		return nil
@@ -1868,6 +2257,68 @@ func playlistTrackPayload(track recommendationsrepo.PlaylistTrackSnapshot) map[s
 		"intensity_band": stringOrNil(track.IntensityBand),
 		"role_hints":     append([]string{}, track.RoleHints...),
 		"analysis_state": track.AnalysisState,
+	}
+}
+
+func trackFeatureDetailPayload(detail recommendationsrepo.TrackFeatureDetail) map[string]any {
+	return map[string]any{
+		"track_id": detail.TrackID,
+		"title":    detail.Title,
+		"artist":   detail.Artist,
+		"basic": map[string]any{
+			"bpm":            valueOrNil(detail.BPM),
+			"key":            stringOrNil(detail.Key),
+			"key_confidence": valueOrNil(detail.KeyConfidence),
+			"key_source":     stringOrNil(detail.KeySource),
+			"key_agreement":  int32OrNil(detail.KeyAgreement),
+		},
+		"absolute": map[string]any{
+			"energy_abs":           valueOrNil(detail.EnergyAbs),
+			"energy_heuristic_abs": valueOrNil(detail.EnergyHeuristicAbs),
+			"energy_sustained":     valueOrNil(detail.EnergySustained),
+			"energy_peak":          valueOrNil(detail.EnergyPeak),
+			"loudness_norm":        valueOrNil(detail.LoudnessNorm),
+			"bass_abs":             valueOrNil(detail.BassAbs),
+			"drums_abs":            valueOrNil(detail.DrumsAbs),
+			"harmonic_abs":         valueOrNil(detail.HarmonicAbs),
+			"groove_abs":           valueOrNil(detail.GrooveAbs),
+			"vocals_abs":           valueOrNil(detail.VocalsAbs),
+			"vocals_confidence":    valueOrNil(detail.VocalsConfidence),
+		},
+		"semantic": map[string]any{
+			"danceability_abs":       valueOrNil(detail.DanceabilityAbs),
+			"arousal_abs":            valueOrNil(detail.ArousalAbs),
+			"valence_abs":            valueOrNil(detail.ValenceAbs),
+			"mood_aggressive_abs":    valueOrNil(detail.MoodAggressiveAbs),
+			"mood_party_abs":         valueOrNil(detail.MoodPartyAbs),
+			"mood_relaxed_abs":       valueOrNil(detail.MoodRelaxedAbs),
+			"energy_essentia_fused":  valueOrNil(detail.EnergyEssentiaFused),
+			"energy_essentia_bucket": stringOrNil(detail.EnergyEssentiaBucket),
+			"source":                 stringOrNil(detail.EssentiaSemanticSource),
+			"inferred_at":            stringOrNil(detail.EssentiaSemanticInferredAt),
+		},
+		"relative": map[string]any{
+			"energy_rel":           valueOrNil(detail.EnergyRel),
+			"bass_rel":             valueOrNil(detail.BassRel),
+			"drums_rel":            valueOrNil(detail.DrumsRel),
+			"vocals_rel":           valueOrNil(detail.VocalsRel),
+			"groove_rel":           valueOrNil(detail.GrooveRel),
+			"energy_spread":        valueOrNil(detail.EnergySpread),
+			"bass_spread":          valueOrNil(detail.BassSpread),
+			"drums_spread":         valueOrNil(detail.DrumsSpread),
+			"vocals_spread":        valueOrNil(detail.VocalsSpread),
+			"groove_spread":        valueOrNil(detail.GrooveSpread),
+			"intensity_band":       stringOrNil(detail.IntensityBand),
+			"intensity_membership": float64MapToAnyMap(detail.IntensityMembership),
+			"role_hints":           append([]string{}, detail.RoleHints...),
+		},
+		"analysis": map[string]any{
+			"analysis_mode":                   stringOrNil(detail.AnalysisMode),
+			"analyzed_at":                     stringOrNil(detail.AnalyzedAt),
+			"analysis_signature":              stringOrNil(detail.AnalysisSignature),
+			"config_signature":                stringOrNil(detail.ConfigSignature),
+			"scoring_contract_id_at_analysis": stringOrNil(detail.ScoringContractAtAnalysis),
+		},
 	}
 }
 

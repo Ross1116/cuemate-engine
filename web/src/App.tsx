@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -7,18 +7,23 @@ import {
   Check,
   CircleHelp,
   CircleDot,
+  FileAudio,
+  FolderPlus,
+  FolderOpen,
   Library,
   ListMusic,
+  PlayCircle,
   Radar,
   RefreshCw,
   Search,
   Settings,
   SlidersHorizontal,
   Sparkles,
+  TerminalSquare,
   Waves,
 } from "lucide-react";
-import { Bar, BarChart, LabelList, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
-import { api, FeedbackSummary, LaneItem, Playlist, RecommendationResponse, Track } from "./api";
+import { Bar, BarChart, LabelList, ResponsiveContainer, XAxis, YAxis } from "recharts";
+import { api, FeedbackSummary, LaneItem, PickPathRequest, Playlist, RecommendationResponse, ToolCommandRequest, ToolCommandResult, Track } from "./api";
 
 const targets = ["maintain", "build", "reset", "jump", "contrast"];
 
@@ -86,8 +91,11 @@ function TooltipAnchor({
   className?: string;
   focusable?: boolean;
 }) {
+  const tooltipId = useId();
   const anchorRef = useRef<HTMLSpanElement>(null);
   const [position, setPosition] = useState<{ left: number; top: number; placement: "top" | "bottom" } | null>(null);
+
+  const closeTooltip = useCallback(() => setPosition(null), []);
 
   const updatePosition = useCallback(() => {
     const anchor = anchorRef.current;
@@ -99,19 +107,44 @@ function TooltipAnchor({
     const unclampedLeft = rect.left + rect.width / 2;
     const left = Math.min(window.innerWidth - 12 - maxTooltipWidth / 2, Math.max(12 + maxTooltipWidth / 2, unclampedLeft));
     const top = placement === "bottom" ? rect.bottom + 10 : rect.top - 10;
+    window.dispatchEvent(new CustomEvent("cuemate-tooltip-open", { detail: { id: tooltipId } }));
     setPosition({ left, top, placement });
-  }, []);
+  }, [tooltipId]);
+
+  useEffect(() => {
+    const handleOtherTooltip = (event: Event) => {
+      const nextTooltipId = (event as CustomEvent<{ id?: string }>).detail?.id;
+      if (nextTooltipId !== tooltipId) closeTooltip();
+    };
+    window.addEventListener("cuemate-tooltip-open", handleOtherTooltip);
+    return () => window.removeEventListener("cuemate-tooltip-open", handleOtherTooltip);
+  }, [closeTooltip, tooltipId]);
 
   useEffect(() => {
     if (!position) return undefined;
     const handleMove = () => updatePosition();
+    const handlePointerMove = (event: PointerEvent) => {
+      const anchor = anchorRef.current;
+      if (anchor && event.target instanceof Node && !anchor.contains(event.target)) closeTooltip();
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") closeTooltip();
+    };
     window.addEventListener("resize", handleMove);
     window.addEventListener("scroll", handleMove, true);
+    window.addEventListener("blur", closeTooltip);
+    window.addEventListener("keydown", handleKeyDown, true);
+    document.addEventListener("pointermove", handlePointerMove, true);
+    document.addEventListener("pointerdown", closeTooltip, true);
     return () => {
       window.removeEventListener("resize", handleMove);
       window.removeEventListener("scroll", handleMove, true);
+      window.removeEventListener("blur", closeTooltip);
+      window.removeEventListener("keydown", handleKeyDown, true);
+      document.removeEventListener("pointermove", handlePointerMove, true);
+      document.removeEventListener("pointerdown", closeTooltip, true);
     };
-  }, [position, updatePosition]);
+  }, [closeTooltip, position, updatePosition]);
 
   return (
     <span
@@ -119,15 +152,16 @@ function TooltipAnchor({
       className={className ? `tooltip-anchor ${className}` : "tooltip-anchor"}
       tabIndex={focusable ? 0 : undefined}
       aria-label={focusable ? text : undefined}
-      onMouseEnter={updatePosition}
-      onMouseLeave={() => setPosition(null)}
+      onPointerEnter={updatePosition}
+      onPointerLeave={closeTooltip}
+      onPointerCancel={closeTooltip}
       onFocus={focusable ? updatePosition : undefined}
-      onBlur={focusable ? () => setPosition(null) : undefined}
+      onBlur={focusable ? closeTooltip : undefined}
     >
       {children}
       {position
         ? createPortal(
-            <span className={`floating-tooltip ${position.placement}`} role="tooltip" style={{ left: position.left, top: position.top }}>
+            <span id={tooltipId} className={`floating-tooltip ${position.placement}`} role="tooltip" style={{ left: position.left, top: position.top }}>
               {text}
             </span>,
             document.body,
@@ -176,6 +210,8 @@ export function App() {
   const [trackQuery, setTrackQuery] = useState("");
   const [selectedCandidate, setSelectedCandidate] = useState<LaneItem | null>(null);
   const [mobileTab, setMobileTab] = useState<"recommend" | "library" | "feedback" | "admin">("recommend");
+  const [workMode, setWorkMode] = useState<"live" | "full">(() => (localStorage.getItem("cuemate.mode") === "full" ? "full" : "live"));
+  const [lastToolResult, setLastToolResult] = useState<ToolCommandResult | null>(null);
 
   const health = useQuery({ queryKey: ["health"], queryFn: api.health, refetchInterval: 15_000 });
   const readiness = useQuery({ queryKey: ["ready"], queryFn: api.readiness, refetchInterval: 15_000 });
@@ -241,6 +277,15 @@ export function App() {
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["jobs"] }),
   });
 
+  const toolMutation = useMutation({
+    mutationFn: (payload: ToolCommandRequest) => api.toolCommand(payload),
+    onSuccess: (result) => {
+      setLastToolResult(result);
+      void queryClient.invalidateQueries({ queryKey: ["playlists"] });
+      void queryClient.invalidateQueries({ queryKey: ["jobs"] });
+    },
+  });
+
   const selectedPlaylist = playlists.data?.items.find((item) => item.playlist_id === selectedPlaylistId) ?? playlists.data?.items[0];
   const currentTrack = tracks.data?.items.find((item) => item.track_id === currentTrackId);
 
@@ -260,7 +305,7 @@ export function App() {
     }
   }, [currentTrackId, firstReadyTrack]);
 
-  const shellClass = `app-shell tab-${mobileTab}`;
+  const shellClass = `app-shell mode-${workMode} tab-${mobileTab}`;
 
   return (
     <div className={shellClass}>
@@ -270,6 +315,20 @@ export function App() {
           <h1>Performance Control</h1>
         </div>
         <div className="status-row">
+          <div className="mode-switch" aria-label="Workspace mode">
+            {(["live", "full"] as const).map((mode) => (
+              <button
+                key={mode}
+                className={workMode === mode ? "active" : ""}
+                onClick={() => {
+                  setWorkMode(mode);
+                  localStorage.setItem("cuemate.mode", mode);
+                }}
+              >
+                {mode}
+              </button>
+            ))}
+          </div>
           <StatusDot label="API" ok={health.data?.status === "ok"} loading={health.isLoading} />
           <StatusDot label="Scorer" ok={readiness.data?.status === "ready"} loading={readiness.isLoading} />
           <span className={metadata.data?.breaker_open ? "pill hot" : "pill cyan"}>
@@ -356,23 +415,29 @@ export function App() {
           onConfirm={(trackId) => playMutation.mutate(trackId)}
           confirming={playMutation.isPending}
         />
-        <FeedbackPanel feedback={feedback.data} />
+        {workMode === "live" ? <CandidateSignalPanel candidate={selectedCandidate} playlistId={selectedPlaylist?.playlist_id} /> : <FeedbackPanel feedback={feedback.data} />}
       </aside>
 
-      <aside className="admin-pane panel mobile-admin">
-        <PaneTitle icon={<SlidersHorizontal />} title="Ops" action={selectedPlaylist?.is_stale ? "stale" : "current"} />
-        <OpsPanel
-          playlist={selectedPlaylist}
-          jobs={jobs.data?.items ?? []}
-          onQueue={() => enqueueMutation.mutate()}
-          queueBusy={enqueueMutation.isPending}
-          queueResult={enqueueMutation.data?.queued_count}
-          onSnapshot={() => snapshotMutation.mutate()}
-          snapshotBusy={snapshotMutation.isPending}
-          onCorrection={(field, value) => correctionMutation.mutate({ field, new_value: value })}
-          correctionBusy={correctionMutation.isPending}
-        />
-      </aside>
+      {workMode === "full" ? (
+        <aside className="admin-pane panel mobile-admin">
+          <FullToolsPanel
+            playlist={selectedPlaylist}
+            playlists={playlists.data?.items ?? []}
+            jobs={jobs.data?.items ?? []}
+            onQueue={() => enqueueMutation.mutate()}
+            queueBusy={enqueueMutation.isPending}
+            queueResult={enqueueMutation.data?.queued_count}
+            onSnapshot={() => snapshotMutation.mutate()}
+            snapshotBusy={snapshotMutation.isPending}
+            onCorrection={(field, value) => correctionMutation.mutate({ field, new_value: value })}
+            correctionBusy={correctionMutation.isPending}
+            onTool={(payload) => toolMutation.mutate(payload)}
+            toolBusy={toolMutation.isPending}
+            toolResult={lastToolResult}
+            toolError={toolMutation.error}
+          />
+        </aside>
+      ) : null}
 
       <nav className="mobile-nav">
         <button className={mobileTab === "recommend" ? "active" : ""} onClick={() => setMobileTab("recommend")}>
@@ -384,8 +449,8 @@ export function App() {
         <button className={mobileTab === "feedback" ? "active" : ""} onClick={() => setMobileTab("feedback")}>
           <BarChart3 size={18} /> Feedback
         </button>
-        <button className={mobileTab === "admin" ? "active" : ""} onClick={() => setMobileTab("admin")}>
-          <Settings size={18} /> Ops
+        <button className={mobileTab === "admin" ? "active" : ""} onClick={() => setMobileTab("admin")} disabled={workMode !== "full"}>
+          <Settings size={18} /> Full
         </button>
       </nav>
     </div>
@@ -580,6 +645,356 @@ function CandidateDetail({
   );
 }
 
+function CandidateSignalPanel({ candidate, playlistId }: { candidate: LaneItem | null; playlistId?: string }) {
+  const features = useQuery({
+    queryKey: ["track-features", playlistId, candidate?.track_id],
+    queryFn: () => api.trackFeatures(playlistId ?? "", candidate?.track_id ?? ""),
+    enabled: Boolean(playlistId && candidate?.track_id),
+  });
+
+  const insight = useMemo(() => {
+    if (!candidate) return null;
+    const detail = features.data;
+    const candidateRel = candidate.candidate_features;
+    const relative = detail?.relative ?? {};
+    const semantic = detail?.semantic ?? {};
+    const transition = candidate.transition_features ?? {};
+
+    const energyRel = firstNumber(relative.energy_rel, candidateRel.energy_rel);
+    const bassRel = firstNumber(relative.bass_rel, candidateRel.bass_rel);
+    const deltaEnergy = maybeNumber(transition.delta_energy_rel);
+    const deltaBass = maybeNumber(transition.delta_bass_rel);
+    const danceability = maybeNumber(semantic.danceability_abs);
+    const arousal = maybeNumber(semantic.arousal_abs);
+    const valence = maybeNumber(semantic.valence_abs);
+    const mood = dominantMood(semantic);
+    const bpmDistance = maybeNumber(transition.effective_bpm_distance);
+    const keyFit = stringValueFromUnknown(transition.key_compat_label) || candidate.tempo_key.key_text || "unknown";
+    const vocalPhrase = vocalHandoffPhrase(maybeNumber(transition.current_vocals_rel), maybeNumber(transition.candidate_vocals_rel));
+    const tempoPhrase = candidate.tempo_key.tempo_text || (bpmDistance == null ? "unknown" : `${bpmDistance.toFixed(1)} BPM away`);
+    const energyPhrase = deltaEnergy == null ? "unknown" : signedPercent(deltaEnergy);
+
+    const drivers = Object.entries(candidate.component_scores ?? {})
+      .map(([key, score]) => ({
+        key,
+        label: labelize(key),
+        score,
+        weight: candidate.weights_used?.[key],
+        confidence: candidate.component_confidences?.[key],
+        strength: score * (candidate.weights_used?.[key] ?? 1),
+      }))
+      .sort((a, b) => b.strength - a.strength || componentSort(a.key) - componentSort(b.key))
+      .slice(0, 3);
+
+    return {
+      summary: buildDJReadSummary({ energyChange: deltaEnergy, risk: candidate.risk, tempo: tempoPhrase, keyFit, mood }),
+      hero: [
+        {
+          label: "Energy move",
+          value: energyPhrase,
+          detail: energyMoveCopy(deltaEnergy, candidate.move),
+          hint: "How this pick changes room pressure from the current base track.",
+        },
+        {
+          label: "Mix safety",
+          value: `${riskToSafety(candidate.risk_score)}%`,
+          detail: `${candidate.risk} risk / ${keyFit}`,
+          hint: "A quick read of transition difficulty using risk, harmonic fit, and scorer confidence.",
+        },
+        {
+          label: "Crowd feel",
+          value: mood.label,
+          detail: mood.detail,
+          hint: "The musical character this candidate brings into the next moment.",
+        },
+      ],
+      mix: [
+        {
+          label: "Tempo",
+          value: tempoPhrase,
+          detail: tempoDecisionCopy(bpmDistance),
+          hint: "How much BPM adjustment or ratio-aware mixing the handoff needs.",
+        },
+        {
+          label: "Harmony",
+          value: keyFit,
+          detail: keyDecisionCopy(maybeNumber(transition.key_distance)),
+          hint: "Whether the key relationship is likely to sound smooth or tense.",
+        },
+        {
+          label: "Low end",
+          value: deltaBass == null ? "unknown" : signedPercent(deltaBass),
+          detail: bassDecisionCopy(deltaBass, bassRel),
+          hint: "Whether the next track adds, removes, or preserves bass pressure.",
+        },
+        {
+          label: "Vocals",
+          value: vocalPhrase.value,
+          detail: vocalPhrase.detail,
+          hint: "Whether vocal content might clash across the transition.",
+        },
+      ],
+      room: [
+        {
+          label: "Candidate energy",
+          value: percentOrMissing(energyRel),
+          detail: `${stringValueFromUnknown(relative.intensity_band) || stringValueFromUnknown(candidateRel.intensity_band) || "band unknown"} / ${energyLevelCopy(energyRel)}`,
+          hint: "Where this track sits in this playlist's energy range.",
+        },
+        {
+          label: "Danceability",
+          value: percentOrMissing(danceability),
+          detail: danceability == null ? "run full semantic analysis to unlock" : danceabilityCopy(danceability),
+          hint: "How strongly the semantic model hears dance-floor movement.",
+        },
+        {
+          label: "Drive",
+          value: percentOrMissing(arousal),
+          detail: arousal == null ? "semantic value missing" : arousalCopy(arousal),
+          hint: "How activated or intense the track feels, separate from BPM.",
+        },
+        {
+          label: "Brightness",
+          value: percentOrMissing(valence),
+          detail: valence == null ? "semantic value missing" : valenceCopy(valence),
+          hint: "How positive or bright the track's mood reads.",
+        },
+      ],
+      drivers,
+      loading: features.isFetching,
+    };
+  }, [candidate, features.data, features.isFetching]);
+
+  return (
+    <section className="detail-block">
+      <PaneTitle icon={<BarChart3 />} title="DJ Read" action={candidate ? "selected track" : "waiting"} />
+      {!candidate ? (
+        <p className="muted">Select a recommendation to see candidate-specific values here.</p>
+      ) : (
+        <>
+          <p className="context-note">
+            {insight?.loading ? "Loading full track analysis..." : insight?.summary}
+          </p>
+          {features.error ? <p className="action-note">Full analysis details could not be loaded; showing scorer-returned fields only.</p> : null}
+          {insight ? (
+            <>
+              <div className="dj-read-hero">
+                {insight.hero.map((item) => (
+                  <InsightTile key={item.label} {...item} featured />
+                ))}
+              </div>
+              <InsightSection title="Can I mix it cleanly?" note="The handoff checks that matter in the booth." items={insight.mix} />
+              <InsightSection title="What happens to the room?" note="Energy and feel, not just raw score." items={insight.room} />
+              <ScoreDriverList drivers={insight.drivers} />
+            </>
+          ) : null}
+        </>
+      )}
+    </section>
+  );
+}
+
+type InsightItem = {
+  label: string;
+  value: string;
+  detail: string;
+  hint: string;
+};
+
+function InsightSection({ title, note, items }: { title: string; note: string; items: InsightItem[] }) {
+  return (
+    <section className="insight-section">
+      <div className="insight-section-title">
+        <h3>{title}</h3>
+        <p>{note}</p>
+      </div>
+      <div className="insight-grid">
+        {items.map((item) => (
+          <InsightTile key={item.label} {...item} />
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function InsightTile({ label, value, detail, hint, featured = false }: InsightItem & { featured?: boolean }) {
+  return (
+    <div className={featured ? "insight-tile featured" : "insight-tile"}>
+      <span>
+        {label}
+        <InfoHint text={hint} />
+      </span>
+      <strong>{value}</strong>
+      <small>{detail}</small>
+    </div>
+  );
+}
+
+type ScoreDriver = {
+  key: string;
+  label: string;
+  score: number;
+  weight?: number;
+  confidence?: number;
+  strength: number;
+};
+
+function ScoreDriverList({ drivers }: { drivers: ScoreDriver[] }) {
+  if (drivers.length === 0) return null;
+  return (
+    <section className="insight-section">
+      <div className="insight-section-title">
+        <h3>Why it scored well</h3>
+        <p>The top scorer components behind this recommendation.</p>
+      </div>
+      <div className="driver-list">
+        {drivers.map((driver) => (
+          <div key={driver.key} className="driver-row">
+            <span>
+              {driver.label}
+              <InfoHint text={helpFor(weightDescriptions, driver.key, "Scoring component used by the recommendation engine.")} />
+            </span>
+            <strong>{Math.round(clamp01(driver.score) * 100)}%</strong>
+            <div className="driver-bar">
+              <i style={{ width: `${Math.round(clamp01(driver.score) * 100)}%` }} />
+            </div>
+            <small>
+              weight {driver.weight == null ? "n/a" : `${Math.round(driver.weight * 100)}%`} / confidence {driver.confidence == null ? "n/a" : `${Math.round(driver.confidence * 100)}%`}
+            </small>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function firstNumber(...values: unknown[]) {
+  for (const value of values) {
+    const parsed = maybeNumber(value);
+    if (parsed != null) return parsed;
+  }
+  return null;
+}
+
+function maybeNumber(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function clamp01(value: number) {
+  return Math.max(0, Math.min(1, value));
+}
+
+function componentSort(key: string) {
+  const order = ["target_energy", "bass_transition", "harmonic", "tempo", "rhythmic_continuity", "vocal_transition", "history_fit", "transition_support"];
+  const index = order.indexOf(key);
+  return index === -1 ? 999 : index;
+}
+
+function labelize(value: string) {
+  return value.replace(/_/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function clampPercent(value: number) {
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.min(100, value));
+}
+
+function riskToSafety(riskScore: number) {
+  const riskPercent = riskScore <= 1 ? riskScore * 100 : riskScore;
+  return clampPercent(100 - Math.round(riskPercent));
+}
+
+function stringValueFromUnknown(value: unknown) {
+  return typeof value === "string" && value.trim() ? value.trim() : "";
+}
+
+function signedPercent(value: number) {
+  return `${value >= 0 ? "+" : ""}${Math.round(value * 100)}%`;
+}
+
+function percentOrMissing(value: number | null) {
+  return value == null ? "missing" : `${Math.round(clamp01(value) * 100)}%`;
+}
+
+function dominantMood(semantic: Record<string, number | string | null>) {
+  const moods = [
+    { label: "party", value: maybeNumber(semantic.mood_party_abs), detail: "club-forward and lively" },
+    { label: "relaxed", value: maybeNumber(semantic.mood_relaxed_abs), detail: "smoother and more laid-back" },
+    { label: "aggressive", value: maybeNumber(semantic.mood_aggressive_abs), detail: "harder and more forceful" },
+  ].filter((item) => item.value != null) as { label: string; value: number; detail: string }[];
+  if (moods.length === 0) return { label: "unknown", detail: "semantic mood not analyzed yet" };
+  moods.sort((a, b) => b.value - a.value);
+  return { label: `${moods[0].label} ${Math.round(moods[0].value * 100)}%`, detail: moods[0].detail };
+}
+
+function buildDJReadSummary({ energyChange, risk, tempo, keyFit, mood }: { energyChange: number | null; risk: string; tempo: string; keyFit: string; mood: { label: string } }) {
+  const energy = energyChange == null ? "Energy impact is unknown" : energyMoveCopy(energyChange, "");
+  return `${energy}. ${risk} risk, ${tempo}, ${keyFit}. Crowd feel: ${mood.label}.`;
+}
+
+function energyMoveCopy(deltaEnergy: number | null, move: string) {
+  if (deltaEnergy == null) return move ? `${move} move; energy delta unavailable` : "energy delta unavailable";
+  if (deltaEnergy > 0.08) return "lifts the room";
+  if (deltaEnergy < -0.08) return "drops pressure for reset";
+  return "keeps energy steady";
+}
+
+function tempoDecisionCopy(distance: number | null) {
+  if (distance == null) return "tempo relationship unavailable";
+  if (distance <= 2) return "tight tempo match";
+  if (distance <= 6) return "workable with pitch or phrasing";
+  return "wide tempo move; plan the transition";
+}
+
+function keyDecisionCopy(distance: number | null) {
+  if (distance == null) return "key relationship unavailable";
+  if (distance <= 1) return "harmonically comfortable";
+  if (distance <= 3) return "usable with attention";
+  return "harmonic contrast; mix carefully";
+}
+
+function bassDecisionCopy(deltaBass: number | null, bassRel: number | null) {
+  if (deltaBass == null) return bassRel == null ? "low-end data unavailable" : `candidate bass ${percentOrMissing(bassRel)}`;
+  if (deltaBass > 0.08) return "adds low-end pressure";
+  if (deltaBass < -0.08) return "lightens the low end";
+  return "keeps bass pressure stable";
+}
+
+function vocalHandoffPhrase(current: number | null, candidate: number | null) {
+  if (current == null || candidate == null) return { value: "unknown", detail: "vocal analysis missing; use ears" };
+  if (current > 0.65 && candidate > 0.65) return { value: "busy", detail: "both tracks are vocal-heavy" };
+  if (current < 0.25 && candidate < 0.25) return { value: "clear", detail: "low vocal overlap" };
+  if (candidate > current + 0.25) return { value: "incoming vocal", detail: "candidate brings vocals forward" };
+  if (candidate < current - 0.25) return { value: "opens space", detail: "candidate reduces vocal density" };
+  return { value: "balanced", detail: "similar vocal density" };
+}
+
+function energyLevelCopy(value: number | null) {
+  if (value == null) return "relative energy missing";
+  if (value >= 0.78) return "peak pressure";
+  if (value >= 0.58) return "driving";
+  if (value >= 0.35) return "groove zone";
+  return "lower-pressure";
+}
+
+function danceabilityCopy(value: number) {
+  if (value >= 0.75) return "strong dance-floor pull";
+  if (value >= 0.5) return "moderate movement";
+  return "less dance-driven";
+}
+
+function arousalCopy(value: number) {
+  if (value >= 0.7) return "high activation";
+  if (value >= 0.45) return "medium drive";
+  return "calmer";
+}
+
+function valenceCopy(value: number) {
+  if (value >= 0.65) return "brighter mood";
+  if (value >= 0.4) return "neutral mood";
+  return "darker mood";
+}
+
 function FeedbackPanel({ feedback }: { feedback?: FeedbackSummary }) {
   const chartData = useMemo(
     () =>
@@ -593,7 +1008,10 @@ function FeedbackPanel({ feedback }: { feedback?: FeedbackSummary }) {
   );
   return (
     <section className="detail-block">
-      <PaneTitle icon={<BarChart3 />} title="Feedback" action={feedback?.weights.source ?? "static"} />
+      <PaneTitle icon={<BarChart3 />} title="Playlist Tuning" action={feedback?.weights.source ? `${feedback.weights.source} weights` : "static weights"} />
+      <p className="context-note">
+        Playlist-wide scoring weights for {feedback?.playlist_name ?? "the selected playlist"}. These change after feedback tuning or when you choose another playlist, not when you click a result card.
+      </p>
       <div className="metric-grid">
         <Metric label="Events" value={(feedback?.metrics.total_events ?? 0).toString()} hint={metricDescriptions.Events} />
         <Metric label="Top 1" value={pct(feedback?.metrics.chosen_top1_rate)} hint={metricDescriptions["Top 1"]} />
@@ -605,7 +1023,6 @@ function FeedbackPanel({ feedback }: { feedback?: FeedbackSummary }) {
           <BarChart data={chartData}>
             <XAxis dataKey="shortName" tick={{ fill: "#8b98aa", fontSize: 10 }} />
             <YAxis hide domain={[0, 100]} />
-            <Tooltip formatter={(value: number, _name, item) => [`${value}%`, item.payload.name]} contentStyle={{ background: "#111720", border: "1px solid #273447" }} />
             <Bar dataKey="value" fill="#5eead4" radius={[4, 4, 0, 0]}>
               <LabelList dataKey="value" position="top" formatter={(value: number) => `${value}%`} fill="#eef5ff" fontSize={11} fontWeight={800} />
             </Bar>
@@ -625,6 +1042,280 @@ function FeedbackPanel({ feedback }: { feedback?: FeedbackSummary }) {
       </div>
       <NoteList title="Tuning notes" notes={feedback?.tuning.notes ?? []} />
     </section>
+  );
+}
+
+function FullToolsPanel({
+  playlist,
+  playlists,
+  jobs,
+  onQueue,
+  queueBusy,
+  queueResult,
+  onSnapshot,
+  snapshotBusy,
+  onCorrection,
+  correctionBusy,
+  onTool,
+  toolBusy,
+  toolResult,
+  toolError,
+}: {
+  playlist?: Playlist;
+  playlists: Playlist[];
+  jobs: { id: number; status: string; track_id: string | null; created_at: string; error_message: string | null }[];
+  onQueue: () => void;
+  queueBusy: boolean;
+  queueResult?: number;
+  onSnapshot: () => void;
+  snapshotBusy: boolean;
+  onCorrection: (field: "bpm" | "key", value: string | number) => void;
+  correctionBusy: boolean;
+  onTool: (payload: ToolCommandRequest) => void;
+  toolBusy: boolean;
+  toolResult: ToolCommandResult | null;
+  toolError: Error | null;
+}) {
+  const [localName, setLocalName] = useState("");
+  const [localPaths, setLocalPaths] = useState("");
+  const [djSource, setDjSource] = useState<"rekordbox" | "traktor" | "serato">("rekordbox");
+  const [djLibrary, setDjLibrary] = useState("");
+  const [djPlaylist, setDjPlaylist] = useState("");
+  const [djName, setDjName] = useState("");
+  const [analysisPlaylist, setAnalysisPlaylist] = useState(() => playlist?.name ?? "");
+  const [analysisMode, setAnalysisMode] = useState<"fast_pass" | "staged" | "full">("staged");
+  const [forceAnalysis, setForceAnalysis] = useState(false);
+  const [workerLimit, setWorkerLimit] = useState("25");
+  const [warmupPath, setWarmupPath] = useState("");
+  const pickPathMutation = useMutation({ mutationFn: api.pickPath });
+
+  useEffect(() => {
+    if (!analysisPlaylist && playlist?.name) setAnalysisPlaylist(playlist.name);
+  }, [analysisPlaylist, playlist?.name]);
+
+  const selectedAnalysisName = analysisPlaylist || playlist?.name || "";
+  const localPathList = localPaths
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  const parsedLimit = Math.max(1, Number.parseInt(workerLimit, 10) || 25);
+  const pickerBusy = pickPathMutation.isPending;
+  const pickerError = pickPathMutation.error instanceof Error ? pickPathMutation.error.message : null;
+
+  const appendLocalPaths = (paths: string[]) => {
+    setLocalPaths((current) => {
+      const existing = current
+        .split(/\r?\n/)
+        .map((item) => item.trim())
+        .filter(Boolean);
+      const next = Array.from(new Set([...existing, ...paths.map((item) => item.trim()).filter(Boolean)]));
+      return next.join("\n");
+    });
+  };
+
+  const pickPaths = async (kind: PickPathRequest["kind"]) => {
+    try {
+      const result = await pickPathMutation.mutateAsync({ kind });
+      return result.paths;
+    } catch {
+      return [];
+    }
+  };
+
+  const chooseLocalFolder = async () => {
+    appendLocalPaths(await pickPaths("folder"));
+  };
+
+  const chooseAudioFiles = async () => {
+    appendLocalPaths(await pickPaths("audio_files"));
+  };
+
+  const chooseDJLibrary = async () => {
+    const kind: PickPathRequest["kind"] = djSource === "serato" ? "folder" : "dj_library_file";
+    const paths = await pickPaths(kind);
+    if (paths[0]) setDjLibrary(paths[0]);
+  };
+
+  return (
+    <div className="full-tools">
+      <PaneTitle icon={<TerminalSquare />} title="Full Mode" action="library + analysis" />
+      <p className="mode-note">Full mode exposes import, analysis, worker, sync, and correction tools. Live mode keeps only the performance surface.</p>
+
+      <ToolSection icon={<FolderPlus />} title="Import local files" description="Build a CueMate playlist from folders or individual audio files.">
+        <div className="field-group">
+          <label className="field-label">CueMate playlist name</label>
+          <input value={localName} onChange={(event) => setLocalName(event.target.value)} placeholder="New playlist name" />
+        </div>
+        <div className="split-actions">
+          <button className="wide-action secondary" disabled={pickerBusy} onClick={chooseLocalFolder}>
+            <FolderOpen size={16} /> Choose folder
+          </button>
+          <button className="wide-action secondary" disabled={pickerBusy} onClick={chooseAudioFiles}>
+            <FileAudio size={16} /> Choose audio files
+          </button>
+        </div>
+        <div className="field-group">
+          <label className="field-label">Selected files or folders</label>
+          <textarea value={localPaths} onChange={(event) => setLocalPaths(event.target.value)} placeholder={"One audio file or folder path per line"} rows={3} />
+          <p className="selection-summary">{localPathList.length ? `${localPathList.length} source path${localPathList.length === 1 ? "" : "s"} ready` : "Choose files/folders or paste paths manually."}</p>
+        </div>
+        <button
+          className="wide-action"
+          disabled={toolBusy || !localName.trim() || localPathList.length === 0}
+          onClick={() => onTool({ action: "import_playlist", name: localName, paths: localPathList })}
+        >
+          <FolderPlus size={16} /> Import local playlist
+        </button>
+      </ToolSection>
+
+      <ToolSection icon={<ListMusic />} title="Import DJ library" description="Pull an existing Rekordbox, Traktor, or Serato playlist into CueMate.">
+        <div className="field-group">
+          <label className="field-label">DJ source</label>
+          <select value={djSource} onChange={(event) => setDjSource(event.target.value as "rekordbox" | "traktor" | "serato")}>
+            <option value="rekordbox">Rekordbox XML</option>
+            <option value="traktor">Traktor NML</option>
+            <option value="serato">Serato crate</option>
+          </select>
+        </div>
+        <div className="field-group">
+          <label className="field-label">{djSource === "serato" ? "Serato crate folder" : "Library export file"}</label>
+          <div className="pick-row">
+            <input value={djLibrary} onChange={(event) => setDjLibrary(event.target.value)} placeholder={djSource === "serato" ? "Choose a Serato crate folder" : "Choose a Rekordbox XML or Traktor NML export"} />
+            <button className="path-pick" disabled={pickerBusy} onClick={chooseDJLibrary}>
+              <FolderOpen size={16} /> Browse
+            </button>
+          </div>
+        </div>
+        <div className="field-grid">
+          <div className="field-group">
+            <label className="field-label">Source playlist or crate</label>
+            <input value={djPlaylist} onChange={(event) => setDjPlaylist(event.target.value)} placeholder="Source name" />
+          </div>
+          <div className="field-group">
+            <label className="field-label">CueMate playlist name</label>
+            <input value={djName} onChange={(event) => setDjName(event.target.value)} placeholder="Optional name" />
+          </div>
+        </div>
+        <div className="split-actions">
+          <button className="wide-action secondary" disabled={toolBusy || !djLibrary.trim()} onClick={() => onTool({ action: "list_dj_playlists", source: djSource, library: djLibrary })}>
+            List
+          </button>
+          <button
+            className="wide-action"
+            disabled={toolBusy || !djLibrary.trim() || !djPlaylist.trim()}
+            onClick={() => onTool({ action: "import_dj_playlist", source: djSource, library: djLibrary, playlist: djPlaylist, name: djName || undefined })}
+          >
+            Import
+          </button>
+        </div>
+      </ToolSection>
+
+      {pickerError ? <div className="tool-result danger">File picker failed: {pickerError}</div> : null}
+
+      <ToolSection icon={<PlayCircle />} title="Analyze and workers" description="Queue feature extraction, run workers, and warm model services.">
+        <div className="field-grid">
+          <div className="field-group">
+            <label className="field-label">Playlist</label>
+            <select value={selectedAnalysisName} onChange={(event) => setAnalysisPlaylist(event.target.value)}>
+              <option value="">Choose playlist</option>
+              {playlists.map((item) => (
+                <option key={item.playlist_id} value={item.name}>
+                  {item.name}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="field-group">
+            <label className="field-label">Mode</label>
+            <select value={analysisMode} onChange={(event) => setAnalysisMode(event.target.value as "fast_pass" | "staged" | "full")}>
+              <option value="staged">staged</option>
+              <option value="full">full</option>
+              <option value="fast_pass">fast pass</option>
+            </select>
+          </div>
+        </div>
+        <label className="check-row">
+          <input type="checkbox" checked={forceAnalysis} onChange={(event) => setForceAnalysis(event.target.checked)} />
+          force re-analysis
+        </label>
+        <button
+          className="wide-action"
+          disabled={toolBusy || !selectedAnalysisName}
+          onClick={() => onTool({ action: "analyze_playlist", playlist: selectedAnalysisName, analysis_mode: analysisMode, force: forceAnalysis })}
+        >
+          Run analyze-playlist
+        </button>
+        <button className="wide-action secondary" disabled={!playlist || queueBusy} onClick={onQueue}>
+          <RefreshCw size={16} /> {queueBusy ? "Queueing..." : "Queue staged jobs"}
+        </button>
+        {queueResult != null ? <p className="muted">{queueResult} analysis jobs queued.</p> : null}
+        <div className="inline-inputs">
+          <input value={workerLimit} onChange={(event) => setWorkerLimit(event.target.value)} inputMode="numeric" />
+          <button disabled={toolBusy} onClick={() => onTool({ action: "run_analysis_worker", limit: parsedLimit })}>Run worker</button>
+        </div>
+        <button className="wide-action secondary" disabled={toolBusy} onClick={() => onTool({ action: "run_feedback_worker", limit: parsedLimit })}>
+          Run feedback worker
+        </button>
+        <div className="field-group">
+          <label className="field-label">Warmup audio path</label>
+          <input value={warmupPath} onChange={(event) => setWarmupPath(event.target.value)} placeholder="Optional path" />
+        </div>
+        <div className="split-actions">
+          <button className="wide-action secondary" disabled={toolBusy} onClick={() => onTool({ action: "prewarm_model_services", path: warmupPath || undefined })}>
+            Prewarm
+          </button>
+          <button className="wide-action secondary" disabled={toolBusy} onClick={() => onTool({ action: "download_essentia_models" })}>
+            Models
+          </button>
+        </div>
+      </ToolSection>
+
+      <ToolSection icon={<SlidersHorizontal />} title="Ops" description="Manual corrections, snapshots, and recent analysis queue state.">
+        <OpsPanel
+          playlist={playlist}
+          jobs={jobs}
+          onQueue={onQueue}
+          queueBusy={queueBusy}
+          queueResult={queueResult}
+          onSnapshot={onSnapshot}
+          snapshotBusy={snapshotBusy}
+          onCorrection={onCorrection}
+          correctionBusy={correctionBusy}
+        />
+      </ToolSection>
+
+      <ToolResultBox result={toolResult} error={toolError} busy={toolBusy} />
+    </div>
+  );
+}
+
+function ToolSection({ icon, title, description, children }: { icon: React.ReactNode; title: string; description?: string; children: React.ReactNode }) {
+  return (
+    <section className="tool-section">
+      <div className="tool-section-title">
+        {icon}
+        <div>
+          <span>{title}</span>
+          {description ? <p>{description}</p> : null}
+        </div>
+      </div>
+      {children}
+    </section>
+  );
+}
+
+function ToolResultBox({ result, error, busy }: { result: ToolCommandResult | null; error: Error | null; busy: boolean }) {
+  if (busy) return <div className="tool-result">Running tool...</div>;
+  if (error) return <div className="tool-result danger">{error.message}</div>;
+  if (!result) return null;
+  return (
+    <div className="tool-result">
+      <strong>{result.mode === "background" ? "Started" : "Completed"}</strong>
+      <small>{result.command.join(" ")}</small>
+      {result.pid ? <span>PID {result.pid}</span> : null}
+      {result.log_path ? <span>Log: {result.log_path}</span> : null}
+      {result.output ? <pre>{result.output}</pre> : null}
+    </div>
   );
 }
 

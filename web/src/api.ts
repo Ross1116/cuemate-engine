@@ -27,12 +27,21 @@ export type LaneItem = {
   title: string;
   artist: string;
   score: number;
+  raw_score: number;
+  penalty_multiplier: number;
   ranking_strength: string;
   move: string;
   move_confidence: number;
   move_note: string | null;
   risk: string;
   risk_score: number;
+  primary_lane: string | null;
+  secondary_lane: boolean;
+  component_scores: Record<string, number>;
+  component_confidences: Record<string, number>;
+  weights_used: Record<string, number>;
+  transition_features: Record<string, number | string | null>;
+  candidate_features: Record<string, number | string | string[] | null>;
   tempo_key: { tempo_text: string; key_text: string; key_state: string };
   advisory_hints: string[];
   reasons: string[];
@@ -46,6 +55,17 @@ export type LaneItem = {
     tempo_key: { tempo_text: string; key_text: string; key_state: string };
   };
   windows: Record<string, unknown>;
+};
+
+export type TrackFeatureDetail = {
+  track_id: string;
+  title: string;
+  artist: string;
+  basic: Record<string, number | string | null>;
+  absolute: Record<string, number | string | null>;
+  semantic: Record<string, number | string | null>;
+  relative: Record<string, number | string | string[] | Record<string, number> | null>;
+  analysis: Record<string, number | string | null>;
 };
 
 export type RecommendationResponse = {
@@ -127,6 +147,38 @@ export type AnalysisJob = {
   completed_at: string | null;
 };
 
+export type ToolCommandRequest = {
+  action: string;
+  name?: string;
+  paths?: string[];
+  source?: "rekordbox" | "traktor" | "serato";
+  library?: string;
+  playlist?: string;
+  analysis_mode?: "fast_pass" | "staged" | "full";
+  force?: boolean;
+  limit?: number;
+  path?: string;
+  print_backend_diagnostics?: boolean;
+};
+
+export type ToolCommandResult = {
+  status: string;
+  mode: "foreground" | "background";
+  command: string[];
+  exit_code?: number;
+  output?: string;
+  pid?: number;
+  log_path?: string;
+};
+
+export type PickPathRequest = {
+  kind: "folder" | "audio_files" | "dj_library_file";
+};
+
+export type PickPathResult = {
+  paths: string[];
+};
+
 const apiBase = import.meta.env.DEV ? "/api" : "";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -163,6 +215,8 @@ export const api = {
     request<{ items: Track[] }>(
       `/playlists/${encodeURIComponent(playlistId)}/tracks?limit=500${query ? `&query=${encodeURIComponent(query)}` : ""}`,
     ),
+  trackFeatures: (playlistId: string, trackId: string) =>
+    request<TrackFeatureDetail>(`/playlists/${encodeURIComponent(playlistId)}/tracks/${encodeURIComponent(trackId)}/features`),
   trackSearch: (playlistId: string, query: string) =>
     request<{ items: Track[] }>(
       `/tracks/search?playlist_id=${encodeURIComponent(playlistId)}&query=${encodeURIComponent(query)}&limit=50`,
@@ -209,5 +263,15 @@ export const api = {
     request<Record<string, unknown>>("/sync/playlists/snapshot", {
       method: "POST",
       body: JSON.stringify({ playlist_id: playlistId }),
+    }),
+  toolCommand: (body: ToolCommandRequest) =>
+    request<ToolCommandResult>("/tools/cli", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  pickPath: (body: PickPathRequest) =>
+    request<PickPathResult>("/tools/pick-path", {
+      method: "POST",
+      body: JSON.stringify(body),
     }),
 };

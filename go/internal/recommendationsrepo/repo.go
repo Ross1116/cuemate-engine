@@ -153,6 +153,56 @@ type PlaylistTrackSnapshot struct {
 	AnalysisState string
 }
 
+type TrackFeatureDetail struct {
+	TrackID                    string
+	Title                      string
+	Artist                     string
+	BPM                        *float64
+	Key                        *string
+	KeyConfidence              *float64
+	KeySource                  *string
+	KeyAgreement               *int32
+	EnergyAbs                  *float64
+	EnergyHeuristicAbs         *float64
+	EnergySustained            *float64
+	EnergyPeak                 *float64
+	LoudnessNorm               *float64
+	BassAbs                    *float64
+	DrumsAbs                   *float64
+	HarmonicAbs                *float64
+	GrooveAbs                  *float64
+	VocalsAbs                  *float64
+	VocalsConfidence           *float64
+	DanceabilityAbs            *float64
+	ArousalAbs                 *float64
+	ValenceAbs                 *float64
+	MoodAggressiveAbs          *float64
+	MoodPartyAbs               *float64
+	MoodRelaxedAbs             *float64
+	EnergyEssentiaFused        *float64
+	EnergyEssentiaBucket       *string
+	EssentiaSemanticSource     *string
+	EssentiaSemanticInferredAt *string
+	AnalysisMode               *string
+	AnalyzedAt                 *string
+	AnalysisSignature          *string
+	ConfigSignature            *string
+	ScoringContractAtAnalysis  *string
+	EnergyRel                  *float64
+	BassRel                    *float64
+	DrumsRel                   *float64
+	VocalsRel                  *float64
+	GrooveRel                  *float64
+	EnergySpread               *float64
+	BassSpread                 *float64
+	DrumsSpread                *float64
+	VocalsSpread               *float64
+	GrooveSpread               *float64
+	IntensityBand              *string
+	IntensityMembership        map[string]float64
+	RoleHints                  []string
+}
+
 type PlaylistSyncState struct {
 	PlaylistID              string
 	LastSnapshotID          string
@@ -488,6 +538,201 @@ func (r *Repository) ListPlaylistTracks(ctx context.Context, playlistID, query, 
 		end = len(filtered)
 	}
 	return filtered[offset:end], nil
+}
+
+func (r *Repository) GetTrackFeatureDetail(ctx context.Context, playlistID, trackID string) (TrackFeatureDetail, error) {
+	row := r.db.QueryRowContext(ctx, `
+		SELECT
+		  t.id,
+		  COALESCE(t.title, ''),
+		  COALESCE(t.artist, ''),
+		  f.bpm,
+		  f.key,
+		  f.key_confidence,
+		  f.key_source,
+		  f.key_agreement,
+		  f.energy_abs,
+		  f.energy_heuristic_abs,
+		  f.energy_sustained,
+		  f.energy_peak,
+		  f.loudness_norm,
+		  f.bass_abs,
+		  f.drums_abs,
+		  f.harmonic_abs,
+		  f.groove_abs,
+		  f.vocals_abs,
+		  f.vocals_confidence,
+		  f.danceability_abs,
+		  f.arousal_abs,
+		  f.valence_abs,
+		  f.mood_aggressive_abs,
+		  f.mood_party_abs,
+		  f.mood_relaxed_abs,
+		  f.energy_essentia_fused,
+		  f.energy_essentia_bucket,
+		  f.essentia_semantic_source,
+		  f.essentia_semantic_inferred_at,
+		  f.analysis_mode,
+		  f.analyzed_at,
+		  f.analysis_signature,
+		  f.config_signature,
+		  f.scoring_contract_id_at_analysis,
+		  rel.energy_rel,
+		  rel.bass_rel,
+		  rel.drums_rel,
+		  rel.vocals_rel,
+		  rel.groove_rel,
+		  rel.energy_spread,
+		  rel.bass_spread,
+		  rel.drums_spread,
+		  rel.vocals_spread,
+		  rel.groove_spread,
+		  rel.intensity_band,
+		  rel.intensity_membership,
+		  rel.role_hints
+		FROM playlist_tracks pt
+		JOIN tracks t ON t.id = pt.track_id
+		LEFT JOIN track_features_abs f ON f.track_id = t.id
+		LEFT JOIN track_features_rel rel ON rel.track_id = t.id AND rel.playlist_id = pt.playlist_id
+		WHERE pt.playlist_id = ? AND t.id = ?
+	`, playlistID, trackID)
+
+	var detail TrackFeatureDetail
+	var bpm, keyConfidence, energyAbs, energyHeuristicAbs, energySustained, energyPeak sql.NullFloat64
+	var loudnessNorm, bassAbs, drumsAbs, harmonicAbs, grooveAbs, vocalsAbs, vocalsConfidence sql.NullFloat64
+	var danceabilityAbs, arousalAbs, valenceAbs, moodAggressiveAbs, moodPartyAbs, moodRelaxedAbs sql.NullFloat64
+	var energyEssentiaFused sql.NullFloat64
+	var energyRel, bassRel, drumsRel, vocalsRel, grooveRel sql.NullFloat64
+	var energySpread, bassSpread, drumsSpread, vocalsSpread, grooveSpread sql.NullFloat64
+	var keyAgreement sql.NullInt64
+	var key, keySource, energyEssentiaBucket, semanticSource, semanticInferredAt sql.NullString
+	var analysisMode, analyzedAt, analysisSignature, configSignature, scoringContract sql.NullString
+	var intensityBand, intensityMembership, roleHints sql.NullString
+	if err := row.Scan(
+		&detail.TrackID,
+		&detail.Title,
+		&detail.Artist,
+		&bpm,
+		&key,
+		&keyConfidence,
+		&keySource,
+		&keyAgreement,
+		&energyAbs,
+		&energyHeuristicAbs,
+		&energySustained,
+		&energyPeak,
+		&loudnessNorm,
+		&bassAbs,
+		&drumsAbs,
+		&harmonicAbs,
+		&grooveAbs,
+		&vocalsAbs,
+		&vocalsConfidence,
+		&danceabilityAbs,
+		&arousalAbs,
+		&valenceAbs,
+		&moodAggressiveAbs,
+		&moodPartyAbs,
+		&moodRelaxedAbs,
+		&energyEssentiaFused,
+		&energyEssentiaBucket,
+		&semanticSource,
+		&semanticInferredAt,
+		&analysisMode,
+		&analyzedAt,
+		&analysisSignature,
+		&configSignature,
+		&scoringContract,
+		&energyRel,
+		&bassRel,
+		&drumsRel,
+		&vocalsRel,
+		&grooveRel,
+		&energySpread,
+		&bassSpread,
+		&drumsSpread,
+		&vocalsSpread,
+		&grooveSpread,
+		&intensityBand,
+		&intensityMembership,
+		&roleHints,
+	); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return TrackFeatureDetail{}, ErrTrackNotFound
+		}
+		return TrackFeatureDetail{}, err
+	}
+
+	detail.BPM = nullableFloatPtr(bpm)
+	detail.Key = nullableStringPtr(key)
+	detail.KeyConfidence = nullableFloatPtr(keyConfidence)
+	detail.KeySource = nullableStringPtr(keySource)
+	if keyAgreement.Valid {
+		value := int32(keyAgreement.Int64)
+		detail.KeyAgreement = &value
+	}
+	detail.EnergyAbs = nullableFloatPtr(energyAbs)
+	detail.EnergyHeuristicAbs = nullableFloatPtr(energyHeuristicAbs)
+	detail.EnergySustained = nullableFloatPtr(energySustained)
+	detail.EnergyPeak = nullableFloatPtr(energyPeak)
+	detail.LoudnessNorm = nullableFloatPtr(loudnessNorm)
+	detail.BassAbs = nullableFloatPtr(bassAbs)
+	detail.DrumsAbs = nullableFloatPtr(drumsAbs)
+	detail.HarmonicAbs = nullableFloatPtr(harmonicAbs)
+	detail.GrooveAbs = nullableFloatPtr(grooveAbs)
+	detail.VocalsAbs = nullableFloatPtr(vocalsAbs)
+	detail.VocalsConfidence = nullableFloatPtr(vocalsConfidence)
+	detail.DanceabilityAbs = nullableFloatPtr(danceabilityAbs)
+	detail.ArousalAbs = nullableFloatPtr(arousalAbs)
+	detail.ValenceAbs = nullableFloatPtr(valenceAbs)
+	detail.MoodAggressiveAbs = nullableFloatPtr(moodAggressiveAbs)
+	detail.MoodPartyAbs = nullableFloatPtr(moodPartyAbs)
+	detail.MoodRelaxedAbs = nullableFloatPtr(moodRelaxedAbs)
+	detail.EnergyEssentiaFused = nullableFloatPtr(energyEssentiaFused)
+	detail.EnergyEssentiaBucket = nullableStringPtr(energyEssentiaBucket)
+	detail.EssentiaSemanticSource = nullableStringPtr(semanticSource)
+	detail.EssentiaSemanticInferredAt = nullableStringPtr(semanticInferredAt)
+	detail.AnalysisMode = nullableStringPtr(analysisMode)
+	detail.AnalyzedAt = nullableStringPtr(analyzedAt)
+	detail.AnalysisSignature = nullableStringPtr(analysisSignature)
+	detail.ConfigSignature = nullableStringPtr(configSignature)
+	detail.ScoringContractAtAnalysis = nullableStringPtr(scoringContract)
+	detail.EnergyRel = nullableFloatPtr(energyRel)
+	detail.BassRel = nullableFloatPtr(bassRel)
+	detail.DrumsRel = nullableFloatPtr(drumsRel)
+	detail.VocalsRel = nullableFloatPtr(vocalsRel)
+	detail.GrooveRel = nullableFloatPtr(grooveRel)
+	detail.EnergySpread = nullableFloatPtr(energySpread)
+	detail.BassSpread = nullableFloatPtr(bassSpread)
+	detail.DrumsSpread = nullableFloatPtr(drumsSpread)
+	detail.VocalsSpread = nullableFloatPtr(vocalsSpread)
+	detail.GrooveSpread = nullableFloatPtr(grooveSpread)
+	detail.IntensityBand = nullableStringPtr(intensityBand)
+	if intensityMembership.Valid && strings.TrimSpace(intensityMembership.String) != "" {
+		if err := json.Unmarshal([]byte(intensityMembership.String), &detail.IntensityMembership); err != nil {
+			log.Printf("warning: failed to decode intensity_membership %q: %v", intensityMembership.String, err)
+		}
+	}
+	if roleHints.Valid && strings.TrimSpace(roleHints.String) != "" {
+		if err := json.Unmarshal([]byte(roleHints.String), &detail.RoleHints); err != nil {
+			log.Printf("warning: failed to decode role_hints %q: %v", roleHints.String, err)
+		}
+	}
+	return detail, nil
+}
+
+func nullableFloatPtr(value sql.NullFloat64) *float64 {
+	if !value.Valid {
+		return nil
+	}
+	return &value.Float64
+}
+
+func nullableStringPtr(value sql.NullString) *string {
+	if !value.Valid {
+		return nil
+	}
+	return &value.String
 }
 
 func (r *Repository) SearchTracks(ctx context.Context, playlistID, query string, limit int) ([]PlaylistTrackSnapshot, error) {

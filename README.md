@@ -12,6 +12,7 @@ The repository is centered on a **Python-first analysis engine** with:
 - Docker-backed model workers for BPM, key, and semantic mood/intensity analysis, with TempoCNN and Essentia semantics sharing one TensorFlow/Essentia service
 
 The Go and protobuf layers now define the shipped local API and scorer boundary, while the scoring semantics still live in the Python analysis plane.
+The repository now also includes a responsive local PWA client under `web/` for library browsing, recommendations, feedback, corrections, sync/admin visibility, and mobile browser use.
 
 ## Current State
 
@@ -121,6 +122,11 @@ The current pipeline is split into 5 main layers:
 |
 |- proto/
 |  |- djengine/scoring/v1/scoring.proto  # Shared scoring contract
+|  |- README.md
+|
+|- web/
+|  |- src/                               # Responsive CueMate PWA client
+|  |- package.json
 |  |- README.md
 |
 |- python/

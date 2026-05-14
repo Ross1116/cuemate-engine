@@ -26,6 +26,20 @@ type PlaylistRef struct {
 	Name string
 }
 
+type PlaylistSummary struct {
+	ID                  string
+	Name                string
+	TrackCount          int
+	CreatedAt           string
+	UpdatedAt           string
+	TrackCountAnalyzed  int
+	EligibleTrackCount  int
+	IsStale             bool
+	StaleReason         string
+	FeedbackEventCount  int
+	FeedbackLastTunedAt *string
+}
+
 type TrackContextRecord struct {
 	TrackID                   string
 	FilePath                  string
@@ -180,6 +194,22 @@ type FeedbackTuningJobRecord struct {
 	ErrorMessage   *string
 }
 
+type AnalysisJobRecord struct {
+	ID              int64
+	PlaylistID      *string
+	TrackID         *string
+	TrackPath       string
+	Status          string
+	Priority        int
+	AnalysisMode    string
+	JobKind         string
+	ErrorMessage    *string
+	DurationSeconds *float64
+	CreatedAt       string
+	StartedAt       *string
+	CompletedAt     *string
+}
+
 type Repository struct {
 	db *sql.DB
 }
@@ -239,6 +269,58 @@ func (r *Repository) ResolvePlaylist(ctx context.Context, playlistID, playlistNa
 		return PlaylistRef{}, err
 	}
 	return playlist, nil
+}
+
+func (r *Repository) ListPlaylists(ctx context.Context) ([]PlaylistSummary, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT
+		  p.id,
+		  p.name,
+		  p.track_count,
+		  p.created_at,
+		  p.updated_at,
+		  COALESCE(ps.track_count_analyzed, 0),
+		  COALESCE(ps.eligible_track_count, 0),
+		  COALESCE(ps.is_stale, 0),
+		  COALESCE(ps.stale_reason, ''),
+		  COALESCE(ps.feedback_event_count, 0),
+		  ps.feedback_last_tuned_at
+		FROM playlists p
+		LEFT JOIN playlist_stats ps ON ps.playlist_id = p.id
+		ORDER BY p.updated_at DESC, p.name ASC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []PlaylistSummary
+	for rows.Next() {
+		var item PlaylistSummary
+		var staleInt int64
+		var tunedAt sql.NullString
+		if err := rows.Scan(
+			&item.ID,
+			&item.Name,
+			&item.TrackCount,
+			&item.CreatedAt,
+			&item.UpdatedAt,
+			&item.TrackCountAnalyzed,
+			&item.EligibleTrackCount,
+			&staleInt,
+			&item.StaleReason,
+			&item.FeedbackEventCount,
+			&tunedAt,
+		); err != nil {
+			return nil, err
+		}
+		item.IsStale = staleInt != 0
+		if tunedAt.Valid {
+			item.FeedbackLastTunedAt = &tunedAt.String
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
 }
 
 func (r *Repository) HydrateRecommendations(
@@ -372,6 +454,120 @@ func (r *Repository) GetPlaylistSnapshotTracks(ctx context.Context, playlistID s
 	return out, rows.Err()
 }
 
+func (r *Repository) ListPlaylistTracks(ctx context.Context, playlistID, query, analysisState string, limit, offset int) ([]PlaylistTrackSnapshot, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	tracks, err := r.GetPlaylistSnapshotTracks(ctx, playlistID)
+	if err != nil {
+		return nil, err
+	}
+	query = strings.ToLower(strings.TrimSpace(query))
+	analysisState = strings.TrimSpace(analysisState)
+	filtered := make([]PlaylistTrackSnapshot, 0, len(tracks))
+	for _, track := range tracks {
+		if query != "" {
+			haystack := strings.ToLower(track.Title + " " + track.Artist + " " + track.TrackID)
+			if !strings.Contains(haystack, query) {
+				continue
+			}
+		}
+		if analysisState != "" && track.AnalysisState != analysisState {
+			continue
+		}
+		filtered = append(filtered, track)
+	}
+	if offset >= len(filtered) {
+		return []PlaylistTrackSnapshot{}, nil
+	}
+	end := offset + limit
+	if end > len(filtered) {
+		end = len(filtered)
+	}
+	return filtered[offset:end], nil
+}
+
+func (r *Repository) SearchTracks(ctx context.Context, playlistID, query string, limit int) ([]PlaylistTrackSnapshot, error) {
+	if strings.TrimSpace(playlistID) != "" {
+		return r.ListPlaylistTracks(ctx, playlistID, query, "", limit, 0)
+	}
+	if limit <= 0 || limit > 100 {
+		limit = 25
+	}
+	like := "%" + strings.ToLower(strings.TrimSpace(query)) + "%"
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT
+		  t.id,
+		  COALESCE(t.title, ''),
+		  COALESCE(t.artist, ''),
+		  0,
+		  f.bpm,
+		  f.key,
+		  NULL,
+		  NULL,
+		  f.analysis_signature,
+		  f.config_signature,
+		  f.scoring_contract_id_at_analysis
+		FROM tracks t
+		LEFT JOIN track_features_abs f ON f.track_id = t.id
+		WHERE ? = '%%' OR lower(t.title) LIKE ? OR lower(t.artist) LIKE ? OR lower(t.id) LIKE ?
+		ORDER BY COALESCE(t.artist, ''), COALESCE(t.title, ''), t.id
+		LIMIT ?
+	`, like, like, like, like, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PlaylistTrackSnapshot
+	for rows.Next() {
+		var track PlaylistTrackSnapshot
+		var bpm sql.NullFloat64
+		var musicalKey sql.NullString
+		var intensityBand sql.NullString
+		var roleHints sql.NullString
+		var analysisSig sql.NullString
+		var configSig sql.NullString
+		var scoringContract sql.NullString
+		if err := rows.Scan(
+			&track.TrackID,
+			&track.Title,
+			&track.Artist,
+			&track.Position,
+			&bpm,
+			&musicalKey,
+			&intensityBand,
+			&roleHints,
+			&analysisSig,
+			&configSig,
+			&scoringContract,
+		); err != nil {
+			return nil, err
+		}
+		if bpm.Valid {
+			track.BPM = &bpm.Float64
+		}
+		if musicalKey.Valid {
+			track.Key = &musicalKey.String
+		}
+		if intensityBand.Valid {
+			track.IntensityBand = &intensityBand.String
+		}
+		if roleHints.Valid && strings.TrimSpace(roleHints.String) != "" {
+			_ = json.Unmarshal([]byte(roleHints.String), &track.RoleHints)
+		}
+		if !analysisSig.Valid || !configSig.Valid || !scoringContract.Valid {
+			track.AnalysisState = "unanalysed"
+		} else {
+			track.AnalysisState = "ready"
+		}
+		out = append(out, track)
+	}
+	return out, rows.Err()
+}
+
 func (r *Repository) GetTrackForCorrection(ctx context.Context, trackID string) (TrackContextRecord, error) {
 	row := r.db.QueryRowContext(
 		ctx,
@@ -412,6 +608,160 @@ func (r *Repository) GetTrackForCorrection(ctx context.Context, trackID string) 
 		return TrackContextRecord{}, err
 	}
 	return record, nil
+}
+
+func (r *Repository) QueuePlaylistAnalysis(
+	ctx context.Context,
+	playlistID string,
+	analysisMode string,
+	force bool,
+	analysisSignature string,
+	configSignature string,
+) (int, error) {
+	if strings.TrimSpace(analysisMode) == "" {
+		analysisMode = "staged"
+	}
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT
+		  t.id,
+		  t.file_path,
+		  t.file_hash,
+		  f.track_id
+		FROM playlist_tracks pt
+		JOIN tracks t ON t.id = pt.track_id
+		LEFT JOIN track_features_abs f ON f.track_id = t.id
+		WHERE pt.playlist_id = ?
+		ORDER BY pt.position ASC
+	`, playlistID)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	type pendingTrack struct {
+		id       string
+		path     string
+		fileHash *string
+		analyzed bool
+	}
+	var tracks []pendingTrack
+	for rows.Next() {
+		var item pendingTrack
+		var fileHash sql.NullString
+		var analyzedID sql.NullString
+		if err := rows.Scan(&item.id, &item.path, &fileHash, &analyzedID); err != nil {
+			return 0, err
+		}
+		if fileHash.Valid {
+			item.fileHash = &fileHash.String
+		}
+		item.analyzed = analyzedID.Valid
+		tracks = append(tracks, item)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	count := 0
+	for _, track := range tracks {
+		if track.analyzed && !force {
+			continue
+		}
+		if _, err := r.CreateAnalysisJobWithKind(
+			ctx,
+			&playlistID,
+			track.id,
+			track.path,
+			"enrichment",
+			analysisMode,
+			analysisSignature,
+			configSignature,
+			track.fileHash,
+			50,
+			NowUTC(),
+		); err != nil {
+			return count, err
+		}
+		count++
+	}
+	return count, nil
+}
+
+func (r *Repository) ListAnalysisJobs(ctx context.Context, playlistID, status string, limit int) ([]AnalysisJobRecord, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	where := []string{"1=1"}
+	args := []any{}
+	if strings.TrimSpace(playlistID) != "" {
+		where = append(where, "playlist_id = ?")
+		args = append(args, playlistID)
+	}
+	if strings.TrimSpace(status) != "" {
+		where = append(where, "status = ?")
+		args = append(args, status)
+	}
+	args = append(args, limit)
+	rows, err := r.db.QueryContext(ctx, fmt.Sprintf(`
+		SELECT
+		  id, playlist_id, track_id, track_path, status, priority, analysis_mode,
+		  job_kind, error_message, duration_seconds, created_at, started_at, completed_at
+		FROM analysis_jobs
+		WHERE %s
+		ORDER BY created_at DESC, id DESC
+		LIMIT ?
+	`, strings.Join(where, " AND ")), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AnalysisJobRecord
+	for rows.Next() {
+		var item AnalysisJobRecord
+		var playlistIDValue sql.NullString
+		var trackID sql.NullString
+		var errorMessage sql.NullString
+		var duration sql.NullFloat64
+		var startedAt sql.NullString
+		var completedAt sql.NullString
+		if err := rows.Scan(
+			&item.ID,
+			&playlistIDValue,
+			&trackID,
+			&item.TrackPath,
+			&item.Status,
+			&item.Priority,
+			&item.AnalysisMode,
+			&item.JobKind,
+			&errorMessage,
+			&duration,
+			&item.CreatedAt,
+			&startedAt,
+			&completedAt,
+		); err != nil {
+			return nil, err
+		}
+		if playlistIDValue.Valid {
+			item.PlaylistID = &playlistIDValue.String
+		}
+		if trackID.Valid {
+			item.TrackID = &trackID.String
+		}
+		if errorMessage.Valid {
+			item.ErrorMessage = &errorMessage.String
+		}
+		if duration.Valid {
+			item.DurationSeconds = &duration.Float64
+		}
+		if startedAt.Valid {
+			item.StartedAt = &startedAt.String
+		}
+		if completedAt.Valid {
+			item.CompletedAt = &completedAt.String
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
 }
 
 func (r *Repository) GetTrackImportedValues(ctx context.Context, trackID string) (*float64, *string, error) {

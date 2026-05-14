@@ -202,7 +202,7 @@ def test_serve_scoring_cli_delegates_to_service(monkeypatch):
     }
 
 
-def test_score_pair_prints_stub_and_missing_vocal_notes(monkeypatch, capsys):
+def test_score_pair_prints_stub_and_missing_vocal_notes(monkeypatch, capfd):
     current = _ctx(track_id="trk_current", title="Current", vocals_rel=None)
     candidate = _ctx(track_id="trk_candidate", title="Candidate", vocals_rel=None)
     contexts = {
@@ -291,7 +291,7 @@ def test_score_pair_prints_stub_and_missing_vocal_notes(monkeypatch, capsys):
             "reset",
         ]
     ) == 0
-    out = capsys.readouterr().out
+    out = capfd.readouterr().out
     assert "Score pair: Test Artist - Current [trk_current]  ->  Test Artist - Candidate [trk_candidate]" in out
     assert "Stubbed and excluded from weighted scoring" in out
     assert "vocals_abs / vocals_rel are not populated yet" in out

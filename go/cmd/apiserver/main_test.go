@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	scoringv1 "github.com/Ross1116/cuemate-engine/go/gen/djengine/scoring/v1"
@@ -870,6 +871,85 @@ func TestOutboxPullAndAckLifecycle(t *testing.T) {
 	}
 	if secondItems[0].(map[string]any)["entity_id"] != "corr_1" {
 		t.Fatalf("remaining item = %#v", secondItems[0])
+	}
+}
+
+func TestClientPlaylistAndTrackBrowseEndpoints(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/playlists", nil)
+	rec := httptest.NewRecorder()
+	srv.handlePlaylists(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var playlists map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &playlists); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	items := playlists["items"].([]any)
+	if len(items) != 1 || items[0].(map[string]any)["playlist_id"] != "pl_1" {
+		t.Fatalf("playlists = %#v", playlists)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/playlists/pl_1/tracks?query=Candidate", nil)
+	rec = httptest.NewRecorder()
+	srv.handlePlaylistRoutes(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var tracks map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &tracks); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	trackItems := tracks["items"].([]any)
+	if len(trackItems) != 1 || trackItems[0].(map[string]any)["track_id"] != "trk_candidate" {
+		t.Fatalf("tracks = %#v", tracks)
+	}
+}
+
+func TestClientAnalysisEnqueueEndpoint(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/playlists/pl_1/analysis/enqueue", bytes.NewBufferString(`{"analysis_mode":"staged","force":true}`))
+	rec := httptest.NewRecorder()
+	srv.handlePlaylistRoutes(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	if payload["queued_count"] != float64(3) {
+		t.Fatalf("payload = %#v", payload)
+	}
+	jobs, err := srv.repo.ListAnalysisJobs(context.Background(), "pl_1", "pending", 10)
+	if err != nil {
+		t.Fatalf("ListAnalysisJobs: %v", err)
+	}
+	if len(jobs) != 3 {
+		t.Fatalf("jobs = %#v", jobs)
+	}
+}
+
+func TestWebAppFallbackServesIndex(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "index.html"), []byte("<main>CueMate</main>"), 0o644); err != nil {
+		t.Fatalf("write index: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/performance/deck", nil)
+	rec := httptest.NewRecorder()
+	handleWebApp(dir)(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "CueMate") {
+		t.Fatalf("body = %s", rec.Body.String())
 	}
 }
 

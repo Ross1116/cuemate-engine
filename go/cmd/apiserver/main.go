@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -30,6 +32,7 @@ var liveLaneOrder = []string{"maintain", "build", "reset", "jump", "contrast"}
 type appConfig struct {
 	Addr     string
 	Database string
+	WebDist  string
 }
 
 type recommendationRequest struct {
@@ -80,6 +83,11 @@ type outboxAckRequest struct {
 	AckedAt      string `json:"acked_at"`
 }
 
+type enqueueAnalysisRequest struct {
+	AnalysisMode string `json:"analysis_mode"`
+	Force        bool   `json:"force"`
+}
+
 type server struct {
 	repo    *recommendationsrepo.Repository
 	runtime *scoringruntime.Runtime
@@ -110,6 +118,11 @@ func run() int {
 	mux.HandleFunc("/healthz", srv.handleHealthz)
 	mux.HandleFunc("/readyz", srv.handleReadyz)
 	mux.HandleFunc("/scoring/metadata", srv.handleMetadata)
+	mux.HandleFunc("/playlists", srv.handlePlaylists)
+	mux.HandleFunc("/playlists/", srv.handlePlaylistRoutes)
+	mux.HandleFunc("/tracks/search", srv.handleTrackSearch)
+	mux.HandleFunc("/analysis/jobs", srv.handleAnalysisJobs)
+	mux.HandleFunc("/recommendation-events", srv.handleRecommendationEvents)
 	mux.HandleFunc("/recommendations", srv.handleRecommendations)
 	mux.HandleFunc("/events/played", srv.handlePlayedEvent)
 	mux.HandleFunc("/feedback/summary", srv.handleFeedbackSummary)
@@ -118,6 +131,7 @@ func run() int {
 	mux.HandleFunc("/sync/playlists/snapshot/ack", srv.handleSnapshotAck)
 	mux.HandleFunc("/sync/outbox/pull", srv.handleOutboxPull)
 	mux.HandleFunc("/sync/outbox/ack", srv.handleOutboxAck)
+	mux.HandleFunc("/", handleWebApp(cfg.WebDist))
 
 	httpServer := &http.Server{
 		Addr:         cfg.Addr,
@@ -171,6 +185,7 @@ func loadConfig() appConfig {
 	return appConfig{
 		Addr:     addr,
 		Database: strings.TrimPrefix(databaseURL, "sqlite:"),
+		WebDist:  firstNonEmpty(strings.TrimSpace(os.Getenv("WEB_DIST_DIR")), "web/dist"),
 	}
 }
 
@@ -200,6 +215,206 @@ func (s *server) handleMetadata(w http.ResponseWriter, r *http.Request) {
 		"metadata_fresh": err == nil,
 		"metadata_error": errorString(err),
 	})
+}
+
+func handleWebApp(webDist string) http.HandlerFunc {
+	fileServer := http.FileServer(http.Dir(webDist))
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		cleanPath := filepath.Clean(strings.TrimPrefix(r.URL.Path, "/"))
+		if cleanPath == "." {
+			cleanPath = "index.html"
+		}
+		fullPath := filepath.Join(webDist, cleanPath)
+		if info, err := os.Stat(fullPath); err == nil && !info.IsDir() {
+			fileServer.ServeHTTP(w, r)
+			return
+		}
+		http.ServeFile(w, r, filepath.Join(webDist, "index.html"))
+	}
+}
+
+func (s *server) handlePlaylists(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	playlists, err := s.repo.ListPlaylists(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	items := make([]any, 0, len(playlists))
+	for _, playlist := range playlists {
+		items = append(items, playlistSummaryPayload(playlist))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *server) handlePlaylistRoutes(w http.ResponseWriter, r *http.Request) {
+	rest := strings.Trim(strings.TrimPrefix(r.URL.Path, "/playlists/"), "/")
+	if rest == "" {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "playlist route not found"})
+		return
+	}
+	parts := strings.Split(rest, "/")
+	playlistID := parts[0]
+	switch {
+	case len(parts) == 1 && r.Method == http.MethodGet:
+		s.handlePlaylistDetail(w, r, playlistID)
+	case len(parts) == 2 && parts[1] == "tracks":
+		s.handlePlaylistTracks(w, r, playlistID)
+	case len(parts) == 3 && parts[1] == "analysis" && parts[2] == "enqueue":
+		s.handlePlaylistAnalysisEnqueue(w, r, playlistID)
+	default:
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "playlist route not found"})
+	}
+}
+
+func (s *server) handlePlaylistDetail(w http.ResponseWriter, r *http.Request, playlistID string) {
+	playlist, err := s.repo.ResolvePlaylist(r.Context(), playlistID, "")
+	if err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, recommendationsrepo.ErrPlaylistNotFound) {
+			status = http.StatusNotFound
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	stats, err := s.repo.GetPlaylistStats(r.Context(), playlist.ID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"playlist_id": playlist.ID,
+		"name":        playlist.Name,
+		"stats":       playlistStatsPayload(stats),
+	})
+}
+
+func (s *server) handlePlaylistTracks(w http.ResponseWriter, r *http.Request, playlistID string) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	if _, err := s.repo.ResolvePlaylist(r.Context(), playlistID, ""); err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, recommendationsrepo.ErrPlaylistNotFound) {
+			status = http.StatusNotFound
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	query := r.URL.Query().Get("query")
+	analysisState := r.URL.Query().Get("analysis_state")
+	limit := queryInt(r, "limit", 100)
+	offset := queryInt(r, "offset", 0)
+	tracks, err := s.repo.ListPlaylistTracks(r.Context(), playlistID, query, analysisState, limit, offset)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	items := make([]any, 0, len(tracks))
+	for _, track := range tracks {
+		items = append(items, playlistTrackPayload(track))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items, "limit": limit, "offset": offset})
+}
+
+func (s *server) handleTrackSearch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	playlistID := r.URL.Query().Get("playlist_id")
+	tracks, err := s.repo.SearchTracks(r.Context(), playlistID, r.URL.Query().Get("query"), queryInt(r, "limit", 25))
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	items := make([]any, 0, len(tracks))
+	for _, track := range tracks {
+		items = append(items, playlistTrackPayload(track))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *server) handleAnalysisJobs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	jobs, err := s.repo.ListAnalysisJobs(r.Context(), r.URL.Query().Get("playlist_id"), r.URL.Query().Get("status"), queryInt(r, "limit", 50))
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	items := make([]any, 0, len(jobs))
+	for _, job := range jobs {
+		items = append(items, analysisJobPayload(job))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *server) handleRecommendationEvents(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	playlistID := strings.TrimSpace(r.URL.Query().Get("playlist_id"))
+	if playlistID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "playlist_id is required"})
+		return
+	}
+	events, err := s.repo.ListRecommendationEventsByPlaylist(r.Context(), playlistID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	limit := queryInt(r, "limit", 25)
+	if limit > len(events) {
+		limit = len(events)
+	}
+	items := make([]any, 0, limit)
+	for _, event := range events[:limit] {
+		items = append(items, recommendationEventPayload(event))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *server) handlePlaylistAnalysisEnqueue(w http.ResponseWriter, r *http.Request, playlistID string) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	var req enqueueAnalysisRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON request"})
+		return
+	}
+	metadata, err := s.runtime.RefreshMetadata(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": scoringruntime.DescribeUnavailable(err)})
+		return
+	}
+	active := metadata.GetActiveSignatures()
+	queued, err := s.repo.QueuePlaylistAnalysis(
+		r.Context(),
+		playlistID,
+		req.AnalysisMode,
+		req.Force,
+		active.GetAnalysisSignature(),
+		active.GetConfigSignature(),
+	)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"playlist_id": playlistID, "queued_count": queued})
 }
 
 func (s *server) handleRecommendations(w http.ResponseWriter, r *http.Request) {
@@ -1605,6 +1820,92 @@ func currentTrackPayload(record recommendationsrepo.TrackContextRecord) map[stri
 	}
 }
 
+func playlistSummaryPayload(playlist recommendationsrepo.PlaylistSummary) map[string]any {
+	return map[string]any{
+		"playlist_id":            playlist.ID,
+		"name":                   playlist.Name,
+		"track_count":            playlist.TrackCount,
+		"created_at":             playlist.CreatedAt,
+		"updated_at":             playlist.UpdatedAt,
+		"track_count_analyzed":   playlist.TrackCountAnalyzed,
+		"eligible_track_count":   playlist.EligibleTrackCount,
+		"is_stale":               playlist.IsStale,
+		"stale_reason":           nullIfEmpty(playlist.StaleReason),
+		"feedback_event_count":   playlist.FeedbackEventCount,
+		"feedback_last_tuned_at": stringOrNil(playlist.FeedbackLastTunedAt),
+	}
+}
+
+func playlistStatsPayload(stats *recommendationsrepo.PlaylistStats) any {
+	if stats == nil {
+		return nil
+	}
+	return map[string]any{
+		"track_count_total":       stats.TrackCountTotal,
+		"track_count_analyzed":    stats.TrackCountAnalyzed,
+		"eligible_track_count":    stats.EligibleTrackCount,
+		"energy_spread":           valueOrNil(stats.EnergySpread),
+		"relative_signature":      stats.RelativeSignature,
+		"is_stale":                stats.IsStale,
+		"stale_reason":            nullIfEmpty(stats.StaleReason),
+		"adapted_weights":         float64MapToAnyMap(stats.AdaptedWeights),
+		"feedback_tuned_weights":  nilIfEmptyWeightMap(stats.FeedbackTunedWeights),
+		"feedback_tuning_notes":   append([]string{}, stats.FeedbackTuningNotes...),
+		"feedback_event_count":    stats.FeedbackEventCount,
+		"feedback_last_tuned_at":  stringOrNil(stats.FeedbackLastTunedAt),
+		"feedback_tuning_metrics": stats.FeedbackTuningMetrics,
+	}
+}
+
+func playlistTrackPayload(track recommendationsrepo.PlaylistTrackSnapshot) map[string]any {
+	return map[string]any{
+		"track_id":       track.TrackID,
+		"title":          track.Title,
+		"artist":         track.Artist,
+		"position":       track.Position,
+		"bpm":            valueOrNil(track.BPM),
+		"key":            stringOrNil(track.Key),
+		"intensity_band": stringOrNil(track.IntensityBand),
+		"role_hints":     append([]string{}, track.RoleHints...),
+		"analysis_state": track.AnalysisState,
+	}
+}
+
+func analysisJobPayload(job recommendationsrepo.AnalysisJobRecord) map[string]any {
+	return map[string]any{
+		"id":               job.ID,
+		"playlist_id":      stringOrNil(job.PlaylistID),
+		"track_id":         stringOrNil(job.TrackID),
+		"track_path":       job.TrackPath,
+		"status":           job.Status,
+		"priority":         job.Priority,
+		"analysis_mode":    job.AnalysisMode,
+		"job_kind":         job.JobKind,
+		"error_message":    stringOrNil(job.ErrorMessage),
+		"duration_seconds": valueOrNil(job.DurationSeconds),
+		"created_at":       job.CreatedAt,
+		"started_at":       stringOrNil(job.StartedAt),
+		"completed_at":     stringOrNil(job.CompletedAt),
+	}
+}
+
+func recommendationEventPayload(event recommendationsrepo.RecommendationEventRecord) map[string]any {
+	return map[string]any{
+		"event_id":                  event.ID,
+		"playlist_id":               event.PlaylistID,
+		"current_track_id":          event.CurrentTrackID,
+		"target":                    event.Target,
+		"candidate_count":           event.CandidateCount,
+		"recommendation_confidence": valueOrNil(event.RecommendationConfidence),
+		"recommendations_status":    event.RecommendationsStatus,
+		"track_chosen":              stringOrNil(event.TrackChosen),
+		"chosen_was_recommended":    boolOrNil(event.ChosenWasRecommended),
+		"scoring_contract_id":       event.ScoringContractID,
+		"timestamp":                 event.Timestamp,
+		"played_at":                 stringOrNil(event.PlayedAt),
+	}
+}
+
 func currentTrackPayloadFromProto(track *scoringv1.TrackContext, outro *scoringv1.OutroSummary) map[string]any {
 	var outroPayload any
 	if outro != nil && outro.GetText() != "" {
@@ -1678,6 +1979,25 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func queryInt(r *http.Request, key string, fallback int) int {
+	raw := strings.TrimSpace(r.URL.Query().Get(key))
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil {
+		return fallback
+	}
+	return value
+}
+
+func boolOrNil(value *bool) any {
+	if value == nil {
+		return nil
+	}
+	return *value
 }
 
 func errorString(err error) any {

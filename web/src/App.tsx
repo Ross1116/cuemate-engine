@@ -5,6 +5,7 @@ import {
   AlertTriangle,
   BarChart3,
   Check,
+  ChevronDown,
   CircleHelp,
   CircleDot,
   FileAudio,
@@ -403,25 +404,41 @@ export function App() {
           error={recommendations.error}
           selected={selectedCandidate}
           onSelect={setSelectedCandidate}
-          onPlay={(trackId) => playMutation.mutate(trackId)}
-          playing={playMutation.isPending}
         />
       </main>
 
       <aside className="detail-pane panel mobile-feedback">
-        <CandidateDetail
-          candidate={selectedCandidate}
-          response={recommendations.data}
-          onConfirm={(trackId) => playMutation.mutate(trackId)}
-          confirming={playMutation.isPending}
-        />
-        {workMode === "live" ? <CandidateSignalPanel candidate={selectedCandidate} playlistId={selectedPlaylist?.playlist_id} /> : <FeedbackPanel feedback={feedback.data} />}
+        <CurrentTrackInfo track={currentTrack} playlistId={selectedPlaylist?.playlist_id} />
+        {workMode === "live" ? (
+          <>
+            <LiveCandidatePanel
+              candidate={selectedCandidate}
+              response={recommendations.data}
+              onConfirm={(trackId) => playMutation.mutate(trackId)}
+              confirming={playMutation.isPending}
+            />
+            <CandidateSignalPanel candidate={selectedCandidate} playlistId={selectedPlaylist?.playlist_id} />
+          </>
+        ) : (
+          <>
+            <CandidateDetail
+              candidate={selectedCandidate}
+              response={recommendations.data}
+              onConfirm={(trackId) => playMutation.mutate(trackId)}
+              confirming={playMutation.isPending}
+            />
+            <FullCandidateAnalysisPanel candidate={selectedCandidate} playlistId={selectedPlaylist?.playlist_id} />
+            <FeedbackPanel feedback={feedback.data} />
+          </>
+        )}
       </aside>
 
       {workMode === "full" ? (
         <aside className="admin-pane panel mobile-admin">
           <FullToolsPanel
             playlist={selectedPlaylist}
+            candidate={selectedCandidate}
+            playlistId={selectedPlaylist?.playlist_id}
             playlists={playlists.data?.items ?? []}
             jobs={jobs.data?.items ?? []}
             onQueue={() => enqueueMutation.mutate()}
@@ -516,16 +533,12 @@ function RecommendationBoard({
   error,
   selected,
   onSelect,
-  onPlay,
-  playing,
 }: {
   response?: RecommendationResponse;
   loading: boolean;
   error: Error | null;
   selected: LaneItem | null;
   onSelect: (item: LaneItem) => void;
-  onPlay: (trackId: string) => void;
-  playing: boolean;
 }) {
   if (loading) return <div className="empty-state">Scoring the room...</div>;
   if (error) return <div className="empty-state danger">{error.message}</div>;
@@ -583,20 +596,16 @@ function RecommendationBoard({
                     </TooltipAnchor>
                   ) : null}
                   <TooltipAnchor text="Tempo/key summary for the transition from the current base track." className="candidate-title-tip" focusable={false}>
-                    <span className="candidate-stats">{item.tempo_key.tempo_text || item.tempo_key.key_text || item.move}</span>
+                    <span className="candidate-stats">{item.tempo_key.tempo_text || item.move}</span>
                   </TooltipAnchor>
+                  <div className="candidate-abs-meta">
+                    <span>{candidateBpmText(item)}</span>
+                    <span>{candidateKeyText(item)}</span>
+                  </div>
                   <TooltipAnchor text={metricDescriptions.Risk} className="candidate-title-tip" focusable={false}>
                     <span className={pillClass(item.risk)}>{item.risk}</span>
                   </TooltipAnchor>
                 </span>
-                <button
-                  className="icon-action"
-                  disabled={playing}
-                  aria-label={`Mark ${item.title || item.track_id} as played`}
-                  onClick={(event) => { event.stopPropagation(); onPlay(item.track_id); }}
-                >
-                  <Check size={16} />
-                </button>
               </div>
             ))}
           </article>
@@ -625,6 +634,11 @@ function CandidateDetail({
       ) : (
         <>
           <h2>{candidate.artist ? `${candidate.artist} - ${candidate.title}` : candidate.title}</h2>
+          <div className="candidate-meta-strip">
+            <span>{candidateBpmText(candidate)}</span>
+            <span>{candidateKeyText(candidate)}</span>
+            <span>{stringValueFromUnknown(candidate.candidate_features.intensity_band) || "band unknown"}</span>
+          </div>
           <div className="metric-grid">
             <Metric label="Fit score" value={`${Math.round(candidate.score * 100)}/100`} hint={metricDescriptions["Fit score"]} />
             <Metric label="Move" value={candidate.move} hint={metricDescriptions.Move} />
@@ -639,6 +653,196 @@ function CandidateDetail({
           <NoteList title="Reasons" notes={candidate.reasons} />
           <NoteList title="Watchouts" notes={candidate.watchouts} />
           <NoteList title="Handoff" notes={candidate.explanation.handoff?.notes ?? []} />
+        </>
+      )}
+    </section>
+  );
+}
+
+function CurrentTrackInfo({ track, playlistId }: { track?: Track; playlistId?: string }) {
+  const [expanded, setExpanded] = useState(false);
+  const detailId = useId();
+  const features = useQuery({
+    queryKey: ["track-features", playlistId, track?.track_id],
+    queryFn: () => api.trackFeatures(playlistId ?? "", track?.track_id ?? ""),
+    enabled: expanded && Boolean(playlistId && track?.track_id),
+  });
+
+  useEffect(() => {
+    setExpanded(false);
+  }, [track?.track_id]);
+
+  const insight = useMemo(() => {
+    if (!track) return null;
+    const detail = features.data;
+    const basic = detail?.basic ?? {};
+    const absolute = detail?.absolute ?? {};
+    const semantic = detail?.semantic ?? {};
+    const relative = detail?.relative ?? {};
+    const bpm = firstNumber(basic.bpm, track.bpm);
+    const key = stringValueFromUnknown(basic.key) || track.key || "key pending";
+    const energy = firstNumber(relative.energy_rel, absolute.energy_abs, semantic.energy_essentia_fused);
+    const bass = firstNumber(relative.bass_rel, absolute.bass_abs);
+    const drums = firstNumber(relative.drums_rel, absolute.drums_abs);
+    const groove = firstNumber(relative.groove_rel, absolute.groove_abs);
+    const vocals = firstNumber(relative.vocals_rel, absolute.vocals_abs);
+    const danceability = maybeNumber(semantic.danceability_abs);
+    const drive = firstNumber(semantic.arousal_abs, absolute.energy_sustained);
+    const moodTone = maybeNumber(semantic.valence_abs);
+    const mood = dominantMood(semantic);
+
+    return {
+      bpm,
+      key,
+      intensity: stringValueFromUnknown(relative.intensity_band) || track.intensity_band || "band pending",
+      glance: [
+        {
+          label: "Tempo",
+          value: bpm == null ? "pending" : `${bpm.toFixed(1)} BPM`,
+          detail: "absolute BPM for the current base track",
+          hint: "The actual analyzed tempo of the track currently driving recommendations.",
+        },
+        {
+          label: "Key",
+          value: key,
+          detail: "ocelot/camelot key used for harmonic decisions",
+          hint: "The analyzed musical key for harmonic compatibility checks.",
+        },
+        {
+          label: "Energy",
+          value: percentOrMissing(energy),
+          detail: energyLevelCopy(energy),
+          hint: "Playlist-relative energy where available, with analyzer energy as fallback.",
+        },
+        {
+          label: "Mood",
+          value: mood.label,
+          detail: mood.detail,
+          hint: "The dominant semantic mood detected during full analysis.",
+        },
+      ],
+      groups: [
+        {
+          title: "Current Track Body",
+          note: "The sound profile this recommendation round is anchored to.",
+          metrics: [
+            percentBarMetric("Energy", energy, "How much room pressure the current track carries."),
+            percentBarMetric("Bass", bass, "Low-end weight in the current base track."),
+            percentBarMetric("Drums", drums, "Percussive strength in the current base track."),
+            percentBarMetric("Groove", groove, "Groove or rhythmic drive in the current base track."),
+            percentBarMetric("Vocals", vocals, "How much vocal content the current base track carries."),
+          ],
+        },
+        {
+          title: "Movement + Mood",
+          note: "Semantic values that explain the current floor feel.",
+          metrics: [
+            percentBarMetric("Danceability", danceability, "How strongly the model hears dance-floor movement."),
+            percentBarMetric("Drive", drive, "Activation and intensity separate from BPM."),
+            percentBarMetric("Mood tone", moodTone, "Semantic valence: emotional tone from darker to more positive. This is not bass or timbre brightness."),
+            percentBarMetric("Party", semantic.mood_party_abs, "Party or club-forward character."),
+            percentBarMetric("Relaxed", semantic.mood_relaxed_abs, "Laid-back or smoother character."),
+          ],
+        },
+      ],
+    };
+  }, [features.data, track]);
+
+  return (
+    <section className={expanded ? "detail-block current-track-card expanded" : "detail-block current-track-card"}>
+      <PaneTitle icon={<Radar />} title="Current Track" action={expanded ? "open" : "base"} />
+      {!track ? (
+        <p className="muted">Choose a ready track to set the base.</p>
+      ) : (
+        <>
+          <button className="current-track-toggle" type="button" aria-expanded={expanded} aria-controls={detailId} onClick={() => setExpanded((value) => !value)}>
+            <span>
+              <strong>{track.artist ? `${track.artist} - ${track.title}` : track.title || track.track_id}</strong>
+              <small>{expanded ? "Hide base-track data" : "Show tempo, energy, mood, and analysis"}</small>
+            </span>
+            <ChevronDown className="disclosure-icon" size={18} />
+          </button>
+          {expanded ? (
+            <div className="current-track-details" id={detailId}>
+              <div className="candidate-meta-strip">
+                <span>{insight?.bpm == null ? "BPM pending" : `${insight.bpm.toFixed(1)} BPM`}</span>
+                <span>{insight?.key ?? "key pending"}</span>
+                <span>{insight?.intensity ?? "band pending"}</span>
+                <span>{track.analysis_state}</span>
+              </div>
+              {track.role_hints.length ? (
+                <div className="mini-tags">
+                  {track.role_hints.slice(0, 3).map((hint) => (
+                    <span key={hint}>{labelize(hint)}</span>
+                  ))}
+                </div>
+              ) : null}
+              {features.isFetching ? <p className="action-note">Loading current track analysis...</p> : null}
+              {features.error ? <p className="action-note">Current track analysis could not be loaded; showing playlist row values only.</p> : null}
+              {insight ? (
+                <>
+                  <div className="current-glance-grid">
+                    {insight.glance.map((item) => (
+                      <InsightTile key={item.label} {...item} />
+                    ))}
+                  </div>
+                  <div className="analysis-groups current-analysis-groups">
+                    {insight.groups.map((group) => (
+                      <AnalysisBarGroup key={group.title} title={group.title} note={group.note} metrics={group.metrics} />
+                    ))}
+                  </div>
+                </>
+              ) : null}
+            </div>
+          ) : null}
+        </>
+      )}
+    </section>
+  );
+}
+
+function LiveCandidatePanel({
+  candidate,
+  response,
+  onConfirm,
+  confirming,
+}: {
+  candidate: LaneItem | null;
+  response?: RecommendationResponse;
+  onConfirm: (trackId: string) => void;
+  confirming: boolean;
+}) {
+  return (
+    <section className="detail-block live-candidate-card">
+      <PaneTitle icon={<Sparkles />} title="Selected Next" action={response?.meta.recommendation_event_id ? "ready" : "preview"} />
+      {!candidate ? (
+        <p className="muted">Select a recommendation to inspect the next-song read.</p>
+      ) : (
+        <>
+          <h2>{candidate.artist ? `${candidate.artist} - ${candidate.title}` : candidate.title}</h2>
+          <div className="candidate-meta-strip">
+            <span>{candidateBpmText(candidate)}</span>
+            <span>{candidateKeyText(candidate)}</span>
+            <span>{candidate.move}</span>
+          </div>
+          <div className="live-score-strip">
+            <span>
+              <small>Fit</small>
+              <strong>{Math.round(candidate.score * 100)}</strong>
+            </span>
+            <span>
+              <small>Risk</small>
+              <strong>{candidate.risk}</strong>
+            </span>
+            <span>
+              <small>Confidence</small>
+              <strong>{pct(candidate.move_confidence)}</strong>
+            </span>
+          </div>
+          <button className="wide-action confirm-next" disabled={confirming || !response?.meta.recommendation_event_id} onClick={() => onConfirm(candidate.track_id)}>
+            <Check size={16} />
+            {confirming ? "Setting next song..." : "Set as next song and make current"}
+          </button>
         </>
       )}
     </section>
@@ -666,7 +870,7 @@ function CandidateSignalPanel({ candidate, playlistId }: { candidate: LaneItem |
     const deltaBass = maybeNumber(transition.delta_bass_rel);
     const danceability = maybeNumber(semantic.danceability_abs);
     const arousal = maybeNumber(semantic.arousal_abs);
-    const valence = maybeNumber(semantic.valence_abs);
+    const moodTone = maybeNumber(semantic.valence_abs);
     const mood = dominantMood(semantic);
     const bpmDistance = maybeNumber(transition.effective_bpm_distance);
     const keyFit = stringValueFromUnknown(transition.key_compat_label) || candidate.tempo_key.key_text || "unknown";
@@ -754,10 +958,10 @@ function CandidateSignalPanel({ candidate, playlistId }: { candidate: LaneItem |
           hint: "How activated or intense the track feels, separate from BPM.",
         },
         {
-          label: "Brightness",
-          value: percentOrMissing(valence),
-          detail: valence == null ? "semantic value missing" : valenceCopy(valence),
-          hint: "How positive or bright the track's mood reads.",
+          label: "Mood tone",
+          value: percentOrMissing(moodTone),
+          detail: moodTone == null ? "semantic value missing" : valenceCopy(moodTone),
+          hint: "Semantic valence: emotional tone from darker to more positive. This is separate from bassline darkness or low-end weight.",
         },
       ],
       drivers,
@@ -868,6 +1072,151 @@ function ScoreDriverList({ drivers }: { drivers: ScoreDriver[] }) {
   );
 }
 
+function FullCandidateAnalysisPanel({ candidate, playlistId }: { candidate: LaneItem | null; playlistId?: string }) {
+  const features = useQuery({
+    queryKey: ["track-features", playlistId, candidate?.track_id],
+    queryFn: () => api.trackFeatures(playlistId ?? "", candidate?.track_id ?? ""),
+    enabled: Boolean(playlistId && candidate?.track_id),
+  });
+
+  const groups = useMemo(() => {
+    if (!candidate) return [];
+    const detail = features.data;
+    const candidateRel = candidate.candidate_features;
+    const relative = detail?.relative ?? {};
+    const absolute = detail?.absolute ?? {};
+    const semantic = detail?.semantic ?? {};
+    const transition = candidate.transition_features ?? {};
+    const components = Object.entries(candidate.component_scores ?? {}).sort(([a], [b]) => componentSort(a) - componentSort(b));
+
+    return [
+      {
+        title: "Relative Playlist Profile",
+        note: "Where this track sits compared with the selected playlist.",
+        metrics: [
+          percentBarMetric("Energy", firstNumber(relative.energy_rel, candidateRel.energy_rel), "Playlist-relative energy."),
+          percentBarMetric("Bass", firstNumber(relative.bass_rel, candidateRel.bass_rel), "Playlist-relative low-end weight."),
+          percentBarMetric("Drums", firstNumber(relative.drums_rel, candidateRel.drums_rel), "Playlist-relative drum/percussive strength."),
+          percentBarMetric("Groove", firstNumber(relative.groove_rel, candidateRel.groove_rel), "Playlist-relative groove estimate."),
+          percentBarMetric("Vocals", firstNumber(relative.vocals_rel, candidateRel.vocals_rel), "Playlist-relative vocal content; missing means unknown."),
+        ],
+      },
+      {
+        title: "Mood And Crowd Feel",
+        note: "Semantic model readings from full analysis.",
+        metrics: [
+          percentBarMetric("Danceability", semantic.danceability_abs, "Dance-floor movement estimate."),
+          percentBarMetric("Drive", semantic.arousal_abs, "Activation/intensity separate from BPM."),
+          percentBarMetric("Mood tone", semantic.valence_abs, "Semantic valence: emotional tone from darker to more positive. This is not bass or timbre brightness."),
+          percentBarMetric("Party", semantic.mood_party_abs, "Party/club mood strength."),
+          percentBarMetric("Aggressive", semantic.mood_aggressive_abs, "Forceful or aggressive character."),
+          percentBarMetric("Relaxed", semantic.mood_relaxed_abs, "Relaxed or laid-back character."),
+          percentBarMetric("Semantic energy", semantic.energy_essentia_fused, "Fused semantic energy reading."),
+        ],
+      },
+      {
+        title: "Audio Body",
+        note: "Absolute analyzer readings from the file.",
+        metrics: [
+          percentBarMetric("Energy", absolute.energy_abs, "Canonical absolute energy."),
+          percentBarMetric("Sustained", absolute.energy_sustained, "Sustained energy over the track."),
+          percentBarMetric("Peak", absolute.energy_peak, "Peak energy moments."),
+          percentBarMetric("Bass", absolute.bass_abs, "Absolute low-end energy."),
+          percentBarMetric("Drums", absolute.drums_abs, "Absolute drum/percussive content."),
+          percentBarMetric("Groove", absolute.groove_abs, "Absolute groove estimate."),
+          percentBarMetric("Vocals", absolute.vocals_abs, "Absolute vocal presence; missing means unknown."),
+        ],
+      },
+      {
+        title: "Transition From Current",
+        note: "How this candidate changes the handoff.",
+        metrics: [
+          signedBarMetric("Energy change", transition.delta_energy_rel, "Positive builds pressure; negative creates space."),
+          signedBarMetric("Bass change", transition.delta_bass_rel, "Positive adds low end; negative lightens the handoff."),
+          percentBarMetric("Current vocals", transition.current_vocals_rel, "Vocal content in the current base track."),
+          percentBarMetric("Candidate vocals", transition.candidate_vocals_rel, "Vocal content in the selected candidate."),
+          percentBarMetric("Current low end", transition.current_outro_low_end, "Low-end content near the current outro."),
+          percentBarMetric("Candidate low end", transition.candidate_intro_low_end, "Low-end content near the candidate intro."),
+        ],
+      },
+      {
+        title: "Scorer Components",
+        note: "Every scoring component returned by the engine.",
+        metrics: components.map(([key, score]) => {
+          const weight = candidate.weights_used?.[key];
+          const confidence = candidate.component_confidences?.[key];
+          return percentBarMetric(
+            labelize(key),
+            score,
+            helpFor(weightDescriptions, key, "Scoring component used by the recommendation engine."),
+            `weight ${weight == null ? "n/a" : `${Math.round(weight * 100)}%`} / confidence ${confidence == null ? "n/a" : `${Math.round(confidence * 100)}%`}`,
+          );
+        }),
+      },
+    ];
+  }, [candidate, features.data]);
+
+  return (
+    <section className="detail-block full-analysis-panel">
+      <PaneTitle icon={<BarChart3 />} title="Full Analysis" action={candidate ? (features.isFetching ? "loading" : "bars") : "waiting"} />
+      {!candidate ? (
+        <p className="muted">Select a recommendation to view its full analysis profile.</p>
+      ) : (
+        <>
+          <div className="candidate-meta-strip">
+            <span>{candidateBpmText(candidate)}</span>
+            <span>{candidateKeyText(candidate)}</span>
+            <span>{stringValueFromUnknown(candidate.candidate_features.intensity_band) || "band unknown"}</span>
+          </div>
+          {features.error ? <p className="action-note">Full track analysis could not be loaded; showing scorer-returned fields only.</p> : null}
+          <div className="analysis-groups">
+            {groups.map((group) => (
+              <AnalysisBarGroup key={group.title} title={group.title} note={group.note} metrics={group.metrics} />
+            ))}
+          </div>
+        </>
+      )}
+    </section>
+  );
+}
+
+type BarMetric = {
+  label: string;
+  value: number | null;
+  display: string;
+  hint: string;
+  detail?: string;
+  signed?: boolean;
+};
+
+function AnalysisBarGroup({ title, note, metrics }: { title: string; note: string; metrics: BarMetric[] }) {
+  return (
+    <section className="analysis-group">
+      <div className="analysis-title">
+        <h3>{title}</h3>
+        <p>{note}</p>
+      </div>
+      <div className="analysis-bars">
+        {metrics.map((metric) => (
+          <div key={metric.label} className={metric.value == null ? "analysis-bar-row missing" : "analysis-bar-row"}>
+            <div className="analysis-bar-label">
+              <span>
+                {metric.label}
+                <InfoHint text={metric.hint} />
+              </span>
+              <strong>{metric.display}</strong>
+            </div>
+            <div className={metric.signed ? "analysis-meter signed" : "analysis-meter"}>
+              <i style={{ width: `${barWidth(metric)}%` }} />
+            </div>
+            {metric.detail ? <small>{metric.detail}</small> : null}
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 function firstNumber(...values: unknown[]) {
   for (const value of values) {
     const parsed = maybeNumber(value);
@@ -878,6 +1227,43 @@ function firstNumber(...values: unknown[]) {
 
 function maybeNumber(value: unknown) {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function candidateBpmText(candidate: LaneItem) {
+  const bpm = maybeNumber(candidate.candidate_features.bpm);
+  return bpm == null ? "BPM pending" : `${bpm.toFixed(1)} BPM`;
+}
+
+function candidateKeyText(candidate: LaneItem) {
+  return stringValueFromUnknown(candidate.candidate_features.key) || candidate.tempo_key.key_text || "key pending";
+}
+
+function percentBarMetric(label: string, rawValue: unknown, hint: string, detail?: string): BarMetric {
+  const value = maybeNumber(rawValue);
+  return {
+    label,
+    value,
+    display: value == null ? "missing" : `${Math.round(clamp01(value) * 100)}%`,
+    hint,
+    detail,
+  };
+}
+
+function signedBarMetric(label: string, rawValue: unknown, hint: string): BarMetric {
+  const value = maybeNumber(rawValue);
+  return {
+    label,
+    value,
+    display: value == null ? "missing" : signedPercent(value),
+    hint,
+    signed: true,
+  };
+}
+
+function barWidth(metric: BarMetric) {
+  if (metric.value == null) return 0;
+  if (metric.signed) return clampPercent(Math.round(Math.abs(metric.value) * 100));
+  return clampPercent(Math.round(clamp01(metric.value) * 100));
 }
 
 function clamp01(value: number) {
@@ -990,8 +1376,9 @@ function arousalCopy(value: number) {
 }
 
 function valenceCopy(value: number) {
-  if (value >= 0.65) return "brighter mood";
-  if (value >= 0.4) return "neutral mood";
+  if (value >= 0.7) return "more positive mood";
+  if (value >= 0.55) return "near-neutral mood";
+  if (value >= 0.4) return "slightly darker mood";
   return "darker mood";
 }
 
@@ -1047,6 +1434,8 @@ function FeedbackPanel({ feedback }: { feedback?: FeedbackSummary }) {
 
 function FullToolsPanel({
   playlist,
+  candidate,
+  playlistId,
   playlists,
   jobs,
   onQueue,
@@ -1062,6 +1451,8 @@ function FullToolsPanel({
   toolError,
 }: {
   playlist?: Playlist;
+  candidate: LaneItem | null;
+  playlistId?: string;
   playlists: Playlist[];
   jobs: { id: number; status: string; track_id: string | null; created_at: string; error_message: string | null }[];
   onQueue: () => void;
@@ -1140,6 +1531,7 @@ function FullToolsPanel({
     <div className="full-tools">
       <PaneTitle icon={<TerminalSquare />} title="Full Mode" action="library + analysis" />
       <p className="mode-note">Full mode exposes import, analysis, worker, sync, and correction tools. Live mode keeps only the performance surface.</p>
+      <FullCandidateAnalysisPanel candidate={candidate} playlistId={playlistId} />
 
       <ToolSection icon={<FolderPlus />} title="Import local files" description="Build a CueMate playlist from folders or individual audio files.">
         <div className="field-group">

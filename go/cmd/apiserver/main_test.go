@@ -288,6 +288,14 @@ func TestRecommendationEventsCapsExcessiveLimit(t *testing.T) {
 	}
 }
 
+func TestBoundedRecommendationEventsCapsLimit(t *testing.T) {
+	events := make([]recommendationsrepo.RecommendationEventRecord, maxRecommendationEventsResponse+1)
+	selected := boundedRecommendationEvents(events, 999999)
+	if len(selected) != maxRecommendationEventsResponse {
+		t.Fatalf("selected len = %d, want %d", len(selected), maxRecommendationEventsResponse)
+	}
+}
+
 func TestPlayedEventUpdatesRecommendationEvent(t *testing.T) {
 	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
 		metadataResp: fakeMetadata("rel_sig_current"),

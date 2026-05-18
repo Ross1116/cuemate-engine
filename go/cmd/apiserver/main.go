@@ -451,21 +451,25 @@ func (s *server) handleRecommendationEvents(w http.ResponseWriter, r *http.Reque
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	limit := queryInt(r, "limit", 25)
-	if limit < 0 {
-		limit = 0
-	}
-	if limit > maxRecommendationEventsResponse {
-		limit = maxRecommendationEventsResponse
-	}
-	if limit > len(events) {
-		limit = len(events)
-	}
-	items := make([]any, 0, limit)
-	for _, event := range events[:limit] {
+	selectedEvents := boundedRecommendationEvents(events, queryInt(r, "limit", 25))
+	items := make([]any, 0, len(selectedEvents))
+	for _, event := range selectedEvents {
 		items = append(items, recommendationEventPayload(event))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func boundedRecommendationEvents(events []recommendationsrepo.RecommendationEventRecord, requestedLimit int) []recommendationsrepo.RecommendationEventRecord {
+	if requestedLimit <= 0 {
+		return events[:0]
+	}
+	if requestedLimit > maxRecommendationEventsResponse {
+		requestedLimit = maxRecommendationEventsResponse
+	}
+	if requestedLimit > len(events) {
+		requestedLimit = len(events)
+	}
+	return events[:requestedLimit]
 }
 
 func (s *server) handleToolCommand(w http.ResponseWriter, r *http.Request) {

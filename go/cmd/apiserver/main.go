@@ -242,43 +242,42 @@ func (s *server) handleMetadata(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleWebApp(webDist string) http.HandlerFunc {
-	fileServer := http.FileServer(http.Dir(webDist))
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 			return
 		}
+		webDistAbs, err := filepath.Abs(webDist)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		webDistAbs = filepath.Clean(webDistAbs)
 		cleanPath := filepath.Clean(strings.TrimPrefix(r.URL.Path, "/"))
 		if cleanPath == "." {
 			cleanPath = "index.html"
 		}
-		fullPath := filepath.Join(webDist, cleanPath)
-		if escapesBasePath(webDist, fullPath) {
+		if filepath.IsAbs(cleanPath) || cleanPath == ".." || strings.HasPrefix(cleanPath, ".."+string(filepath.Separator)) {
+			http.NotFound(w, r)
+			return
+		}
+		fullPath, err := filepath.Abs(filepath.Join(webDistAbs, cleanPath))
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		fullPath = filepath.Clean(fullPath)
+		rel, err := filepath.Rel(webDistAbs, fullPath)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 			http.NotFound(w, r)
 			return
 		}
 		if info, err := os.Stat(fullPath); err == nil && !info.IsDir() {
-			fileServer.ServeHTTP(w, r)
+			http.ServeFile(w, r, fullPath)
 			return
 		}
-		http.ServeFile(w, r, filepath.Join(webDist, "index.html"))
+		http.ServeFile(w, r, filepath.Join(webDistAbs, "index.html"))
 	}
-}
-
-func escapesBasePath(basePath string, candidatePath string) bool {
-	baseAbs, err := filepath.Abs(basePath)
-	if err != nil {
-		return true
-	}
-	candidateAbs, err := filepath.Abs(candidatePath)
-	if err != nil {
-		return true
-	}
-	rel, err := filepath.Rel(filepath.Clean(baseAbs), filepath.Clean(candidateAbs))
-	if err != nil {
-		return true
-	}
-	return rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 func (s *server) handlePlaylists(w http.ResponseWriter, r *http.Request) {

@@ -44,7 +44,6 @@ body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
-  background-color: var(--bg);
   background:
     linear-gradient(128deg, rgba(127, 145, 82, 0.1) 0%, transparent 34%),
     linear-gradient(34deg, rgba(8, 32, 51, 0.5) 0%, transparent 50%),
@@ -1928,10 +1927,6 @@ h1 {
     grid-template-columns: 280px minmax(0, 1fr) 320px;
   }
 
-  .mode-full .admin-pane {
-    display: none;
-  }
-
   .mode-full .detail-pane {
     display: flex;
   }
@@ -1942,6 +1937,10 @@ h1 {
 }
 
 @media (max-width: 980px) {
+  .mode-full .admin-pane {
+    display: none;
+  }
+
   .app-shell {
     display: block;
     height: auto;

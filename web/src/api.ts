@@ -181,6 +181,26 @@ export type PickPathResult = {
 
 const apiBase = import.meta.env.DEV ? "/api" : "";
 
+export class ApiError extends Error {
+  status: number;
+  payload?: unknown;
+
+  constructor(message: string, status: number, payload?: unknown) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.payload = payload;
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function hasToolDiagnostics(payload: unknown) {
+  return isRecord(payload) && ("status" in payload || "command" in payload || "output" in payload);
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${apiBase}${path}`, {
     headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
@@ -188,13 +208,15 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   });
   if (!response.ok) {
     let message = `${response.status} ${response.statusText}`;
+    let payload: unknown;
     try {
-      const payload = (await response.json()) as { error?: string };
-      if (payload.error) message = payload.error;
+      payload = await response.json();
+      if (isRecord(payload) && typeof payload.error === "string") message = payload.error;
+      if (hasToolDiagnostics(payload)) message = JSON.stringify(payload);
     } catch {
       // Keep HTTP status message.
     }
-    throw new Error(message);
+    throw new ApiError(message, response.status, payload);
   }
   return (await response.json()) as T;
 }

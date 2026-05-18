@@ -28,6 +28,7 @@ import (
 
 const (
 	defaultAPIAddr = "127.0.0.1:8080"
+	pythonModule   = "cuemate_analysis"
 )
 
 var liveLaneOrder = []string{"maintain", "build", "reset", "jump", "contrast"}
@@ -252,12 +253,32 @@ func handleWebApp(webDist string) http.HandlerFunc {
 			cleanPath = "index.html"
 		}
 		fullPath := filepath.Join(webDist, cleanPath)
+		if escapesBasePath(webDist, fullPath) {
+			http.NotFound(w, r)
+			return
+		}
 		if info, err := os.Stat(fullPath); err == nil && !info.IsDir() {
 			fileServer.ServeHTTP(w, r)
 			return
 		}
 		http.ServeFile(w, r, filepath.Join(webDist, "index.html"))
 	}
+}
+
+func escapesBasePath(basePath string, candidatePath string) bool {
+	baseAbs, err := filepath.Abs(basePath)
+	if err != nil {
+		return true
+	}
+	candidateAbs, err := filepath.Abs(candidatePath)
+	if err != nil {
+		return true
+	}
+	rel, err := filepath.Rel(filepath.Clean(baseAbs), filepath.Clean(candidateAbs))
+	if err != nil {
+		return true
+	}
+	return rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 func (s *server) handlePlaylists(w http.ResponseWriter, r *http.Request) {
@@ -431,6 +452,9 @@ func (s *server) handleRecommendationEvents(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	limit := queryInt(r, "limit", 25)
+	if limit < 0 {
+		limit = 0
+	}
 	if limit > len(events) {
 		limit = len(events)
 	}
@@ -456,9 +480,14 @@ func (s *server) handleToolCommand(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	command := append([]string{"python"}, cliArgs...)
+	pythonExe, err := pythonExecutable()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	command := append([]string{pythonExe}, cliArgs...)
 	if background {
-		result, err := startBackgroundToolCommand(cliArgs)
+		result, err := startBackgroundToolCommand(pythonExe, cliArgs)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
@@ -470,7 +499,7 @@ func (s *server) handleToolCommand(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "python", cliArgs...)
+	cmd := exec.CommandContext(ctx, pythonExe, cliArgs...)
 	output, err := cmd.CombinedOutput()
 	exitCode := 0
 	if err != nil {
@@ -578,18 +607,25 @@ if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
 
 func buildToolCommand(req toolCommandRequest) ([]string, bool, error) {
 	action := strings.TrimSpace(req.Action)
-	args := []string{"-m", "cuemate_analysis"}
+	args := []string{"-m", pythonModule}
 	switch action {
 	case "import_playlist":
-		name := strings.TrimSpace(req.Name)
+		name, err := safeCLIValue(req.Name, "name")
+		if err != nil {
+			return nil, false, err
+		}
 		if name == "" {
 			return nil, false, errors.New("name is required")
 		}
-		paths := compactStrings(req.Paths)
+		paths, err := safeCLIPaths(req.Paths)
+		if err != nil {
+			return nil, false, err
+		}
 		if len(paths) == 0 {
 			return nil, false, errors.New("at least one path is required")
 		}
 		args = append(args, "import-playlist", "--name", name)
+		args = append(args, "--")
 		args = append(args, paths...)
 		return args, true, nil
 	case "list_dj_playlists":
@@ -597,7 +633,10 @@ func buildToolCommand(req toolCommandRequest) ([]string, bool, error) {
 		if err != nil {
 			return nil, false, err
 		}
-		library := strings.TrimSpace(req.Library)
+		library, err := safeCLIPath(req.Library, "library")
+		if err != nil {
+			return nil, false, err
+		}
 		if library == "" {
 			return nil, false, errors.New("library is required")
 		}
@@ -607,18 +646,31 @@ func buildToolCommand(req toolCommandRequest) ([]string, bool, error) {
 		if err != nil {
 			return nil, false, err
 		}
-		library := strings.TrimSpace(req.Library)
-		playlist := strings.TrimSpace(req.Playlist)
+		library, err := safeCLIPath(req.Library, "library")
+		if err != nil {
+			return nil, false, err
+		}
+		playlist, err := safeCLIValue(req.Playlist, "playlist")
+		if err != nil {
+			return nil, false, err
+		}
 		if library == "" || playlist == "" {
 			return nil, false, errors.New("library and playlist are required")
 		}
 		args = append(args, "import-dj-playlist", "--source", source, "--library", library, "--playlist", playlist)
-		if name := strings.TrimSpace(req.Name); name != "" {
+		name, err := safeCLIValue(req.Name, "name")
+		if err != nil {
+			return nil, false, err
+		}
+		if name != "" {
 			args = append(args, "--name", name)
 		}
 		return args, true, nil
 	case "analyze_playlist":
-		playlist := strings.TrimSpace(req.Playlist)
+		playlist, err := safeCLIValue(req.Playlist, "playlist")
+		if err != nil {
+			return nil, false, err
+		}
 		if playlist == "" {
 			return nil, false, errors.New("playlist is required")
 		}
@@ -646,7 +698,11 @@ func buildToolCommand(req toolCommandRequest) ([]string, bool, error) {
 		return append(args, "run-feedback-worker", "--limit", strconv.Itoa(limit)), true, nil
 	case "prewarm_model_services":
 		args = append(args, "prewarm-model-services")
-		if path := strings.TrimSpace(req.Path); path != "" {
+		path, err := safeCLIPath(req.Path, "path")
+		if err != nil {
+			return nil, false, err
+		}
+		if path != "" {
 			args = append(args, "--path", path)
 		}
 		return args, true, nil
@@ -657,7 +713,7 @@ func buildToolCommand(req toolCommandRequest) ([]string, bool, error) {
 	}
 }
 
-func startBackgroundToolCommand(cliArgs []string) (map[string]any, error) {
+func startBackgroundToolCommand(pythonExe string, cliArgs []string) (map[string]any, error) {
 	logDir := filepath.Join("tmp", "tool-runs")
 	if err := os.MkdirAll(logDir, 0o755); err != nil {
 		return nil, err
@@ -667,7 +723,7 @@ func startBackgroundToolCommand(cliArgs []string) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	cmd := exec.Command("python", cliArgs...)
+	cmd := exec.Command(pythonExe, cliArgs...)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	if err := cmd.Start(); err != nil {
@@ -689,6 +745,21 @@ func startBackgroundToolCommand(cliArgs []string) (map[string]any, error) {
 	}, nil
 }
 
+func pythonExecutable() (string, error) {
+	configured := strings.TrimSpace(os.Getenv("CUEMATE_PYTHON"))
+	if configured != "" {
+		if !filepath.IsAbs(configured) {
+			return "", errors.New("CUEMATE_PYTHON must be an absolute path")
+		}
+		return filepath.Clean(configured), nil
+	}
+	pythonExe, err := exec.LookPath("python")
+	if err != nil {
+		return "", err
+	}
+	return pythonExe, nil
+}
+
 func normalizeDJSource(source string) (string, error) {
 	switch strings.ToLower(strings.TrimSpace(source)) {
 	case "rekordbox", "traktor", "serato":
@@ -698,14 +769,40 @@ func normalizeDJSource(source string) (string, error) {
 	}
 }
 
-func compactStrings(values []string) []string {
+func safeCLIValue(value string, field string) (string, error) {
+	trimmed := strings.TrimSpace(value)
+	if strings.ContainsRune(trimmed, '\x00') {
+		return "", fmt.Errorf("%s contains an invalid character", field)
+	}
+	if strings.HasPrefix(trimmed, "-") {
+		return "", fmt.Errorf("%s must not start with '-'", field)
+	}
+	return trimmed, nil
+}
+
+func safeCLIPath(value string, field string) (string, error) {
+	trimmed, err := safeCLIValue(value, field)
+	if err != nil {
+		return "", err
+	}
+	if trimmed == "" {
+		return "", nil
+	}
+	return filepath.Clean(trimmed), nil
+}
+
+func safeCLIPaths(values []string) ([]string, error) {
 	out := make([]string, 0, len(values))
 	for _, value := range values {
-		if trimmed := strings.TrimSpace(value); trimmed != "" {
+		trimmed, err := safeCLIPath(value, "path")
+		if err != nil {
+			return nil, err
+		}
+		if trimmed != "" {
 			out = append(out, trimmed)
 		}
 	}
-	return out
+	return out, nil
 }
 
 func boundedPositive(value, fallback, max int) int {
@@ -726,6 +823,14 @@ func (s *server) handlePlaylistAnalysisEnqueue(w http.ResponseWriter, r *http.Re
 	var req enqueueAnalysisRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON request"})
+		return
+	}
+	if _, err := s.repo.ResolvePlaylist(r.Context(), playlistID, ""); err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, recommendationsrepo.ErrPlaylistNotFound) {
+			status = http.StatusNotFound
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
 		return
 	}
 	metadata, err := s.runtime.RefreshMetadata(r.Context())
@@ -868,6 +973,13 @@ func (s *server) handlePlayedEvent(w http.ResponseWriter, r *http.Request) {
 	playedAt := req.PlayedAt
 	if strings.TrimSpace(playedAt) == "" {
 		playedAt = recommendationsrepo.NowUTC()
+	} else {
+		parsed, err := time.Parse(time.RFC3339, strings.TrimSpace(playedAt))
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "played_at must be an RFC3339 timestamp"})
+			return
+		}
+		playedAt = parsed.UTC().Format(time.RFC3339)
 	}
 	err = s.repo.RunInTx(r.Context(), func(tx *sql.Tx) error {
 		if err := s.repo.UpdateRecommendationEventChoiceTx(

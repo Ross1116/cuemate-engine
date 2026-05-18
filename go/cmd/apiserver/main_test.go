@@ -235,6 +235,40 @@ func TestRecommendationsCreatesRecommendationEvent(t *testing.T) {
 	}
 }
 
+func TestRecommendationEventsClampsNegativeLimit(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+	err := srv.repo.InsertRecommendationEvent(context.Background(), recommendationsrepo.RecommendationEventRecord{
+		ID:                    "evt_limit",
+		PlaylistID:            "pl_1",
+		CurrentTrackID:        "trk_current",
+		Target:                "maintain",
+		CandidateCount:        1,
+		RecommendationsStatus: "available",
+		LanesReturnedJSON:     `{"lane_order":["maintain"],"lanes":{"maintain":[]}}`,
+		ScoringContractID:     "m3-v1",
+		Timestamp:             "2026-04-09T00:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("InsertRecommendationEvent() error = %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/recommendation-events?playlist_id=pl_1&limit=-1", nil)
+	srv.handleRecommendationEvents(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	if got := len(payload["items"].([]any)); got != 0 {
+		t.Fatalf("items len = %d, want 0", got)
+	}
+}
+
 func TestPlayedEventUpdatesRecommendationEvent(t *testing.T) {
 	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
 		metadataResp: fakeMetadata("rel_sig_current"),
@@ -274,6 +308,33 @@ func TestPlayedEventUpdatesRecommendationEvent(t *testing.T) {
 	}
 	if len(jobs) != 1 || jobs[0].Status != "pending" || jobs[0].TriggerEventID == nil || *jobs[0].TriggerEventID != eventID {
 		t.Fatalf("feedback tuning jobs = %#v", jobs)
+	}
+}
+
+func TestPlayedEventRejectsInvalidPlayedAt(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+	err := srv.repo.InsertRecommendationEvent(context.Background(), recommendationsrepo.RecommendationEventRecord{
+		ID:                    "evt_bad_played_at",
+		PlaylistID:            "pl_1",
+		CurrentTrackID:        "trk_current",
+		Target:                "maintain",
+		CandidateCount:        1,
+		RecommendationsStatus: "available",
+		LanesReturnedJSON:     `{"lane_order":["maintain"],"lanes":{"maintain":[{"track_id":"trk_candidate","score":0.9}]}}`,
+		ScoringContractID:     "m3-v1",
+		Timestamp:             "2026-04-09T00:00:00Z",
+	})
+	if err != nil {
+		t.Fatalf("InsertRecommendationEvent() error = %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/events/played", bytes.NewBufferString(`{"recommendation_event_id":"evt_bad_played_at","chosen_track_id":"trk_candidate","played_at":"not-a-time"}`))
+	srv.handlePlayedEvent(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -937,6 +998,59 @@ func TestClientAnalysisEnqueueEndpoint(t *testing.T) {
 	}
 }
 
+func TestQueuePlaylistAnalysisRequeuesStaleSignatures(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+
+	queued, err := srv.repo.QueuePlaylistAnalysis(context.Background(), "pl_1", "staged", false, "m1-ebd25381ebad", "default")
+	if err != nil {
+		t.Fatalf("QueuePlaylistAnalysis(current signatures) error = %v", err)
+	}
+	if queued != 0 {
+		t.Fatalf("queued current signatures = %d, want 0", queued)
+	}
+
+	queued, err = srv.repo.QueuePlaylistAnalysis(context.Background(), "pl_1", "staged", false, "m1-new", "default")
+	if err != nil {
+		t.Fatalf("QueuePlaylistAnalysis(stale signatures) error = %v", err)
+	}
+	if queued != 3 {
+		t.Fatalf("queued stale signatures = %d, want 3", queued)
+	}
+}
+
+func TestBuildToolCommandSeparatesImportPlaylistPaths(t *testing.T) {
+	args, background, err := buildToolCommand(toolCommandRequest{
+		Action: "import_playlist",
+		Name:   "Test Playlist",
+		Paths:  []string{`C:\Music\track.flac`},
+	})
+	if err != nil {
+		t.Fatalf("buildToolCommand() error = %v", err)
+	}
+	if !background {
+		t.Fatalf("background = false")
+	}
+	want := []string{"-m", pythonModule, "import-playlist", "--name", "Test Playlist", "--", `C:\Music\track.flac`}
+	if fmt.Sprint(args) != fmt.Sprint(want) {
+		t.Fatalf("args = %#v, want %#v", args, want)
+	}
+}
+
+func TestBuildToolCommandRejectsOptionLikeUserValues(t *testing.T) {
+	_, _, err := buildToolCommand(toolCommandRequest{
+		Action:   "analyze_playlist",
+		Playlist: "--help",
+	})
+	if err == nil {
+		t.Fatalf("expected error for option-like playlist")
+	}
+	if !strings.Contains(err.Error(), "must not start with '-'") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 func TestWebAppFallbackServesIndex(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "index.html"), []byte("<main>CueMate</main>"), 0o644); err != nil {
@@ -950,6 +1064,19 @@ func TestWebAppFallbackServesIndex(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "CueMate") {
 		t.Fatalf("body = %s", rec.Body.String())
+	}
+}
+
+func TestWebAppRejectsPathTraversal(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "index.html"), []byte("<main>CueMate</main>"), 0o644); err != nil {
+		t.Fatalf("write index: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/../secret.txt", nil)
+	rec := httptest.NewRecorder()
+	handleWebApp(dir)(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
 }
 

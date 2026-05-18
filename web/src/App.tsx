@@ -347,6 +347,9 @@ export function App() {
             setSelectedPlaylistId(id);
             localStorage.setItem("cuemate.playlist", id);
             setCurrentTrackId("");
+            setHistory([]);
+            localStorage.removeItem("cuemate.current");
+            localStorage.removeItem("cuemate.history");
           }}
         />
         <div className="searchbox">

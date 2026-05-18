@@ -871,7 +871,9 @@ func (r *Repository) QueuePlaylistAnalysis(
 		  t.id,
 		  t.file_path,
 		  t.file_hash,
-		  f.track_id
+		  f.track_id,
+		  f.analysis_signature,
+		  f.config_signature
 		FROM playlist_tracks pt
 		JOIN tracks t ON t.id = pt.track_id
 		LEFT JOIN track_features_abs f ON f.track_id = t.id
@@ -884,21 +886,31 @@ func (r *Repository) QueuePlaylistAnalysis(
 	defer rows.Close()
 
 	type pendingTrack struct {
-		id       string
-		path     string
-		fileHash *string
-		analyzed bool
+		id                string
+		path              string
+		fileHash          *string
+		analyzed          bool
+		storedAnalysisSig *string
+		storedConfigSig   *string
 	}
 	var tracks []pendingTrack
 	for rows.Next() {
 		var item pendingTrack
 		var fileHash sql.NullString
 		var analyzedID sql.NullString
-		if err := rows.Scan(&item.id, &item.path, &fileHash, &analyzedID); err != nil {
+		var storedAnalysisSig sql.NullString
+		var storedConfigSig sql.NullString
+		if err := rows.Scan(&item.id, &item.path, &fileHash, &analyzedID, &storedAnalysisSig, &storedConfigSig); err != nil {
 			return 0, err
 		}
 		if fileHash.Valid {
 			item.fileHash = &fileHash.String
+		}
+		if storedAnalysisSig.Valid {
+			item.storedAnalysisSig = &storedAnalysisSig.String
+		}
+		if storedConfigSig.Valid {
+			item.storedConfigSig = &storedConfigSig.String
 		}
 		item.analyzed = analyzedID.Valid
 		tracks = append(tracks, item)
@@ -909,7 +921,7 @@ func (r *Repository) QueuePlaylistAnalysis(
 
 	count := 0
 	for _, track := range tracks {
-		if track.analyzed && !force {
+		if track.analyzed && !force && stringPtrEqual(track.storedAnalysisSig, analysisSignature) && stringPtrEqual(track.storedConfigSig, configSignature) {
 			continue
 		}
 		if _, err := r.CreateAnalysisJobWithKind(
@@ -930,6 +942,10 @@ func (r *Repository) QueuePlaylistAnalysis(
 		count++
 	}
 	return count, nil
+}
+
+func stringPtrEqual(value *string, expected string) bool {
+	return value != nil && *value == expected
 }
 
 func (r *Repository) ListAnalysisJobs(ctx context.Context, playlistID, status string, limit int) ([]AnalysisJobRecord, error) {

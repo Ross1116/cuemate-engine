@@ -1123,6 +1123,30 @@ func TestRemoteAccessBlocksAdminRoutesEvenWithSession(t *testing.T) {
 	}
 }
 
+func TestSetupStatusReadsInstallerState(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+	statePath := filepath.Join(t.TempDir(), "setup-state.json")
+	if err := os.WriteFile(statePath, []byte(`{"step":"prepare-docker","status":"blocked","message":"Docker login required","core_ready":true,"docker_ready":false,"model_ready":false,"mobile_ready":false,"log_dir":"C:\\CueMate\\logs"}`), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	t.Setenv("CUEMATE_SETUP_STATE_PATH", statePath)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/setup/status", nil)
+	srv.handleSetupStatus(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	if payload["status"] != "blocked" || payload["core_ready"] != true || payload["docker_ready"] != false {
+		t.Fatalf("setup payload = %#v", payload)
+	}
+}
+
 func TestClientPlaylistAndTrackBrowseEndpoints(t *testing.T) {
 	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
 		metadataResp: fakeMetadata("rel_sig_current"),

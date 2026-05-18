@@ -22,8 +22,8 @@ OutputBaseFilename=CueMateSetup
 Compression=lzma2
 SolidCompression=yes
 PrivilegesRequired=lowest
-ArchitecturesAllowed=x64
-ArchitecturesInstallIn64BitMode=x64
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayName={#MyAppName}
 WizardStyle=modern
 
@@ -36,7 +36,9 @@ Name: "{autodesktop}\CueMate"; Filename: "powershell.exe"; Parameters: "-NoProfi
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: checkedonce
+Name: "mobileaccess"; Description: "Prepare optional phone access with Tailscale"; GroupDescription: "Mobile access:"; Flags: checkedonce
 
 [Run]
-Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\Bootstrap-CueMate.ps1"" -InstallDir ""{app}"""; WorkingDir: "{app}"; StatusMsg: "Preparing CueMate runtime, models, and local services..."
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\Bootstrap-CueMate.ps1"" -InstallDir ""{app}"""; WorkingDir: "{app}"; StatusMsg: "Preparing CueMate runtime, models, and local services..."; Check: WizardIsTaskSelected('mobileaccess')
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\Bootstrap-CueMate.ps1"" -InstallDir ""{app}"" -SkipTailscaleInstall"; WorkingDir: "{app}"; StatusMsg: "Preparing CueMate runtime, models, and local services..."; Check: not WizardIsTaskSelected('mobileaccess')
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\Start-CueMate.ps1"" -InstallDir ""{app}"""; WorkingDir: "{app}"; Description: "Launch CueMate"; Flags: postinstall nowait skipifsilent

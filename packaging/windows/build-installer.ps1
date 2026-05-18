@@ -57,7 +57,8 @@ function Get-InnoCompiler {
 
     $candidates = @(
         "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
-        "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+        "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
+        "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
     )
     foreach ($candidate in $candidates) {
         if (Test-Path $candidate -PathType Leaf) {
@@ -111,6 +112,14 @@ Copy-Item (Join-Path $packagingRoot "Bootstrap-CueMate.ps1") (Join-Path $stageRo
 Copy-Item (Join-Path $packagingRoot "Start-CueMate.ps1") (Join-Path $stageRoot "Start-CueMate.ps1") -Force
 Set-Content -Path (Join-Path $stageRoot "VERSION") -Value $Version -Encoding UTF8
 
+Invoke-LoggedCommand -FilePath "powershell.exe" -Arguments @(
+    "-NoProfile",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    (Join-Path $packagingRoot "Test-PackagingSmoke.ps1")
+) -WorkingDirectory $repoRoot
+
 if ($SkipInstaller) {
     Write-Host "Staged CueMate runtime at $stageRoot"
     exit 0
@@ -124,5 +133,14 @@ Invoke-LoggedCommand -FilePath $iscc -Arguments @(
     "/DOutputDir=$outputRoot",
     $iss
 ) -WorkingDirectory $packagingRoot
+
+Invoke-LoggedCommand -FilePath "powershell.exe" -Arguments @(
+    "-NoProfile",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    (Join-Path $packagingRoot "Test-PackagingSmoke.ps1"),
+    "-RequireInstaller"
+) -WorkingDirectory $repoRoot
 
 Write-Host "Installer written to $outputRoot"

@@ -25,7 +25,7 @@ import {
   Waves,
 } from "lucide-react";
 import { Bar, BarChart, LabelList, ResponsiveContainer, XAxis, YAxis } from "recharts";
-import { api, FeedbackSummary, LaneItem, PickPathRequest, Playlist, RecommendationResponse, ToolCommandRequest, ToolCommandResult, Track } from "./api";
+import { api, FeedbackSummary, LaneItem, PickPathRequest, Playlist, RecommendationResponse, SetupStatus, ToolCommandRequest, ToolCommandResult, Track } from "./api";
 
 const targets = ["maintain", "build", "reset", "jump", "contrast"];
 
@@ -222,6 +222,7 @@ export function App() {
   const health = useQuery({ queryKey: ["health"], queryFn: api.health, refetchInterval: 15_000 });
   const readiness = useQuery({ queryKey: ["ready"], queryFn: api.readiness, refetchInterval: 15_000 });
   const metadata = useQuery({ queryKey: ["metadata"], queryFn: api.metadata, refetchInterval: 30_000 });
+  const setupStatus = useQuery({ queryKey: ["setupStatus"], queryFn: api.setupStatus, refetchInterval: 15_000 });
   const playlists = useQuery({ queryKey: ["playlists"], queryFn: api.playlists });
   const tracks = useQuery({
     queryKey: ["playlistTracks", selectedPlaylistId, trackQuery],
@@ -377,6 +378,7 @@ export function App() {
           {remoteConsumePairMutation.error ? `Pairing failed: ${remoteConsumePairMutation.error.message}` : null}
         </div>
       ) : null}
+      <SetupStatusBanner status={setupStatus.data} />
 
       <aside className="library-pane panel mobile-library">
         <PaneTitle icon={<Library />} title="Library" action={`${playlists.data?.items.length ?? 0} playlists`} />
@@ -495,6 +497,7 @@ export function App() {
             toolBusy={toolMutation.isPending}
             toolResult={lastToolResult}
             toolError={toolMutation.error}
+            setupStatus={setupStatus.data}
             remoteStatus={remoteStatus.data}
             remoteStatusLoading={remoteStatus.isLoading}
             remotePairUrl={remotePairUrl}
@@ -531,6 +534,23 @@ function StatusDot({ label, ok, loading }: { label: string; ok: boolean; loading
       <CircleDot size={14} />
       {loading ? `${label}...` : label}
     </span>
+  );
+}
+
+function SetupStatusBanner({ status }: { status?: SetupStatus }) {
+  if (!status?.available) return null;
+  const isBlocked = status.status === "blocked" || status.status === "failed";
+  const modelPending = status.core_ready && (!status.docker_ready || !status.model_ready);
+  if (!isBlocked && !modelPending) return null;
+  const message = isBlocked
+    ? status.message || "CueMate setup needs attention before all features are available."
+    : "CueMate is open. Docker/model setup is still pending, so full analysis may be unavailable until setup resumes.";
+  return (
+    <div className={isBlocked ? "setup-banner blocked" : "setup-banner"}>
+      <AlertTriangle size={16} />
+      <span>{message}</span>
+      {status.log_dir ? <small>Logs: {status.log_dir}</small> : null}
+    </div>
   );
 }
 
@@ -1507,6 +1527,7 @@ function FullToolsPanel({
   toolBusy,
   toolResult,
   toolError,
+  setupStatus,
   remoteStatus,
   remoteStatusLoading,
   remotePairUrl,
@@ -1532,6 +1553,7 @@ function FullToolsPanel({
   toolBusy: boolean;
   toolResult: ToolCommandResult | null;
   toolError: Error | null;
+  setupStatus?: SetupStatus;
   remoteStatus?: { enabled: boolean; remote_url: string | null; paired: boolean; request_local: boolean };
   remoteStatusLoading: boolean;
   remotePairUrl: string;
@@ -1611,7 +1633,13 @@ function FullToolsPanel({
             <p className={remoteStatus?.enabled ? "pill cyan" : "pill amber"}>
               {remoteStatusLoading ? "checking" : remoteStatus?.enabled ? "remote ready" : "remote setup needed"}
             </p>
-            <p className="muted">{remoteStatus?.remote_url ?? "Enable Tailscale Serve from the Windows launcher to get a remote HTTPS URL."}</p>
+            <p className="muted">
+              {remoteStatus?.remote_url ??
+                "Mobile access requires Tailscale on this PC and your phone. Local CueMate works without it; launch again after signing in to enable QR pairing."}
+            </p>
+            {setupStatus?.available && !setupStatus.mobile_ready ? (
+              <p className="action-note">Tailscale was skipped or is not ready. Install and sign in to Tailscale on both devices to use phone access.</p>
+            ) : null}
           </div>
           <button className="wide-action secondary" disabled={!remoteStatus?.enabled || remotePairBusy} onClick={onGenerateRemotePair}>
             {remotePairBusy ? "Generating..." : "Generate QR"}

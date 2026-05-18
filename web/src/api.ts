@@ -191,6 +191,19 @@ export type RemoteStatus = {
   paired: boolean;
 };
 
+export type SetupStatus = {
+  available: boolean;
+  status: "unknown" | "running" | "blocked" | "failed" | "complete" | "skipped" | string;
+  step: string;
+  message: string;
+  core_ready: boolean;
+  docker_ready: boolean;
+  model_ready: boolean;
+  mobile_ready: boolean;
+  log_dir: string | null;
+  updated_at?: string;
+};
+
 export type RemotePairingToken = {
   token: string;
   expires_at: string;
@@ -242,6 +255,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   health: () => request<{ status: string }>("/healthz"),
   readiness: () => request<{ status: string; error?: string }>("/readyz"),
+  setupStatus: () => request<SetupStatus>("/setup/status"),
   metadata: () =>
     request<{
       metadata: { capability_flags?: Record<string, boolean>; active_signatures?: Record<string, string> };

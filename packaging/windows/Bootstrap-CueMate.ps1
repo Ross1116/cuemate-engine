@@ -2,6 +2,7 @@ param(
     [string]$InstallDir = $PSScriptRoot,
     [string]$AppDataRoot = (Join-Path $env:LOCALAPPDATA "CueMate"),
     [switch]$SkipWingetInstall,
+    [switch]$SkipTailscaleInstall,
     [switch]$SkipDockerSetup,
     [switch]$SkipModelSetup
 )
@@ -18,21 +19,62 @@ $venvPython = Join-Path $venvDir "Scripts\python.exe"
 $databasePath = Join-Path $dataDir "cuemate.db"
 $cachePath = Join-Path $dataDir "inference-cache.db"
 $bootstrapLog = Join-Path $logDir "bootstrap.log"
+$script:SetupBlocked = $false
 
 New-Item -ItemType Directory -Force -Path $AppDataRoot, $dataDir, $logDir | Out-Null
 Start-Transcript -Path $bootstrapLog -Append | Out-Null
+
+function Read-SetupState {
+    if (-not (Test-Path $statePath -PathType Leaf)) {
+        return [pscustomobject]@{
+            core_ready = $false
+            docker_ready = $false
+            model_ready = $false
+            mobile_ready = $false
+        }
+    }
+    try {
+        return Get-Content $statePath -Raw | ConvertFrom-Json
+    } catch {
+        return [pscustomobject]@{
+            core_ready = $false
+            docker_ready = $false
+            model_ready = $false
+            mobile_ready = $false
+        }
+    }
+}
 
 function Write-SetupState {
     param(
         [string]$Step,
         [string]$Status,
-        [string]$Message = ""
+        [string]$Message = "",
+        [Nullable[bool]]$CoreReady = $null,
+        [Nullable[bool]]$DockerReady = $null,
+        [Nullable[bool]]$ModelReady = $null,
+        [Nullable[bool]]$MobileReady = $null
     )
+
+    $previous = Read-SetupState
+    $coreReadyValue = if ($null -ne $CoreReady) { [bool]$CoreReady } else { [bool]$previous.core_ready }
+    $dockerReadyValue = if ($null -ne $DockerReady) { [bool]$DockerReady } else { [bool]$previous.docker_ready }
+    $modelReadyValue = if ($null -ne $ModelReady) { [bool]$ModelReady } else { [bool]$previous.model_ready }
+    $mobileReadyValue = if ($null -ne $MobileReady) { [bool]$MobileReady } else { [bool]$previous.mobile_ready }
+
+    if ($Status -eq "blocked") {
+        $script:SetupBlocked = $true
+    }
 
     [pscustomobject]@{
         step = $Step
         status = $Status
         message = $Message
+        core_ready = $coreReadyValue
+        docker_ready = $dockerReadyValue
+        model_ready = $modelReadyValue
+        mobile_ready = $mobileReadyValue
+        log_dir = $logDir
         updated_at = (Get-Date).ToUniversalTime().ToString("o")
     } | ConvertTo-Json -Depth 4 | Set-Content -Path $statePath -Encoding UTF8
 }
@@ -48,6 +90,10 @@ function Get-SetupStateStatus {
     }
 }
 
+function Test-SetupBlocked {
+    return $script:SetupBlocked -or ((Get-SetupStateStatus) -eq "blocked")
+}
+
 function Invoke-Step {
     param(
         [string]$Name,
@@ -58,6 +104,7 @@ function Invoke-Step {
     Write-Host "[CueMate setup] $Name"
     & $ScriptBlock
     if ((Get-SetupStateStatus) -eq "blocked") {
+        $script:SetupBlocked = $true
         return
     }
     Write-SetupState -Step $Name -Status "complete"
@@ -175,6 +222,7 @@ function Initialize-Database {
     if (-not (Test-Path $schemaPath -PathType Leaf)) {
         throw "Missing database schema at $schemaPath"
     }
+    $initScript = Join-Path $AppDataRoot "initialize-db.py"
     $code = @"
 import pathlib
 import sqlite3
@@ -185,7 +233,8 @@ db_path.parent.mkdir(parents=True, exist_ok=True)
 with sqlite3.connect(db_path) as conn:
     conn.executescript(schema_path.read_text(encoding="utf-8"))
 "@
-    Invoke-External -FilePath $venvPython -Arguments @("-c", $code)
+    Set-Content -Path $initScript -Value $code -Encoding UTF8
+    Invoke-External -FilePath $venvPython -Arguments @($initScript)
 }
 
 try {
@@ -207,8 +256,14 @@ try {
             )
         }
         Ensure-WingetPackage -CommandName "docker.exe" -PackageId "Docker.DockerDesktop"
-        Ensure-WingetPackage -CommandName "tailscale.exe" -PackageId "Tailscale.Tailscale"
+        if (-not $SkipTailscaleInstall) {
+            Ensure-WingetPackage -CommandName "tailscale.exe" -PackageId "Tailscale.Tailscale"
+            Write-SetupState -Step "install-prerequisites" -Status "running" -MobileReady $true
+        } else {
+            Write-SetupState -Step "install-prerequisites" -Status "running" -MobileReady $false -Message "Tailscale installation was skipped; mobile access can be enabled later."
+        }
     }
+    if (Test-SetupBlocked) { exit 0 }
 
     Invoke-Step "prepare-python" {
         $python = Get-PythonCommand
@@ -221,6 +276,7 @@ try {
         Invoke-External -FilePath $venvPython -Arguments @("-m", "pip", "install", "--upgrade", "pip")
         Invoke-External -FilePath $venvPython -Arguments @("-m", "pip", "install", "--upgrade", (Join-Path $InstallDir "python"))
     }
+    if (Test-SetupBlocked) { exit 0 }
 
     Invoke-Step "initialize-data" {
         Set-CueMateEnvironment
@@ -234,7 +290,9 @@ SCORING_GRPC_ADDR=127.0.0.1:47834
 SCORING_RPC_TIMEOUT_MS=250
 CUEMATE_INFERENCE_CACHE_PATH=$cachePath
 "@ | Set-Content -Path (Join-Path $InstallDir ".env") -Encoding UTF8
+        Write-SetupState -Step "initialize-data" -Status "running" -CoreReady $true
     }
+    if (Test-SetupBlocked) { exit 0 }
 
     if (-not $SkipDockerSetup) {
         Invoke-Step "prepare-docker" {
@@ -246,8 +304,12 @@ CUEMATE_INFERENCE_CACHE_PATH=$cachePath
             }
             Invoke-External -FilePath "powershell.exe" -Arguments @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $InstallDir "scripts\build-essentia-semantics-image.ps1"))
             Invoke-External -FilePath "powershell.exe" -Arguments @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $InstallDir "scripts\build-musicalkeycnn-image.ps1"))
+            Write-SetupState -Step "prepare-docker" -Status "running" -DockerReady $true
         }
+    } else {
+        Write-SetupState -Step "prepare-docker" -Status "skipped" -DockerReady $false -Message "Docker setup was skipped; full model analysis will be unavailable until Docker is ready."
     }
+    if (Test-SetupBlocked) { exit 0 }
 
     if (-not $SkipModelSetup) {
         Invoke-Step "prepare-models" {
@@ -259,10 +321,14 @@ CUEMATE_INFERENCE_CACHE_PATH=$cachePath
             }
             Invoke-External -FilePath $venvPython -Arguments @("-m", "cuemate_analysis", "download-essentia-semantic-models")
             Invoke-External -FilePath $venvPython -Arguments @("-m", "cuemate_analysis", "prewarm-model-services")
+            Write-SetupState -Step "prepare-models" -Status "running" -ModelReady $true
         }
+    } else {
+        Write-SetupState -Step "prepare-models" -Status "skipped" -ModelReady $false -Message "Model setup was skipped."
     }
+    if (Test-SetupBlocked) { exit 0 }
 
-    Write-SetupState -Step "complete" -Status "complete"
+    Write-SetupState -Step "complete" -Status "complete" -CoreReady $true -DockerReady (-not $SkipDockerSetup) -ModelReady (-not $SkipModelSetup) -MobileReady (-not $SkipTailscaleInstall)
     Write-Host "CueMate setup complete."
 } catch {
     Write-SetupState -Step "failed" -Status "failed" -Message $_.Exception.Message

@@ -1667,6 +1667,32 @@ h1 {
   font-weight: 800;
 }
 
+.setup-banner {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  margin: -8px 0 8px;
+  padding: 10px 14px;
+  border: 1px solid rgba(198, 161, 91, 0.28);
+  border-radius: 7px;
+  color: var(--text);
+  background: rgba(198, 161, 91, 0.08);
+  font-size: 0.86rem;
+  font-weight: 750;
+}
+
+.setup-banner.blocked {
+  border-color: rgba(222, 92, 82, 0.32);
+  background: rgba(222, 92, 82, 0.1);
+}
+
+.setup-banner small {
+  color: var(--muted);
+  font-weight: 700;
+}
+
 .remote-card {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;

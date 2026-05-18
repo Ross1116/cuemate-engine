@@ -30,6 +30,8 @@ function Get-FixedDriveLetters {
 function Set-CueMateEnvironment {
     $env:DATABASE_URL = "sqlite:$databasePath"
     $env:CUEMATE_INFERENCE_CACHE_PATH = $cachePath
+    $env:CUEMATE_SETUP_STATE_PATH = Join-Path $AppDataRoot "setup-state.json"
+    $env:CUEMATE_LOG_DIR = $logDir
     $env:WEB_DIST_DIR = (Join-Path $InstallDir "web\dist")
     $env:CUEMATE_PYTHON = $venvPython
     $env:SCORING_GRPC_ADDR = "127.0.0.1:47834"
@@ -210,6 +212,9 @@ function Ensure-BootstrapComplete {
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $bootstrap -InstallDir $InstallDir -AppDataRoot $AppDataRoot
     if ($LASTEXITCODE -ne 0) {
         throw "CueMate bootstrap failed. See logs in $logDir."
+    }
+    if ((-not (Test-Path $venvPython -PathType Leaf)) -or (-not (Test-Path $databasePath -PathType Leaf))) {
+        throw "CueMate core setup is not ready yet. Finish any required prerequisite prompts, then launch CueMate again. See logs in $logDir."
     }
 }
 

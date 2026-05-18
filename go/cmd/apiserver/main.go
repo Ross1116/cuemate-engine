@@ -154,6 +154,7 @@ func run() int {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", srv.handleHealthz)
 	mux.HandleFunc("/readyz", srv.handleReadyz)
+	mux.HandleFunc("/setup/status", srv.handleSetupStatus)
 	mux.HandleFunc("/scoring/metadata", srv.handleMetadata)
 	mux.HandleFunc("/playlists", srv.handlePlaylists)
 	mux.HandleFunc("/playlists/", srv.handlePlaylistRoutes)
@@ -243,6 +244,52 @@ func (s *server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ready"})
+}
+
+func (s *server) handleSetupStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	statePath := strings.TrimSpace(os.Getenv("CUEMATE_SETUP_STATE_PATH"))
+	logDir := strings.TrimSpace(os.Getenv("CUEMATE_LOG_DIR"))
+	payload := map[string]any{
+		"available":    false,
+		"status":       "unknown",
+		"step":         "",
+		"message":      "",
+		"core_ready":   true,
+		"docker_ready": false,
+		"model_ready":  false,
+		"mobile_ready": remoteBaseURL() != "",
+		"log_dir":      nullIfEmpty(logDir),
+	}
+	if statePath == "" {
+		writeJSON(w, http.StatusOK, payload)
+		return
+	}
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			payload["message"] = err.Error()
+		}
+		writeJSON(w, http.StatusOK, payload)
+		return
+	}
+	var state map[string]any
+	if err := json.Unmarshal(data, &state); err != nil {
+		payload["message"] = "setup state could not be read"
+		writeJSON(w, http.StatusOK, payload)
+		return
+	}
+	for key, value := range state {
+		payload[key] = value
+	}
+	payload["available"] = true
+	if _, ok := payload["log_dir"]; !ok || payload["log_dir"] == "" {
+		payload["log_dir"] = nullIfEmpty(logDir)
+	}
+	writeJSON(w, http.StatusOK, payload)
 }
 
 func (s *server) handleMetadata(w http.ResponseWriter, r *http.Request) {

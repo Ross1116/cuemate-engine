@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -8,8 +9,12 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -18,10 +23,13 @@ import (
 	"github.com/Ross1116/cuemate-engine/go/internal/recommendationsrepo"
 	"github.com/Ross1116/cuemate-engine/go/internal/scoringruntime"
 	"github.com/google/uuid"
+	"google.golang.org/protobuf/types/known/structpb"
 )
 
 const (
-	defaultAPIAddr = "127.0.0.1:8080"
+	defaultAPIAddr                  = "127.0.0.1:8080"
+	pythonModule                    = "cuemate_analysis"
+	maxRecommendationEventsResponse = 200
 )
 
 var liveLaneOrder = []string{"maintain", "build", "reset", "jump", "contrast"}
@@ -29,6 +37,7 @@ var liveLaneOrder = []string{"maintain", "build", "reset", "jump", "contrast"}
 type appConfig struct {
 	Addr     string
 	Database string
+	WebDist  string
 }
 
 type recommendationRequest struct {
@@ -58,6 +67,13 @@ type snapshotRequest struct {
 	PlaylistName string `json:"playlist_name"`
 }
 
+type feedbackSummaryRequest struct {
+	PlaylistID   string `json:"playlist_id"`
+	PlaylistName string `json:"playlist_name"`
+	Since        string `json:"since"`
+	Until        string `json:"until"`
+}
+
 type snapshotAckRequest struct {
 	SnapshotID string `json:"snapshot_id"`
 	AckedAt    string `json:"acked_at"`
@@ -70,6 +86,29 @@ type outboxPullRequest struct {
 type outboxAckRequest struct {
 	AckThroughID int64  `json:"ack_through_id"`
 	AckedAt      string `json:"acked_at"`
+}
+
+type enqueueAnalysisRequest struct {
+	AnalysisMode string `json:"analysis_mode"`
+	Force        bool   `json:"force"`
+}
+
+type toolCommandRequest struct {
+	Action                  string   `json:"action"`
+	Name                    string   `json:"name"`
+	Paths                   []string `json:"paths"`
+	Source                  string   `json:"source"`
+	Library                 string   `json:"library"`
+	Playlist                string   `json:"playlist"`
+	AnalysisMode            string   `json:"analysis_mode"`
+	Force                   bool     `json:"force"`
+	Limit                   int      `json:"limit"`
+	Path                    string   `json:"path"`
+	PrintBackendDiagnostics bool     `json:"print_backend_diagnostics"`
+}
+
+type pickPathRequest struct {
+	Kind string `json:"kind"`
 }
 
 type server struct {
@@ -102,13 +141,22 @@ func run() int {
 	mux.HandleFunc("/healthz", srv.handleHealthz)
 	mux.HandleFunc("/readyz", srv.handleReadyz)
 	mux.HandleFunc("/scoring/metadata", srv.handleMetadata)
+	mux.HandleFunc("/playlists", srv.handlePlaylists)
+	mux.HandleFunc("/playlists/", srv.handlePlaylistRoutes)
+	mux.HandleFunc("/tracks/search", srv.handleTrackSearch)
+	mux.HandleFunc("/analysis/jobs", srv.handleAnalysisJobs)
+	mux.HandleFunc("/recommendation-events", srv.handleRecommendationEvents)
 	mux.HandleFunc("/recommendations", srv.handleRecommendations)
 	mux.HandleFunc("/events/played", srv.handlePlayedEvent)
+	mux.HandleFunc("/feedback/summary", srv.handleFeedbackSummary)
 	mux.HandleFunc("/corrections", srv.handleCorrections)
 	mux.HandleFunc("/sync/playlists/snapshot", srv.handleSnapshot)
 	mux.HandleFunc("/sync/playlists/snapshot/ack", srv.handleSnapshotAck)
 	mux.HandleFunc("/sync/outbox/pull", srv.handleOutboxPull)
 	mux.HandleFunc("/sync/outbox/ack", srv.handleOutboxAck)
+	mux.HandleFunc("/tools/cli", srv.handleToolCommand)
+	mux.HandleFunc("/tools/pick-path", srv.handlePickPath)
+	mux.HandleFunc("/", handleWebApp(cfg.WebDist))
 
 	httpServer := &http.Server{
 		Addr:         cfg.Addr,
@@ -162,6 +210,7 @@ func loadConfig() appConfig {
 	return appConfig{
 		Addr:     addr,
 		Database: strings.TrimPrefix(databaseURL, "sqlite:"),
+		WebDist:  firstNonEmpty(strings.TrimSpace(os.Getenv("WEB_DIST_DIR")), "web/dist"),
 	}
 }
 
@@ -191,6 +240,638 @@ func (s *server) handleMetadata(w http.ResponseWriter, r *http.Request) {
 		"metadata_fresh": err == nil,
 		"metadata_error": errorString(err),
 	})
+}
+
+func handleWebApp(webDist string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return
+		}
+		webDistAbs, err := filepath.Abs(webDist)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		webDistAbs = filepath.Clean(webDistAbs)
+		cleanPath := filepath.Clean(strings.TrimPrefix(r.URL.Path, "/"))
+		if cleanPath == "." {
+			cleanPath = "index.html"
+		}
+		if filepath.IsAbs(cleanPath) || cleanPath == ".." || strings.HasPrefix(cleanPath, ".."+string(filepath.Separator)) {
+			http.NotFound(w, r)
+			return
+		}
+		fullPath, err := filepath.Abs(filepath.Join(webDistAbs, cleanPath))
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		fullPath = filepath.Clean(fullPath)
+		rel, err := filepath.Rel(webDistAbs, fullPath)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			http.NotFound(w, r)
+			return
+		}
+		if info, err := os.Stat(fullPath); err == nil && !info.IsDir() {
+			http.ServeFile(w, r, fullPath)
+			return
+		}
+		http.ServeFile(w, r, filepath.Join(webDistAbs, "index.html"))
+	}
+}
+
+func (s *server) handlePlaylists(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	playlists, err := s.repo.ListPlaylists(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	items := make([]any, 0, len(playlists))
+	for _, playlist := range playlists {
+		items = append(items, playlistSummaryPayload(playlist))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *server) handlePlaylistRoutes(w http.ResponseWriter, r *http.Request) {
+	rest := strings.Trim(strings.TrimPrefix(r.URL.Path, "/playlists/"), "/")
+	if rest == "" {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "playlist route not found"})
+		return
+	}
+	parts := strings.Split(rest, "/")
+	playlistID := parts[0]
+	switch {
+	case len(parts) == 1 && r.Method == http.MethodGet:
+		s.handlePlaylistDetail(w, r, playlistID)
+	case len(parts) == 2 && parts[1] == "tracks":
+		s.handlePlaylistTracks(w, r, playlistID)
+	case len(parts) == 4 && parts[1] == "tracks" && parts[3] == "features":
+		trackID, err := url.PathUnescape(parts[2])
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid track id"})
+			return
+		}
+		s.handleTrackFeatureDetail(w, r, playlistID, trackID)
+	case len(parts) == 3 && parts[1] == "analysis" && parts[2] == "enqueue":
+		s.handlePlaylistAnalysisEnqueue(w, r, playlistID)
+	default:
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "playlist route not found"})
+	}
+}
+
+func (s *server) handlePlaylistDetail(w http.ResponseWriter, r *http.Request, playlistID string) {
+	playlist, err := s.repo.ResolvePlaylist(r.Context(), playlistID, "")
+	if err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, recommendationsrepo.ErrPlaylistNotFound) {
+			status = http.StatusNotFound
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	stats, err := s.repo.GetPlaylistStats(r.Context(), playlist.ID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"playlist_id": playlist.ID,
+		"name":        playlist.Name,
+		"stats":       playlistStatsPayload(stats),
+	})
+}
+
+func (s *server) handlePlaylistTracks(w http.ResponseWriter, r *http.Request, playlistID string) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	if _, err := s.repo.ResolvePlaylist(r.Context(), playlistID, ""); err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, recommendationsrepo.ErrPlaylistNotFound) {
+			status = http.StatusNotFound
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	query := r.URL.Query().Get("query")
+	analysisState := r.URL.Query().Get("analysis_state")
+	limit := queryInt(r, "limit", 100)
+	offset := queryInt(r, "offset", 0)
+	tracks, err := s.repo.ListPlaylistTracks(r.Context(), playlistID, query, analysisState, limit, offset)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	items := make([]any, 0, len(tracks))
+	for _, track := range tracks {
+		items = append(items, playlistTrackPayload(track))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items, "limit": limit, "offset": offset})
+}
+
+func (s *server) handleTrackFeatureDetail(w http.ResponseWriter, r *http.Request, playlistID string, trackID string) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	if _, err := s.repo.ResolvePlaylist(r.Context(), playlistID, ""); err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, recommendationsrepo.ErrPlaylistNotFound) {
+			status = http.StatusNotFound
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	detail, err := s.repo.GetTrackFeatureDetail(r.Context(), playlistID, trackID)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, recommendationsrepo.ErrTrackNotFound) {
+			status = http.StatusNotFound
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, trackFeatureDetailPayload(detail))
+}
+
+func (s *server) handleTrackSearch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	playlistID := r.URL.Query().Get("playlist_id")
+	tracks, err := s.repo.SearchTracks(r.Context(), playlistID, r.URL.Query().Get("query"), queryInt(r, "limit", 25))
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	items := make([]any, 0, len(tracks))
+	for _, track := range tracks {
+		items = append(items, playlistTrackPayload(track))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *server) handleAnalysisJobs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	jobs, err := s.repo.ListAnalysisJobs(r.Context(), r.URL.Query().Get("playlist_id"), r.URL.Query().Get("status"), queryInt(r, "limit", 50))
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	items := make([]any, 0, len(jobs))
+	for _, job := range jobs {
+		items = append(items, analysisJobPayload(job))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *server) handleRecommendationEvents(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	playlistID := strings.TrimSpace(r.URL.Query().Get("playlist_id"))
+	if playlistID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "playlist_id is required"})
+		return
+	}
+	events, err := s.repo.ListRecommendationEventsByPlaylist(r.Context(), playlistID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	selectedEvents := boundedRecommendationEvents(events, queryInt(r, "limit", 25))
+	items := make([]any, 0, len(selectedEvents))
+	for _, event := range selectedEvents {
+		items = append(items, recommendationEventPayload(event))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func boundedRecommendationEvents(events []recommendationsrepo.RecommendationEventRecord, requestedLimit int) []recommendationsrepo.RecommendationEventRecord {
+	if requestedLimit <= 0 {
+		return events[:0]
+	}
+	if requestedLimit > maxRecommendationEventsResponse {
+		requestedLimit = maxRecommendationEventsResponse
+	}
+	if requestedLimit > len(events) {
+		requestedLimit = len(events)
+	}
+	return events[:requestedLimit]
+}
+
+func (s *server) handleToolCommand(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	var req toolCommandRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON request"})
+		return
+	}
+	cliArgs, background, err := buildToolCommand(req)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	pythonExe, err := pythonExecutable()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	command := append([]string{pythonExe}, cliArgs...)
+	if background {
+		result, err := startBackgroundToolCommand(pythonExe, cliArgs)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		result["command"] = command
+		writeJSON(w, http.StatusAccepted, result)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, pythonExe, cliArgs...)
+	output, err := cmd.CombinedOutput()
+	exitCode := 0
+	if err != nil {
+		exitCode = 1
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			exitCode = exitErr.ExitCode()
+		}
+	}
+	status := "completed"
+	if ctx.Err() == context.DeadlineExceeded {
+		status = "timeout"
+	}
+	httpStatus := http.StatusOK
+	if exitCode != 0 || status == "timeout" {
+		httpStatus = http.StatusBadRequest
+	}
+	writeJSON(w, httpStatus, map[string]any{
+		"status":    status,
+		"mode":      "foreground",
+		"command":   command,
+		"exit_code": exitCode,
+		"output":    string(output),
+	})
+}
+
+func (s *server) handlePickPath(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	var req pickPathRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON request"})
+		return
+	}
+	script, err := pickerScript(req.Kind)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "powershell", "-NoProfile", "-STA", "-Command", script)
+	output, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		writeJSON(w, http.StatusRequestTimeout, map[string]string{"error": "file picker timed out"})
+		return
+	}
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": strings.TrimSpace(string(output))})
+		return
+	}
+	var paths []string
+	if err := json.Unmarshal(bytes.TrimSpace(output), &paths); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("parse picker output: %v", err)})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"paths": paths})
+}
+
+func pickerScript(kind string) (string, error) {
+	switch strings.TrimSpace(kind) {
+	case "folder":
+		return `
+Add-Type -AssemblyName System.Windows.Forms
+$dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+$dialog.Description = 'Choose a folder to import into CueMate'
+if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+  @($dialog.SelectedPath) | ConvertTo-Json -Compress
+} else {
+  @() | ConvertTo-Json -Compress
+}
+`, nil
+	case "audio_files":
+		return `
+Add-Type -AssemblyName System.Windows.Forms
+$dialog = New-Object System.Windows.Forms.OpenFileDialog
+$dialog.Title = 'Choose audio files to import into CueMate'
+$dialog.Filter = 'Audio files|*.mp3;*.wav;*.aiff;*.aif;*.flac;*.m4a;*.ogg|All files|*.*'
+$dialog.Multiselect = $true
+if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+  @($dialog.FileNames) | ConvertTo-Json -Compress
+} else {
+  @() | ConvertTo-Json -Compress
+}
+`, nil
+	case "dj_library_file":
+		return `
+Add-Type -AssemblyName System.Windows.Forms
+$dialog = New-Object System.Windows.Forms.OpenFileDialog
+$dialog.Title = 'Choose Rekordbox XML or Traktor NML export'
+$dialog.Filter = 'DJ library exports|*.xml;*.nml|Rekordbox XML|*.xml|Traktor NML|*.nml|All files|*.*'
+$dialog.Multiselect = $false
+if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+  @($dialog.FileName) | ConvertTo-Json -Compress
+} else {
+  @() | ConvertTo-Json -Compress
+}
+`, nil
+	default:
+		return "", errors.New("kind must be folder, audio_files, or dj_library_file")
+	}
+}
+
+func buildToolCommand(req toolCommandRequest) ([]string, bool, error) {
+	action := strings.TrimSpace(req.Action)
+	args := []string{"-m", pythonModule}
+	switch action {
+	case "import_playlist":
+		name, err := safeCLIValue(req.Name, "name")
+		if err != nil {
+			return nil, false, err
+		}
+		if name == "" {
+			return nil, false, errors.New("name is required")
+		}
+		paths, err := safeCLIPaths(req.Paths)
+		if err != nil {
+			return nil, false, err
+		}
+		if len(paths) == 0 {
+			return nil, false, errors.New("at least one path is required")
+		}
+		args = append(args, "import-playlist", "--name", name)
+		args = append(args, "--")
+		args = append(args, paths...)
+		return args, true, nil
+	case "list_dj_playlists":
+		source, err := normalizeDJSource(req.Source)
+		if err != nil {
+			return nil, false, err
+		}
+		library, err := safeCLIPath(req.Library, "library")
+		if err != nil {
+			return nil, false, err
+		}
+		if library == "" {
+			return nil, false, errors.New("library is required")
+		}
+		return append(args, "list-dj-playlists", "--source", source, "--library", library), false, nil
+	case "import_dj_playlist":
+		source, err := normalizeDJSource(req.Source)
+		if err != nil {
+			return nil, false, err
+		}
+		library, err := safeCLIPath(req.Library, "library")
+		if err != nil {
+			return nil, false, err
+		}
+		playlist, err := safeCLIValue(req.Playlist, "playlist")
+		if err != nil {
+			return nil, false, err
+		}
+		if library == "" || playlist == "" {
+			return nil, false, errors.New("library and playlist are required")
+		}
+		args = append(args, "import-dj-playlist", "--source", source, "--library", library, "--playlist", playlist)
+		name, err := safeCLIValue(req.Name, "name")
+		if err != nil {
+			return nil, false, err
+		}
+		if name != "" {
+			args = append(args, "--name", name)
+		}
+		return args, true, nil
+	case "analyze_playlist":
+		playlist, err := safeCLIValue(req.Playlist, "playlist")
+		if err != nil {
+			return nil, false, err
+		}
+		if playlist == "" {
+			return nil, false, errors.New("playlist is required")
+		}
+		mode := strings.TrimSpace(req.AnalysisMode)
+		if mode == "" {
+			mode = "staged"
+		}
+		if mode != "fast_pass" && mode != "staged" && mode != "full" {
+			return nil, false, errors.New("analysis_mode must be fast_pass, staged, or full")
+		}
+		args = append(args, "analyze-playlist", "--playlist", playlist, "--analysis-mode", mode)
+		if req.Force {
+			args = append(args, "--force")
+		}
+		return args, true, nil
+	case "run_analysis_worker":
+		limit := boundedPositive(req.Limit, 100, 1000)
+		args = append(args, "run-analysis-worker", "--limit", strconv.Itoa(limit))
+		if req.PrintBackendDiagnostics {
+			args = append(args, "--print-backend-diagnostics")
+		}
+		return args, true, nil
+	case "run_feedback_worker":
+		limit := boundedPositive(req.Limit, 50, 1000)
+		return append(args, "run-feedback-worker", "--limit", strconv.Itoa(limit)), true, nil
+	case "prewarm_model_services":
+		args = append(args, "prewarm-model-services")
+		path, err := safeCLIPath(req.Path, "path")
+		if err != nil {
+			return nil, false, err
+		}
+		if path != "" {
+			args = append(args, "--path", path)
+		}
+		return args, true, nil
+	case "download_essentia_models":
+		return append(args, "download-essentia-semantic-models"), true, nil
+	default:
+		return nil, false, fmt.Errorf("unsupported action %q", action)
+	}
+}
+
+func startBackgroundToolCommand(pythonExe string, cliArgs []string) (map[string]any, error) {
+	logDir := filepath.Join("tmp", "tool-runs")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		return nil, err
+	}
+	logPath := filepath.Join(logDir, fmt.Sprintf("%s.log", time.Now().UTC().Format("20060102T150405.000000000Z")))
+	logFile, err := os.Create(logPath)
+	if err != nil {
+		return nil, err
+	}
+	cmd := exec.Command(pythonExe, cliArgs...)
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	if err := cmd.Start(); err != nil {
+		_ = logFile.Close()
+		return nil, err
+	}
+	go func() {
+		err := cmd.Wait()
+		if err != nil {
+			_, _ = fmt.Fprintf(logFile, "\n[cuemate] command failed: %v\n", err)
+		}
+		_ = logFile.Close()
+	}()
+	return map[string]any{
+		"status":   "started",
+		"mode":     "background",
+		"pid":      cmd.Process.Pid,
+		"log_path": logPath,
+	}, nil
+}
+
+func pythonExecutable() (string, error) {
+	configured := strings.TrimSpace(os.Getenv("CUEMATE_PYTHON"))
+	if configured != "" {
+		if !filepath.IsAbs(configured) {
+			return "", errors.New("CUEMATE_PYTHON must be an absolute path")
+		}
+		return filepath.Clean(configured), nil
+	}
+	pythonExe, err := exec.LookPath("python")
+	if err != nil {
+		return "", err
+	}
+	return pythonExe, nil
+}
+
+func normalizeDJSource(source string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(source)) {
+	case "rekordbox", "traktor", "serato":
+		return strings.ToLower(strings.TrimSpace(source)), nil
+	default:
+		return "", errors.New("source must be rekordbox, traktor, or serato")
+	}
+}
+
+func safeCLIValue(value string, field string) (string, error) {
+	trimmed := strings.TrimSpace(value)
+	if strings.ContainsRune(trimmed, '\x00') {
+		return "", fmt.Errorf("%s contains an invalid character", field)
+	}
+	if strings.HasPrefix(trimmed, "-") {
+		return "", fmt.Errorf("%s must not start with '-'", field)
+	}
+	return trimmed, nil
+}
+
+func safeCLIPath(value string, field string) (string, error) {
+	trimmed, err := safeCLIValue(value, field)
+	if err != nil {
+		return "", err
+	}
+	if trimmed == "" {
+		return "", nil
+	}
+	return filepath.Clean(trimmed), nil
+}
+
+func safeCLIPaths(values []string) ([]string, error) {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		trimmed, err := safeCLIPath(value, "path")
+		if err != nil {
+			return nil, err
+		}
+		if trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out, nil
+}
+
+func boundedPositive(value, fallback, max int) int {
+	if value <= 0 {
+		return fallback
+	}
+	if value > max {
+		return max
+	}
+	return value
+}
+
+func validAnalysisMode(mode string) bool {
+	switch strings.TrimSpace(mode) {
+	case "", "fast_pass", "staged", "full":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *server) handlePlaylistAnalysisEnqueue(w http.ResponseWriter, r *http.Request, playlistID string) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	var req enqueueAnalysisRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON request"})
+		return
+	}
+	if !validAnalysisMode(req.AnalysisMode) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "analysis_mode must be fast_pass, staged, or full"})
+		return
+	}
+	if _, err := s.repo.ResolvePlaylist(r.Context(), playlistID, ""); err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, recommendationsrepo.ErrPlaylistNotFound) {
+			status = http.StatusNotFound
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	metadata, err := s.runtime.RefreshMetadata(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": scoringruntime.DescribeUnavailable(err)})
+		return
+	}
+	active := metadata.GetActiveSignatures()
+	queued, err := s.repo.QueuePlaylistAnalysis(
+		r.Context(),
+		playlistID,
+		req.AnalysisMode,
+		req.Force,
+		active.GetAnalysisSignature(),
+		active.GetConfigSignature(),
+	)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"playlist_id": playlistID, "queued_count": queued})
 }
 
 func (s *server) handleRecommendations(w http.ResponseWriter, r *http.Request) {
@@ -263,6 +944,7 @@ func (s *server) handleRecommendations(w http.ResponseWriter, r *http.Request) {
 	}
 
 	payload := translateRecommendationsResponse(response)
+	applyPlaylistWeightSource(payload, hydrated.Stats)
 	eventID, err := s.recordRecommendationEvent(r.Context(), hydrated, response, payload)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -311,6 +993,13 @@ func (s *server) handlePlayedEvent(w http.ResponseWriter, r *http.Request) {
 	playedAt := req.PlayedAt
 	if strings.TrimSpace(playedAt) == "" {
 		playedAt = recommendationsrepo.NowUTC()
+	} else {
+		parsed, err := time.Parse(time.RFC3339, strings.TrimSpace(playedAt))
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "played_at must be an RFC3339 timestamp"})
+			return
+		}
+		playedAt = parsed.UTC().Format(time.RFC3339)
 	}
 	err = s.repo.RunInTx(r.Context(), func(tx *sql.Tx) error {
 		if err := s.repo.UpdateRecommendationEventChoiceTx(
@@ -320,6 +1009,7 @@ func (s *server) handlePlayedEvent(w http.ResponseWriter, r *http.Request) {
 			req.ChosenTrackID,
 			wasRecommended,
 			string(skippedJSONBytes),
+			playedAt,
 		); err != nil {
 			return err
 		}
@@ -336,13 +1026,22 @@ func (s *server) handlePlayedEvent(w http.ResponseWriter, r *http.Request) {
 			log.Printf("failed to marshal recommendation event outbox payload for %s: %v", event.ID, err)
 			return fmt.Errorf("failed to encode sync payload: %w", err)
 		}
-		_, err = s.repo.InsertSyncOutboxTx(
+		if _, err = s.repo.InsertSyncOutboxTx(
 			r.Context(),
 			tx,
 			"recommendation_event",
 			event.ID,
 			"played",
 			string(outboxPayload),
+			playedAt,
+		); err != nil {
+			return err
+		}
+		_, err = s.repo.UpsertFeedbackTuningJobTx(
+			r.Context(),
+			tx,
+			event.PlaylistID,
+			&event.ID,
 			playedAt,
 		)
 		return err
@@ -843,9 +1542,16 @@ func buildRecommendationsRequest(
 		if hydrated.Stats.EnergySpread != nil {
 			req.PlaylistStats.EnergySpread = hydrated.Stats.EnergySpread
 		}
+		_, source := effectivePlaylistWeights(hydrated.Stats)
 		if len(hydrated.Stats.AdaptedWeights) > 0 {
-			req.PlaylistStats.AdaptedWeights = hydrated.Stats.AdaptedWeights
+			req.PlaylistStats.AdaptedWeights = copyWeightMap(hydrated.Stats.AdaptedWeights)
 		}
+		if len(hydrated.Stats.FeedbackTunedWeights) > 0 {
+			req.PlaylistStats.FeedbackTunedWeights = copyWeightMap(hydrated.Stats.FeedbackTunedWeights)
+		}
+		req.PlaylistStats.WeightSourceEnum = playlistWeightSourceEnum(source)
+	} else {
+		req.PlaylistStats.WeightSourceEnum = scoringv1.WeightSource_WEIGHT_SOURCE_STATIC
 	}
 	return req
 }
@@ -945,16 +1651,25 @@ func translateRecommendationsResponse(resp *scoringv1.GetRecommendationsResponse
 		items := make([]any, 0, len(lane.GetItems()))
 		for _, item := range lane.GetItems() {
 			items = append(items, map[string]any{
-				"track_id":         item.GetCandidate().GetTrackId(),
-				"title":            item.GetCandidate().GetTitle(),
-				"artist":           item.GetCandidate().GetArtist(),
-				"score":            item.GetFinalScore(),
-				"ranking_strength": item.GetRankingStrength(),
-				"move":             item.GetMove(),
-				"move_confidence":  item.GetMoveConfidence(),
-				"move_note":        item.GetMoveNote(),
-				"risk":             item.GetRisk(),
-				"risk_score":       item.GetRiskScore(),
+				"track_id":              item.GetCandidate().GetTrackId(),
+				"title":                 item.GetCandidate().GetTitle(),
+				"artist":                item.GetCandidate().GetArtist(),
+				"score":                 item.GetFinalScore(),
+				"ranking_strength":      item.GetRankingStrength(),
+				"move":                  item.GetMove(),
+				"move_confidence":       item.GetMoveConfidence(),
+				"move_note":             item.GetMoveNote(),
+				"risk":                  item.GetRisk(),
+				"risk_score":            item.GetRiskScore(),
+				"raw_score":             item.GetRawScore(),
+				"penalty_multiplier":    item.GetPenaltyMultiplier(),
+				"primary_lane":          nullIfEmpty(item.GetPrimaryLane()),
+				"secondary_lane":        item.GetSecondaryLane(),
+				"component_scores":      float64MapToAnyMap(item.GetComponentScores()),
+				"component_confidences": float64MapToAnyMap(item.GetComponentConfidences()),
+				"weights_used":          float64MapToAnyMap(item.GetWeightsUsed()),
+				"transition_features":   transitionFeaturesPayload(item.GetTransitionFeatures()),
+				"candidate_features":    trackContextFeaturePayload(item.GetCandidate()),
 				"tempo_key": map[string]any{
 					"tempo_text": item.GetTempoKey().GetTempoText(),
 					"key_text":   item.GetTempoKey().GetKeyText(),
@@ -1053,14 +1768,70 @@ func (s *server) recordRecommendationEvent(
 	}
 
 	lanesSnapshot := make(map[string][]map[string]any)
+	eventItems := make([]recommendationsrepo.RecommendationEventItemRecord, 0)
+	eventID := uuid.NewString()
 	for _, lane := range resp.GetLanes() {
 		items := make([]map[string]any, 0, len(lane.GetItems()))
-		for _, item := range lane.GetItems() {
+		for idx, item := range lane.GetItems() {
 			items = append(items, map[string]any{
 				"track_id":       item.GetCandidate().GetTrackId(),
 				"score":          item.GetFinalScore(),
 				"primary_lane":   item.GetPrimaryLane(),
 				"secondary_lane": item.GetSecondaryLane(),
+			})
+			componentScoresJSON, err := json.Marshal(item.GetComponentScores())
+			if err != nil {
+				return nil, err
+			}
+			confidencesJSON, err := json.Marshal(item.GetComponentConfidences())
+			if err != nil {
+				return nil, err
+			}
+			weightsUsedJSON, err := json.Marshal(item.GetWeightsUsed())
+			if err != nil {
+				return nil, err
+			}
+			transitionFeatures := item.GetTransitionFeatures()
+			transitionFeaturesJSON, err := json.Marshal(map[string]any{
+				"effective_bpm_distance":   transitionFeatures.GetEffectiveBpmDistance(),
+				"raw_bpm_distance":         transitionFeatures.GetRawBpmDistance(),
+				"bpm_relationship":         transitionFeatures.GetBpmRelationship(),
+				"key_distance":             transitionFeatures.GetKeyDistance(),
+				"key_compat_label":         transitionFeatures.GetKeyCompatLabel(),
+				"key_confidence_current":   transitionFeatures.GetKeyConfidenceCurrent(),
+				"key_confidence_candidate": transitionFeatures.GetKeyConfidenceCandidate(),
+				"delta_energy_rel":         transitionFeatures.GetDeltaEnergyRel(),
+				"delta_bass_rel":           transitionFeatures.GetDeltaBassRel(),
+				"current_vocals_rel":       transitionVocalValue(transitionFeatures, true),
+				"candidate_vocals_rel":     transitionVocalValue(transitionFeatures, false),
+				"current_outro_low_end":    transitionFeatures.GetCurrentOutroLowEnd(),
+				"candidate_intro_low_end":  transitionFeatures.GetCandidateIntroLowEnd(),
+			})
+			if err != nil {
+				return nil, err
+			}
+			var primaryLane *string
+			if laneValue := firstNonEmpty(item.GetPrimaryLane(), lane.GetLaneGroup().GetLaneId()); laneValue != "" {
+				primaryLane = &laneValue
+			}
+			eventItems = append(eventItems, recommendationsrepo.RecommendationEventItemRecord{
+				EventID:                eventID,
+				LaneID:                 lane.GetLaneGroup().GetLaneId(),
+				LaneRank:               idx + 1,
+				CandidateTrackID:       item.GetCandidate().GetTrackId(),
+				FinalScore:             item.GetFinalScore(),
+				RawScore:               item.GetRawScore(),
+				PenaltyMultiplier:      item.GetPenaltyMultiplier(),
+				Move:                   item.GetMove(),
+				MoveConfidence:         item.GetMoveConfidence(),
+				Risk:                   item.GetRisk(),
+				RiskScore:              item.GetRiskScore(),
+				PrimaryLane:            primaryLane,
+				SecondaryLane:          item.GetSecondaryLane(),
+				ComponentScoresJSON:    string(componentScoresJSON),
+				ConfidencesJSON:        string(confidencesJSON),
+				WeightsUsedJSON:        string(weightsUsedJSON),
+				TransitionFeaturesJSON: string(transitionFeaturesJSON),
 			})
 		}
 		lanesSnapshot[lane.GetLaneGroup().GetLaneId()] = items
@@ -1082,7 +1853,6 @@ func (s *server) recordRecommendationEvent(
 		value := string(raw)
 		adaptedWeightsJSON = &value
 	}
-	eventID := uuid.NewString()
 	record := recommendationsrepo.RecommendationEventRecord{
 		ID:                    eventID,
 		PlaylistID:            hydrated.Playlist.ID,
@@ -1098,7 +1868,12 @@ func (s *server) recordRecommendationEvent(
 	if confidence := resp.GetRecommendationConfidence(); confidence > 0 {
 		record.RecommendationConfidence = &confidence
 	}
-	if err := s.repo.InsertRecommendationEvent(ctx, record); err != nil {
+	if err := s.repo.RunInTx(ctx, func(tx *sql.Tx) error {
+		if err := s.repo.InsertRecommendationEventTx(ctx, tx, record); err != nil {
+			return err
+		}
+		return s.repo.InsertRecommendationEventItemsTx(ctx, tx, eventItems)
+	}); err != nil {
 		return nil, err
 	}
 	return &eventID, nil
@@ -1144,6 +1919,221 @@ func derivePlayedOutcome(lanesJSON string, chosenTrackID string) (bool, []string
 	return chosenWasRecommended, skipped, nil
 }
 
+func (s *server) handleFeedbackSummary(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	var req feedbackSummaryRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON request"})
+		return
+	}
+	since, until, err := validateFeedbackSummaryWindow(req.Since, req.Until)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	playlist, err := s.repo.ResolvePlaylist(r.Context(), req.PlaylistID, req.PlaylistName)
+	if err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, recommendationsrepo.ErrPlaylistNotFound) {
+			status = http.StatusNotFound
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	events, err := s.repo.ListRecommendationEventsByPlaylistWindow(r.Context(), playlist.ID, since, until)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	playedEvents := make([]recommendationsrepo.RecommendationEventRecord, 0, len(events))
+	eventIDs := make([]string, 0, len(events))
+	for _, event := range events {
+		if event.PlayedAt == nil {
+			continue
+		}
+		playedEvents = append(playedEvents, event)
+		eventIDs = append(eventIDs, event.ID)
+	}
+	itemsByEvent, err := s.repo.ListRecommendationEventItemsByEventIDs(r.Context(), eventIDs)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	stats, err := s.repo.GetPlaylistStats(r.Context(), playlist.ID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	rpcReq, err := buildFeedbackSummaryRPCRequest(playlist, playedEvents, itemsByEvent, stats, since, until)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	rpcResp, err := s.runtime.GetFeedbackSummary(r.Context(), rpcReq)
+	if err == nil {
+		writeJSON(w, http.StatusOK, translateFeedbackSummaryResponse(rpcResp))
+		return
+	}
+	if scoringruntime.IsUnavailable(err) {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": scoringruntime.DescribeUnavailable(err)})
+		return
+	}
+	writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+}
+
+func validateFeedbackSummaryWindow(rawSince, rawUntil string) (string, string, error) {
+	since := strings.TrimSpace(rawSince)
+	until := strings.TrimSpace(rawUntil)
+	var parsedSince time.Time
+	var parsedUntil time.Time
+	var hasSince bool
+	var hasUntil bool
+	if since != "" {
+		value, err := time.Parse(time.RFC3339, since)
+		if err != nil {
+			return "", "", fmt.Errorf("since must be a valid RFC3339 timestamp")
+		}
+		parsedSince = value.UTC()
+		hasSince = true
+		since = parsedSince.Format(time.RFC3339)
+	}
+	if until != "" {
+		value, err := time.Parse(time.RFC3339, until)
+		if err != nil {
+			return "", "", fmt.Errorf("until must be a valid RFC3339 timestamp")
+		}
+		parsedUntil = value.UTC()
+		hasUntil = true
+		until = parsedUntil.Format(time.RFC3339)
+	}
+	if hasSince && hasUntil && parsedSince.After(parsedUntil) {
+		return "", "", fmt.Errorf("since must be before or equal to until")
+	}
+	return since, until, nil
+}
+
+func buildFeedbackSummaryRPCRequest(
+	playlist recommendationsrepo.PlaylistRef,
+	events []recommendationsrepo.RecommendationEventRecord,
+	itemsByEvent map[string][]recommendationsrepo.RecommendationEventItemRecord,
+	stats *recommendationsrepo.PlaylistStats,
+	since, until string,
+) (*scoringv1.GetFeedbackSummaryRequest, error) {
+	req := &scoringv1.GetFeedbackSummaryRequest{
+		PlaylistId:   playlist.ID,
+		PlaylistName: playlist.Name,
+		Window: &scoringv1.FeedbackSummaryWindow{
+			Since: since,
+			Until: until,
+		},
+		PlaylistStats: &scoringv1.FeedbackSummaryPlaylistStats{
+			AdaptedWeights:       map[string]float64{},
+			FeedbackTunedWeights: map[string]float64{},
+		},
+	}
+	if stats != nil {
+		req.PlaylistStats.AdaptedWeights = copyWeightMap(stats.AdaptedWeights)
+		req.PlaylistStats.FeedbackTunedWeights = copyWeightMap(stats.FeedbackTunedWeights)
+		req.PlaylistStats.FeedbackTuningNotes = append([]string{}, stats.FeedbackTuningNotes...)
+		req.PlaylistStats.FeedbackEventCount = int32(stats.FeedbackEventCount)
+		if stats.FeedbackLastTunedAt != nil {
+			req.PlaylistStats.FeedbackLastTunedAt = *stats.FeedbackLastTunedAt
+		}
+		if len(stats.FeedbackTuningMetrics) > 0 {
+			metrics, err := structpb.NewStruct(stats.FeedbackTuningMetrics)
+			if err != nil {
+				return nil, err
+			}
+			req.PlaylistStats.FeedbackTuningMetrics = metrics
+		}
+	}
+	req.Events = make([]*scoringv1.FeedbackSummaryEvent, 0, len(events))
+	for _, event := range events {
+		pbEvent := &scoringv1.FeedbackSummaryEvent{
+			EventId:              event.ID,
+			Timestamp:            firstNonEmpty(stringValue(event.PlayedAt), event.Timestamp),
+			ChosenWasRecommended: event.ChosenWasRecommended != nil && *event.ChosenWasRecommended,
+			Items:                make([]*scoringv1.FeedbackSummaryEventItem, 0, len(itemsByEvent[event.ID])),
+		}
+		if event.TrackChosen != nil {
+			pbEvent.TrackChosen = *event.TrackChosen
+		}
+		for _, item := range itemsByEvent[event.ID] {
+			pbEvent.Items = append(pbEvent.Items, &scoringv1.FeedbackSummaryEventItem{
+				CandidateTrackId: item.CandidateTrackID,
+				FinalScore:       item.FinalScore,
+				LaneId:           item.LaneID,
+				PrimaryLane:      firstNonEmpty(stringValue(item.PrimaryLane), item.LaneID),
+			})
+		}
+		req.Events = append(req.Events, pbEvent)
+	}
+	return req, nil
+}
+
+func translateFeedbackSummaryResponse(resp *scoringv1.GetFeedbackSummaryResponse) map[string]any {
+	metrics := resp.GetMetrics()
+	weights := resp.GetWeights()
+	tuning := resp.GetTuning()
+	var meanChosenRank any
+	if metrics != nil && metrics.MeanChosenRank != nil {
+		meanChosenRank = metrics.GetMeanChosenRank()
+	}
+	tuningMetrics := map[string]any{}
+	if tuning != nil && tuning.GetMetrics() != nil {
+		tuningMetrics = tuning.GetMetrics().AsMap()
+	}
+	return map[string]any{
+		"playlist_id":   resp.GetPlaylistId(),
+		"playlist_name": resp.GetPlaylistName(),
+		"window": map[string]any{
+			"since": nullIfEmpty(resp.GetWindow().GetSince()),
+			"until": nullIfEmpty(resp.GetWindow().GetUntil()),
+		},
+		"metrics": map[string]any{
+			"total_events":                   metrics.GetTotalEvents(),
+			"contributory_events":            metrics.GetContributoryEvents(),
+			"ranked_events":                  metrics.GetRankedEvents(),
+			"pairwise_comparison_count":      metrics.GetPairwiseComparisonCount(),
+			"chosen_top1_rate":               metrics.GetChosenTop1Rate(),
+			"chosen_top3_rate":               metrics.GetChosenTop3Rate(),
+			"chosen_top5_rate":               metrics.GetChosenTop5Rate(),
+			"mean_chosen_rank":               meanChosenRank,
+			"lane_acceptance_counts":         int32MapToAnyMap(metrics.GetLaneAcceptanceCounts()),
+			"higher_scored_lane_skip_counts": int32MapToAnyMap(metrics.GetHigherScoredLaneSkipCounts()),
+		},
+		"weights": map[string]any{
+			"source":    feedbackSummaryWeightSource(weights.GetSource()),
+			"static":    float64MapToAnyMap(weights.GetStaticWeights()),
+			"base":      float64MapToAnyMap(weights.GetBaseWeights()),
+			"tuned":     nilIfEmptyWeightMap(weights.GetTunedWeights()),
+			"effective": float64MapToAnyMap(weights.GetEffectiveWeights()),
+		},
+		"tuning": map[string]any{
+			"last_tuned_at":        nullIfEmpty(tuning.GetLastTunedAt()),
+			"feedback_event_count": tuning.GetFeedbackEventCount(),
+			"notes":                append([]string{}, tuning.GetNotes()...),
+			"metrics":              tuningMetrics,
+		},
+	}
+}
+
+func feedbackSummaryWeightSource(source scoringv1.WeightSource) string {
+	switch source {
+	case scoringv1.WeightSource_WEIGHT_SOURCE_FEEDBACK_TUNED:
+		return "feedback_tuned_weights"
+	case scoringv1.WeightSource_WEIGHT_SOURCE_ADAPTED:
+		return "adapted_weights"
+	case scoringv1.WeightSource_WEIGHT_SOURCE_STATIC:
+		return "static"
+	default:
+		return ""
+	}
+}
+
 func parseCorrectionBPM(value any) (float64, bool) {
 	switch typed := value.(type) {
 	case float64:
@@ -1153,6 +2143,158 @@ func parseCorrectionBPM(value any) (float64, bool) {
 	default:
 		return 0, false
 	}
+}
+
+func playlistWeightSource(stats *recommendationsrepo.PlaylistStats) string {
+	if stats != nil && len(stats.FeedbackTunedWeights) > 0 {
+		return "feedback_tuned_weights"
+	}
+	if stats != nil && len(stats.AdaptedWeights) > 0 {
+		return "adapted_weights"
+	}
+	return "static"
+}
+
+func playlistWeightSourceEnum(source string) scoringv1.WeightSource {
+	switch strings.TrimSpace(source) {
+	case "feedback_tuned_weights":
+		return scoringv1.WeightSource_WEIGHT_SOURCE_FEEDBACK_TUNED
+	case "adapted_weights":
+		return scoringv1.WeightSource_WEIGHT_SOURCE_ADAPTED
+	case "static":
+		return scoringv1.WeightSource_WEIGHT_SOURCE_STATIC
+	default:
+		return scoringv1.WeightSource_WEIGHT_SOURCE_UNSPECIFIED
+	}
+}
+
+func effectivePlaylistWeights(stats *recommendationsrepo.PlaylistStats) (map[string]float64, string) {
+	if stats != nil && len(stats.FeedbackTunedWeights) > 0 {
+		return copyWeightMap(stats.FeedbackTunedWeights), "feedback_tuned_weights"
+	}
+	if stats != nil && len(stats.AdaptedWeights) > 0 {
+		return copyWeightMap(stats.AdaptedWeights), "adapted_weights"
+	}
+	return nil, "static"
+}
+
+func applyPlaylistWeightSource(payload map[string]any, stats *recommendationsrepo.PlaylistStats) {
+	meta, ok := payload["meta"].(map[string]any)
+	if !ok {
+		return
+	}
+	weightAdaptation, ok := meta["weight_adaptation"].(map[string]any)
+	if !ok {
+		return
+	}
+	source := playlistWeightSource(stats)
+	weightAdaptation["mode"] = source
+	weightAdaptation["source"] = source
+}
+
+func copyWeightMap(source map[string]float64) map[string]float64 {
+	if len(source) == 0 {
+		return map[string]float64{}
+	}
+	out := make(map[string]float64, len(source))
+	for key, value := range source {
+		out[key] = value
+	}
+	return out
+}
+
+func float64MapToAnyMap(source map[string]float64) map[string]any {
+	if len(source) == 0 {
+		return map[string]any{}
+	}
+	out := make(map[string]any, len(source))
+	for key, value := range source {
+		out[key] = value
+	}
+	return out
+}
+
+func int32MapToAnyMap(source map[string]int32) map[string]any {
+	if len(source) == 0 {
+		return map[string]any{}
+	}
+	out := make(map[string]any, len(source))
+	for key, value := range source {
+		out[key] = value
+	}
+	return out
+}
+
+func nilIfEmptyWeightMap(source map[string]float64) any {
+	if len(source) == 0 {
+		return nil
+	}
+	return float64MapToAnyMap(source)
+}
+
+func valueOrNil(value *float64) any {
+	if value == nil {
+		return nil
+	}
+	return *value
+}
+
+func int32OrNil(value *int32) any {
+	if value == nil {
+		return nil
+	}
+	return *value
+}
+
+func trackContextFeaturePayload(track *scoringv1.TrackContext) map[string]any {
+	if track == nil {
+		return map[string]any{}
+	}
+	return map[string]any{
+		"bpm":            track.GetBpm(),
+		"key":            nullIfEmpty(track.GetMusicalKey()),
+		"key_confidence": valueOrNil(track.KeyConfidence),
+		"key_source":     nullIfEmpty(track.GetKeySource()),
+		"key_agreement":  int32OrNil(track.KeyAgreement),
+		"energy_rel":     valueOrNil(track.EnergyRel),
+		"bass_rel":       valueOrNil(track.BassRel),
+		"drums_rel":      valueOrNil(track.DrumsRel),
+		"vocals_rel":     valueOrNil(track.VocalsRel),
+		"groove_rel":     valueOrNil(track.GrooveRel),
+		"intensity_band": nullIfEmpty(track.GetIntensityBand()),
+		"role_hints":     append([]string{}, track.GetRoleHints()...),
+	}
+}
+
+func transitionFeaturesPayload(features *scoringv1.TransitionFeatures) map[string]any {
+	if features == nil {
+		return map[string]any{}
+	}
+	return map[string]any{
+		"effective_bpm_distance":   features.GetEffectiveBpmDistance(),
+		"raw_bpm_distance":         features.GetRawBpmDistance(),
+		"bpm_relationship":         features.GetBpmRelationship(),
+		"key_distance":             features.GetKeyDistance(),
+		"key_compat_label":         features.GetKeyCompatLabel(),
+		"key_confidence_current":   features.GetKeyConfidenceCurrent(),
+		"key_confidence_candidate": features.GetKeyConfidenceCandidate(),
+		"delta_energy_rel":         features.GetDeltaEnergyRel(),
+		"delta_bass_rel":           features.GetDeltaBassRel(),
+		"current_vocals_rel":       transitionVocalValue(features, true),
+		"candidate_vocals_rel":     transitionVocalValue(features, false),
+		"current_outro_low_end":    features.GetCurrentOutroLowEnd(),
+		"candidate_intro_low_end":  features.GetCandidateIntroLowEnd(),
+	}
+}
+
+func transitionVocalValue(features *scoringv1.TransitionFeatures, current bool) any {
+	if features == nil {
+		return nil
+	}
+	if current {
+		return valueOrNil(features.CurrentVocalsRel)
+	}
+	return valueOrNil(features.CandidateVocalsRel)
 }
 
 func parseCorrectionKey(value any) (string, bool) {
@@ -1201,6 +2343,154 @@ func currentTrackPayload(record recommendationsrepo.TrackContextRecord) map[stri
 		"intensity_band": stringOrNil(record.IntensityBand),
 		"role_hints":     record.RoleHints,
 		"outro_summary":  nil,
+	}
+}
+
+func playlistSummaryPayload(playlist recommendationsrepo.PlaylistSummary) map[string]any {
+	return map[string]any{
+		"playlist_id":            playlist.ID,
+		"name":                   playlist.Name,
+		"track_count":            playlist.TrackCount,
+		"created_at":             playlist.CreatedAt,
+		"updated_at":             playlist.UpdatedAt,
+		"track_count_analyzed":   playlist.TrackCountAnalyzed,
+		"eligible_track_count":   playlist.EligibleTrackCount,
+		"is_stale":               playlist.IsStale,
+		"stale_reason":           nullIfEmpty(playlist.StaleReason),
+		"feedback_event_count":   playlist.FeedbackEventCount,
+		"feedback_last_tuned_at": stringOrNil(playlist.FeedbackLastTunedAt),
+	}
+}
+
+func playlistStatsPayload(stats *recommendationsrepo.PlaylistStats) any {
+	if stats == nil {
+		return nil
+	}
+	return map[string]any{
+		"track_count_total":       stats.TrackCountTotal,
+		"track_count_analyzed":    stats.TrackCountAnalyzed,
+		"eligible_track_count":    stats.EligibleTrackCount,
+		"energy_spread":           valueOrNil(stats.EnergySpread),
+		"relative_signature":      stats.RelativeSignature,
+		"is_stale":                stats.IsStale,
+		"stale_reason":            nullIfEmpty(stats.StaleReason),
+		"adapted_weights":         float64MapToAnyMap(stats.AdaptedWeights),
+		"feedback_tuned_weights":  nilIfEmptyWeightMap(stats.FeedbackTunedWeights),
+		"feedback_tuning_notes":   append([]string{}, stats.FeedbackTuningNotes...),
+		"feedback_event_count":    stats.FeedbackEventCount,
+		"feedback_last_tuned_at":  stringOrNil(stats.FeedbackLastTunedAt),
+		"feedback_tuning_metrics": stats.FeedbackTuningMetrics,
+	}
+}
+
+func playlistTrackPayload(track recommendationsrepo.PlaylistTrackSnapshot) map[string]any {
+	return map[string]any{
+		"track_id":       track.TrackID,
+		"title":          track.Title,
+		"artist":         track.Artist,
+		"position":       track.Position,
+		"bpm":            valueOrNil(track.BPM),
+		"key":            stringOrNil(track.Key),
+		"intensity_band": stringOrNil(track.IntensityBand),
+		"role_hints":     append([]string{}, track.RoleHints...),
+		"analysis_state": track.AnalysisState,
+	}
+}
+
+func trackFeatureDetailPayload(detail recommendationsrepo.TrackFeatureDetail) map[string]any {
+	return map[string]any{
+		"track_id": detail.TrackID,
+		"title":    detail.Title,
+		"artist":   detail.Artist,
+		"basic": map[string]any{
+			"bpm":            valueOrNil(detail.BPM),
+			"key":            stringOrNil(detail.Key),
+			"key_confidence": valueOrNil(detail.KeyConfidence),
+			"key_source":     stringOrNil(detail.KeySource),
+			"key_agreement":  int32OrNil(detail.KeyAgreement),
+		},
+		"absolute": map[string]any{
+			"energy_abs":           valueOrNil(detail.EnergyAbs),
+			"energy_heuristic_abs": valueOrNil(detail.EnergyHeuristicAbs),
+			"energy_sustained":     valueOrNil(detail.EnergySustained),
+			"energy_peak":          valueOrNil(detail.EnergyPeak),
+			"loudness_norm":        valueOrNil(detail.LoudnessNorm),
+			"bass_abs":             valueOrNil(detail.BassAbs),
+			"drums_abs":            valueOrNil(detail.DrumsAbs),
+			"harmonic_abs":         valueOrNil(detail.HarmonicAbs),
+			"groove_abs":           valueOrNil(detail.GrooveAbs),
+			"vocals_abs":           valueOrNil(detail.VocalsAbs),
+			"vocals_confidence":    valueOrNil(detail.VocalsConfidence),
+		},
+		"semantic": map[string]any{
+			"danceability_abs":       valueOrNil(detail.DanceabilityAbs),
+			"arousal_abs":            valueOrNil(detail.ArousalAbs),
+			"valence_abs":            valueOrNil(detail.ValenceAbs),
+			"mood_aggressive_abs":    valueOrNil(detail.MoodAggressiveAbs),
+			"mood_party_abs":         valueOrNil(detail.MoodPartyAbs),
+			"mood_relaxed_abs":       valueOrNil(detail.MoodRelaxedAbs),
+			"energy_essentia_fused":  valueOrNil(detail.EnergyEssentiaFused),
+			"energy_essentia_bucket": stringOrNil(detail.EnergyEssentiaBucket),
+			"source":                 stringOrNil(detail.EssentiaSemanticSource),
+			"inferred_at":            stringOrNil(detail.EssentiaSemanticInferredAt),
+		},
+		"relative": map[string]any{
+			"energy_rel":           valueOrNil(detail.EnergyRel),
+			"bass_rel":             valueOrNil(detail.BassRel),
+			"drums_rel":            valueOrNil(detail.DrumsRel),
+			"vocals_rel":           valueOrNil(detail.VocalsRel),
+			"groove_rel":           valueOrNil(detail.GrooveRel),
+			"energy_spread":        valueOrNil(detail.EnergySpread),
+			"bass_spread":          valueOrNil(detail.BassSpread),
+			"drums_spread":         valueOrNil(detail.DrumsSpread),
+			"vocals_spread":        valueOrNil(detail.VocalsSpread),
+			"groove_spread":        valueOrNil(detail.GrooveSpread),
+			"intensity_band":       stringOrNil(detail.IntensityBand),
+			"intensity_membership": float64MapToAnyMap(detail.IntensityMembership),
+			"role_hints":           append([]string{}, detail.RoleHints...),
+		},
+		"analysis": map[string]any{
+			"analysis_mode":                   stringOrNil(detail.AnalysisMode),
+			"analyzed_at":                     stringOrNil(detail.AnalyzedAt),
+			"analysis_signature":              stringOrNil(detail.AnalysisSignature),
+			"config_signature":                stringOrNil(detail.ConfigSignature),
+			"scoring_contract_id_at_analysis": stringOrNil(detail.ScoringContractAtAnalysis),
+		},
+	}
+}
+
+func analysisJobPayload(job recommendationsrepo.AnalysisJobRecord) map[string]any {
+	return map[string]any{
+		"id":               job.ID,
+		"playlist_id":      stringOrNil(job.PlaylistID),
+		"track_id":         stringOrNil(job.TrackID),
+		"track_path":       job.TrackPath,
+		"status":           job.Status,
+		"priority":         job.Priority,
+		"analysis_mode":    job.AnalysisMode,
+		"job_kind":         job.JobKind,
+		"error_message":    stringOrNil(job.ErrorMessage),
+		"duration_seconds": valueOrNil(job.DurationSeconds),
+		"created_at":       job.CreatedAt,
+		"started_at":       stringOrNil(job.StartedAt),
+		"completed_at":     stringOrNil(job.CompletedAt),
+	}
+}
+
+func recommendationEventPayload(event recommendationsrepo.RecommendationEventRecord) map[string]any {
+	return map[string]any{
+		"event_id":                  event.ID,
+		"playlist_id":               event.PlaylistID,
+		"current_track_id":          event.CurrentTrackID,
+		"target":                    event.Target,
+		"candidate_count":           event.CandidateCount,
+		"recommendation_confidence": valueOrNil(event.RecommendationConfidence),
+		"recommendations_status":    event.RecommendationsStatus,
+		"track_chosen":              stringOrNil(event.TrackChosen),
+		"chosen_was_recommended":    boolOrNil(event.ChosenWasRecommended),
+		"scoring_contract_id":       event.ScoringContractID,
+		"timestamp":                 event.Timestamp,
+		"played_at":                 stringOrNil(event.PlayedAt),
 	}
 }
 
@@ -1277,6 +2567,25 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func queryInt(r *http.Request, key string, fallback int) int {
+	raw := strings.TrimSpace(r.URL.Query().Get(key))
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil {
+		return fallback
+	}
+	return value
+}
+
+func boolOrNil(value *bool) any {
+	if value == nil {
+		return nil
+	}
+	return *value
 }
 
 func errorString(err error) any {

@@ -7,7 +7,7 @@ This repository is intentionally local-first.
 - Go hosts the public API and orchestration surface.
 - Python hosts the authoritative scoring service over gRPC.
 - SQLite is the canonical local database on PC.
-- Mobile consumes playlist/crate snapshots rather than mutating canonical analysis tables.
+- Mobile/bootstrap consumers use the local PC-hosted HTTP API plus playlist/crate snapshots and outbox feeds rather than mutating canonical analysis tables directly.
 
 ## Operational choices
 

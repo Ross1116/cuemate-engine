@@ -153,7 +153,7 @@ def host_gpu_available() -> bool:
         return False
     try:
         completed = subprocess.run([nvidia_smi, "-L"], capture_output=True, text=True, timeout=10, check=False)
-    except Exception:
+    except (subprocess.SubprocessError, OSError):
         return False
     return completed.returncode == 0 and bool((completed.stdout or "").strip())
 

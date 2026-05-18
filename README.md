@@ -2,20 +2,21 @@
 
 CueMate Engine is the local analysis and recommendation foundation for CueMate.
 
-Today, the repository is primarily a **Python-first analysis engine** with:
+The repository is centered on a **Python-first analysis engine** with:
 
 - DJ-library playlist import
 - staged BPM/key analysis for fast feedback
 - background enrichment for absolute features
 - persisted relative playlist context
 - live recommendation/scoring lanes and pair diagnostics
-- Docker-backed model workers for BPM, key, and semantic mood/intensity analysis
+- Docker-backed model workers for BPM, key, and semantic mood/intensity analysis, with TempoCNN and Essentia semantics sharing one TensorFlow/Essentia service
 
-The Go and protobuf layers are now present as the service boundary for the scorer, but the current working core still lives in the Python analysis plane.
+The Go and protobuf layers now define the shipped local API and scorer boundary, while the scoring semantics still live in the Python analysis plane.
+The repository now also includes a responsive local PWA client under `web/` for library browsing, recommendations, feedback, corrections, sync/admin visibility, and mobile browser use.
 
 ## Current State
 
-Implemented today:
+Implemented:
 
 - Milestone 1 absolute analysis
 - Milestone 2 Phase 1 relative-context logic
@@ -38,6 +39,11 @@ Implemented today:
   - Go HTTP API server for `/recommendations`, `/scoring/metadata`, `/healthz`, and `/readyz`
   - SQLite hydration of live scoring inputs
   - scorer readiness/circuit-breaker handling in the decision plane
+- Milestone 5 feedback loop slice:
+  - immutable recommendation event item capture for returned candidates
+  - `/events/played` outcome capture plus queued `feedback_tuning_jobs`
+  - playlist-level feedback summaries and per-playlist tuned weights
+  - local feedback worker for automatic per-playlist retuning
 - staged analysis pipeline:
   - `fast_pass`
   - `staged` (default)
@@ -47,9 +53,9 @@ Deferred for now:
 
 - windowed intro/outro analysis
 
-Follow-on work:
+Broader follow-on work:
 
-- recommendation outcome analytics and tuning loops built on top of the captured event data
+- multi-device/authenticated sync on top of the shipped local-first recommendation and snapshot/outbox surfaces
 
 ## Architecture
 
@@ -77,7 +83,8 @@ The current pipeline is split into 5 main layers:
 5. Recommendation/scoring
 - ranks next-track candidates from precomputed absolute + relative context
 - organizes results into move lanes
-- exposes CLI inspection surfaces for recommendations, score breakdowns, weights, scoring metadata, and a local gRPC scoring service
+- exposes the local HTTP API for live recommendations, event capture, feedback summaries, and sync surfaces
+- keeps CLI inspection surfaces for recommendations, score breakdowns, weights, scoring metadata, and local operator workflows
 
 ## Repository Layout
 
@@ -115,6 +122,11 @@ The current pipeline is split into 5 main layers:
 |
 |- proto/
 |  |- djengine/scoring/v1/scoring.proto  # Shared scoring contract
+|  |- README.md
+|
+|- web/
+|  |- src/                               # Responsive CueMate PWA client
+|  |- package.json
 |  |- README.md
 |
 |- python/
@@ -346,6 +358,13 @@ powershell -ExecutionPolicy Bypass -File .\scripts\docker-compose.ps1 --profile 
 
 ## Building Local Model Services
 
+The active runtime topology uses two warm model-service containers:
+
+- one shared TensorFlow/Essentia service for TempoCNN BPM + Essentia semantic inference
+- one separate PyTorch service for MusicalKeyCNN key inference
+
+The `tempocnn` folder and helper scripts still exist, but they now alias into the shared TensorFlow/Essentia image/service rather than starting an independent third container.
+
 Build images:
 
 ```powershell
@@ -362,7 +381,95 @@ powershell -ExecutionPolicy Bypass -File .\scripts\start-musicalkeycnn-service.p
 powershell -ExecutionPolicy Bypass -File .\scripts\start-essentia-semantics-service.ps1
 ```
 
+Notes:
+
+- `build-tempocnn-image.ps1` delegates to the shared Essentia/TensorFlow image build
+- `start-tempocnn-service.ps1` delegates to the shared Essentia/TensorFlow service startup
+- starting either the TempoCNN or Essentia semantics service path results in the same shared container
+
 The CLI also starts them on demand.
+
+## Common API Workflows
+
+Start the local scorer and API:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\compile-proto.ps1
+```
+
+Run the scorer and the API in separate terminals because `python -m cuemate_analysis serve-scoring` is a long-running server process.
+
+Terminal 1:
+
+```powershell
+python -m cuemate_analysis serve-scoring --host 127.0.0.1 --port 47834
+```
+
+Terminal 2:
+
+```powershell
+go run ./go/cmd/apiserver
+```
+
+PowerShell background alternative:
+
+```powershell
+Start-Process powershell -ArgumentList '-NoExit','-Command','python -m cuemate_analysis serve-scoring --host 127.0.0.1 --port 47834'
+go run ./go/cmd/apiserver
+```
+
+Check service health and scoring metadata:
+
+```powershell
+Invoke-RestMethod -Uri http://127.0.0.1:8080/healthz
+Invoke-RestMethod -Uri http://127.0.0.1:8080/readyz
+Invoke-RestMethod -Uri http://127.0.0.1:8080/scoring/metadata | ConvertTo-Json -Depth 10
+```
+
+Request live recommendations:
+
+```powershell
+Invoke-RestMethod -Method Post `
+  -Uri http://127.0.0.1:8080/recommendations `
+  -ContentType "application/json" `
+  -Body '{"playlist_name":"Fred again","current_track_id":"trk_example123","target":"build"}' |
+  ConvertTo-Json -Depth 10
+```
+
+Record a played outcome:
+
+```powershell
+Invoke-RestMethod -Method Post `
+  -Uri http://127.0.0.1:8080/events/played `
+  -ContentType "application/json" `
+  -Body '{"recommendation_event_id":"evt_example","chosen_track_id":"trk_example456"}'
+```
+
+Read playlist feedback summary:
+
+```powershell
+Invoke-RestMethod -Method Post `
+  -Uri http://127.0.0.1:8080/feedback/summary `
+  -ContentType "application/json" `
+  -Body '{"playlist_name":"Fred again"}' |
+  ConvertTo-Json -Depth 10
+```
+
+Local mobile/bootstrap sync primitives:
+
+```powershell
+Invoke-RestMethod -Method Post `
+  -Uri http://127.0.0.1:8080/sync/playlists/snapshot `
+  -ContentType "application/json" `
+  -Body '{"playlist_name":"Fred again"}' |
+  ConvertTo-Json -Depth 12
+
+Invoke-RestMethod -Method Post `
+  -Uri http://127.0.0.1:8080/sync/outbox/pull `
+  -ContentType "application/json" `
+  -Body '{"limit":100}' |
+  ConvertTo-Json -Depth 12
+```
 
 ## Common CLI Workflows
 
@@ -438,10 +545,11 @@ python -m cuemate_analysis inspect-scoring-weights --playlist "Fred again"
 python -m cuemate_analysis inspect-scoring-metadata
 python -m cuemate_analysis inspect-scoring-metadata --json
 python -m cuemate_analysis serve-scoring --host 127.0.0.1 --port 47834
-go run ./go/cmd/apiserver
 go run ./go/cmd/scoringctl metadata
 go run ./go/cmd/scoringctl score --fixture .\go\testdata\score_candidate.json
-Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8080/recommendations -ContentType "application/json" -Body '{"playlist_name":"Fred again","current_track_id":"trk_example123","target":"build"}'
+python -m cuemate_analysis feedback-summary --playlist "Fred again" --json
+python -m cuemate_analysis feedback-tune --playlist "Fred again" --preview-only --json
+python -m cuemate_analysis run-feedback-worker --limit 10
 ```
 
 ### Essentia semantic workflows
@@ -455,6 +563,9 @@ python -m cuemate_analysis prewarm-model-services
 ### Cache and service maintenance
 
 ```powershell
+python -m cuemate_analysis clear-analysis-queue
+python -m cuemate_analysis clear-analysis-queue --job-kind enrichment
+python -m cuemate_analysis clear-analysis-queue --include-running
 python -m cuemate_analysis purge-model-cache
 python -m cuemate_analysis purge-model-cache --backend tempocnn
 python -m cuemate_analysis purge-model-cache --backend essentia_semantics
@@ -500,6 +611,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\compile-proto.ps1
 
 The compile helper runs `buf lint`, writes `data/scoring.pb`, and generates Python and Go gRPC stubs into `python/src/djengine/` and `go/gen/`.
 
+For the shipped Milestone 5 operator flow, see [docs/feedback-loop-local.md](docs/feedback-loop-local.md).
+
 Benchmark local DSP:
 
 ```powershell
@@ -509,7 +622,7 @@ python -m cuemate_analysis benchmark-dsp --path "D:\Music\track.flac"
 
 ## Known Boundaries
 
-- Go decision plane now serves the live recommendations API plus single-consumer snapshot/outbox sync primitives; richer outcome analytics and actual mobile consumption are follow-on work
+- Go decision plane now serves the shipped local recommendations API, event capture, feedback summary surfaces, and single-consumer snapshot/outbox sync primitives that a local mobile/bootstrap client can consume
 - windowed intro/outro analysis is intentionally deferred
 - `transition_support`, `vocal_transition`, and `rhythmic_continuity` are still explicit stubs and are excluded from weighted scoring
 - `vocals_abs` / `vocals_rel` are not populated by the current analysis pipeline yet, so vocal-dependent recommendation logic remains limited
@@ -524,11 +637,7 @@ Done:
 - Milestone 2 persisted relative context
 - Milestone 3 Python recommendation/scoring core
 - Milestone 4 local service/API bootstrap, write-side cleanup, and explicit-ack sync protocol
-
-Next:
-
-- mobile/API integration
-- recommendation outcome analytics and tuning loop
+- Milestone 5 per-playlist feedback loop and auto-tuned weights
 
 Later:
 

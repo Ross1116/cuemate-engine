@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from pathlib import Path
 import re
 import sqlite3
@@ -624,6 +625,25 @@ class Database:
             (limit,),
         ).fetchall()
 
+    def clear_analysis_jobs(
+        self,
+        *,
+        statuses: Iterable[str],
+        job_kind: str | None = None,
+    ) -> int:
+        status_list = [str(status).strip() for status in statuses if str(status).strip()]
+        if not status_list:
+            return 0
+        placeholders = ", ".join("?" for _ in status_list)
+        params: list[Any] = list(status_list)
+        query = f"DELETE FROM analysis_jobs WHERE status IN ({placeholders})"
+        if job_kind is not None:
+            query += " AND job_kind = ?"
+            params.append(job_kind)
+        with self.connection:
+            cursor = self.connection.execute(query, params)
+        return int(cursor.rowcount)
+
     # ------------------------------------------------------------------
     # Canonical relative persistence (Phase 2)
     # ------------------------------------------------------------------
@@ -891,7 +911,7 @@ class Database:
         ).fetchone()
 
     def get_playlist_stats_for_scoring(self, playlist_id: str) -> dict[str, Any] | None:
-        """Return the playlist_stats row as a plain dict, JSON-decoding adapted_weights.
+        """Return the playlist_stats row as a plain dict, JSON-decoding weight payloads.
 
         Returns None when no stats row exists (playlist not yet enriched).
         """
@@ -902,22 +922,62 @@ class Database:
         if row is None:
             return None
         result: dict[str, Any] = {key: row[key] for key in row.keys()}
-        raw_weights = result.get("adapted_weights")
-        if isinstance(raw_weights, str):
+        for key, expected_type in (
+            ("adapted_weights", "object"),
+            ("feedback_tuned_weights", "object"),
+            ("feedback_tuning_notes", "array"),
+            ("feedback_tuning_metrics", "object"),
+        ):
+            raw_value = result.get(key)
+            if not isinstance(raw_value, str):
+                continue
             try:
-                result["adapted_weights"] = json.loads(raw_weights)
+                decoded = json.loads(raw_value)
             except (json.JSONDecodeError, TypeError) as exc:
                 logger.exception(
-                    "Invalid adapted_weights JSON in playlist_stats",
+                    "Invalid %s JSON in playlist_stats",
+                    key,
                     extra={
                         "playlist_id": result.get("playlist_id"),
                         "relative_signature": result.get("relative_signature"),
-                        "raw_weights": raw_weights,
+                        "raw_value": raw_value,
                     },
                 )
                 raise ValueError(
-                    f"Corrupted adapted_weights for playlist '{result.get('playlist_id')}': {raw_weights!r}"
+                    f"Corrupted {key} for playlist '{result.get('playlist_id')}': {raw_value!r}"
                 ) from exc
+            if expected_type == "object" and not isinstance(decoded, dict):
+                raise ValueError(
+                    f"Expected {key} to decode to an object for playlist '{result.get('playlist_id')}'."
+                )
+            if expected_type == "array" and not isinstance(decoded, list):
+                raise ValueError(
+                    f"Expected {key} to decode to a list for playlist '{result.get('playlist_id')}'."
+                )
+            if key in {"adapted_weights", "feedback_tuned_weights"}:
+                validated: dict[str, float] = {}
+                for raw_key, raw_item in decoded.items():
+                    if not isinstance(raw_key, str):
+                        raise ValueError(
+                            f"Invalid {key} entry for playlist '{result.get('playlist_id')}': non-string key {raw_key!r}."
+                        )
+                    if isinstance(raw_item, bool):
+                        raise ValueError(
+                            f"Invalid {key} entry for playlist '{result.get('playlist_id')}', key '{raw_key}': boolean value {raw_item!r}."
+                        )
+                    try:
+                        coerced = float(raw_item)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(
+                            f"Invalid {key} entry for playlist '{result.get('playlist_id')}', key '{raw_key}': {raw_item!r}."
+                        ) from exc
+                    if not math.isfinite(coerced):
+                        raise ValueError(
+                            f"Invalid {key} entry for playlist '{result.get('playlist_id')}', key '{raw_key}': non-finite value {raw_item!r}."
+                        )
+                    validated[raw_key] = coerced
+                decoded = validated
+            result[key] = decoded
         return result
 
     def get_analysis_jobs_by_ids(self, job_ids: Iterable[int]) -> list[sqlite3.Row]:
@@ -933,3 +993,144 @@ class Database:
             """,
             ids,
         ).fetchall()
+
+    def upsert_feedback_tuning_job(
+        self,
+        *,
+        playlist_id: str,
+        trigger_event_id: str | None,
+        created_at: str,
+    ) -> int:
+        with self.connection:
+            self.connection.execute(
+                """
+                UPDATE feedback_tuning_jobs
+                SET trigger_event_id = COALESCE(?, trigger_event_id)
+                WHERE playlist_id = ?
+                  AND status = 'pending'
+                """,
+                (trigger_event_id, playlist_id),
+            )
+            existing = self.connection.execute(
+                """
+                SELECT id
+                FROM feedback_tuning_jobs
+                WHERE playlist_id = ?
+                  AND status = 'pending'
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (playlist_id,),
+            ).fetchone()
+            if existing is not None:
+                return int(existing["id"])
+            self.connection.execute(
+                """
+                INSERT OR IGNORE INTO feedback_tuning_jobs (
+                  playlist_id, status, trigger_event_id, created_at
+                ) VALUES (?, 'pending', ?, ?)
+                """,
+                (playlist_id, trigger_event_id, created_at),
+            )
+            existing = self.connection.execute(
+                """
+                SELECT id
+                FROM feedback_tuning_jobs
+                WHERE playlist_id = ?
+                  AND status = 'pending'
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (playlist_id,),
+            ).fetchone()
+            if existing is None:
+                raise RuntimeError(f"Failed to upsert feedback_tuning_jobs row for playlist '{playlist_id}'.")
+            return int(existing["id"])
+
+    def claim_pending_feedback_tuning_jobs(
+        self,
+        *,
+        limit: int,
+        started_at: str,
+    ) -> list[sqlite3.Row]:
+        with self.connection:
+            return self.connection.execute(
+                """
+                WITH to_claim AS (
+                    SELECT id
+                    FROM feedback_tuning_jobs
+                    WHERE status = 'pending'
+                    ORDER BY created_at ASC, id ASC
+                    LIMIT ?
+                )
+                UPDATE feedback_tuning_jobs
+                SET status = 'running',
+                    started_at = ?,
+                    finished_at = NULL,
+                    error_message = NULL
+                WHERE id IN (SELECT id FROM to_claim)
+                RETURNING *
+                """,
+                (limit, started_at),
+            ).fetchall()
+
+    def mark_feedback_tuning_job_completed(self, job_id: int, finished_at: str) -> None:
+        with self.connection:
+            self.connection.execute(
+                """
+                UPDATE feedback_tuning_jobs
+                SET status = 'completed',
+                    finished_at = ?,
+                    error_message = NULL
+                WHERE id = ?
+                """,
+                (finished_at, job_id),
+            )
+
+    def mark_feedback_tuning_job_failed(self, job_id: int, error_message: str, finished_at: str) -> None:
+        with self.connection:
+            self.connection.execute(
+                """
+                UPDATE feedback_tuning_jobs
+                SET status = 'failed',
+                    finished_at = ?,
+                    error_message = ?
+                WHERE id = ?
+                """,
+                (finished_at, error_message, job_id),
+            )
+
+    def update_playlist_feedback_tuning(
+        self,
+        *,
+        playlist_id: str,
+        feedback_tuned_weights: dict[str, float] | None,
+        feedback_tuning_notes: list[str],
+        feedback_event_count: int,
+        feedback_last_tuned_at: str | None,
+        feedback_tuning_metrics: dict[str, Any],
+    ) -> None:
+        with self.connection:
+            cursor = self.connection.execute(
+                """
+                UPDATE playlist_stats
+                SET feedback_tuned_weights = ?,
+                    feedback_tuning_notes = ?,
+                    feedback_event_count = ?,
+                    feedback_last_tuned_at = ?,
+                    feedback_tuning_metrics = ?
+                WHERE playlist_id = ?
+                """,
+                (
+                    json.dumps(feedback_tuned_weights, sort_keys=True) if feedback_tuned_weights is not None else None,
+                    json.dumps(feedback_tuning_notes),
+                    int(feedback_event_count),
+                    feedback_last_tuned_at,
+                    json.dumps(feedback_tuning_metrics, sort_keys=True),
+                    playlist_id,
+                ),
+            )
+            if cursor.rowcount == 0:
+                raise RuntimeError(
+                    f"Failed to persist feedback tuning for playlist '{playlist_id}': playlist_stats row was not found."
+                )

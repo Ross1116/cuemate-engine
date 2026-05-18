@@ -37,29 +37,10 @@ RATIO_DISTANCE_FLOOR: dict[str, float] = {
     "three_four": 2.0,
 }
 
-# Loaded from config/default.json in Phase 2; kept here as module-level fallback
-# so scoring functions work without any config wiring in tests.
-STATIC_WEIGHTS: dict[str, float] = {
-    "target_energy": 0.22,
-    "transition_support": 0.18,
-    "bass_transition": 0.15,
-    "vocal_transition": 0.13,
-    "harmonic": 0.12,
-    "tempo": 0.10,
-    "history_fit": 0.06,
-    "rhythmic_continuity": 0.04,
-}
-
-WEIGHT_FLOORS: dict[str, float] = {
-    "target_energy": 0.08,
-    "transition_support": 0.05,
-    "bass_transition": 0.04,
-    "vocal_transition": 0.03,
-    "harmonic": 0.04,
-    "tempo": 0.03,
-    "history_fit": 0.03,
-    "rhythmic_continuity": 0.02,
-}
+# Canonical source is config.py; aliased here for backward compatibility with
+# tests and code that import from scoring directly.
+from cuemate_analysis.config import DEFAULT_STATIC_WEIGHTS as STATIC_WEIGHTS  # noqa: E402
+from cuemate_analysis.config import DEFAULT_WEIGHT_FLOORS as WEIGHT_FLOORS  # noqa: E402
 
 # Sentinel for scoring components that are not yet implemented.
 # compute_weighted_score skips these entirely and renormalizes over active components.
@@ -614,8 +595,9 @@ def history_fit_score(
 ) -> float:
     """Baseline history signal: short-term key repetition + energy stagnation.
 
-    This is a conservative placeholder. Expansion (artist repetition, BPM
-    staleness, intensity-band reuse) is deferred to Milestone 5.
+    This is a conservative placeholder. Expansion can still add artist
+    repetition, BPM staleness, and intensity-band reuse on top of the current
+    shipped Milestone 5 behavior.
     """
     recent = history[-window:]
     if not recent:
@@ -694,15 +676,35 @@ def resolve_effective_weights(
 ) -> dict[str, float]:
     """Return effective per-component weights for live scoring.
 
-    Reads precomputed `adapted_weights` from playlist_stats when available.
-    Falls back to config-provided static weights when available, otherwise
-    STATIC_WEIGHTS so scoring works without a DB-populated crate.
+    Weight precedence:
+    1. feedback_tuned_weights
+    2. adapted_weights
+    3. config-provided static weights
+    4. module STATIC_WEIGHTS fallback
     """
+    _, weights = _select_weight_payload(playlist_stats, config)
+    return dict(weights)
+
+
+def resolve_weight_source(
+    playlist_stats: dict[str, Any] | None,
+    config: dict[str, Any] | None = None,
+) -> str:
+    source, _ = _select_weight_payload(playlist_stats, config)
+    return source
+
+
+def _select_weight_payload(
+    playlist_stats: dict[str, Any] | None,
+    config: dict[str, Any] | None = None,
+) -> tuple[str, dict[str, float]]:
+    if playlist_stats and playlist_stats.get("feedback_tuned_weights"):
+        return "feedback_tuned_weights", dict(playlist_stats["feedback_tuned_weights"])
     if playlist_stats and playlist_stats.get("adapted_weights"):
-        return dict(playlist_stats["adapted_weights"])
+        return "adapted_weights", dict(playlist_stats["adapted_weights"])
     if config and config.get("static_weights"):
-        return dict(config["static_weights"])
-    return dict(STATIC_WEIGHTS)
+        return "static", dict(config["static_weights"])
+    return "static", dict(STATIC_WEIGHTS)
 
 
 # ---------------------------------------------------------------------------

@@ -11,6 +11,7 @@ from cuemate_analysis.explanations import (
     compute_set_trend,
     generate_session_notes,
 )
+from cuemate_analysis.feedback import build_feedback_summary_from_payload
 from cuemate_analysis.scoring import (
     SUPPORTED_LANE_GROUPS,
     ScoringTrackContext,
@@ -19,6 +20,7 @@ from cuemate_analysis.scoring import (
     get_recommendations,
     get_scoring_metadata,
     resolve_effective_weights,
+    resolve_weight_source,
     score_candidate,
 )
 from cuemate_analysis.scoring_proto import load_scoring_proto_modules
@@ -109,7 +111,34 @@ def _playlist_stats_from_proto(message: Any) -> dict[str, Any] | None:
         payload["energy_spread"] = float(message.energy_spread)
     if message.adapted_weights:
         payload["adapted_weights"] = dict(message.adapted_weights)
+    if getattr(message, "feedback_tuned_weights", None):
+        payload["feedback_tuned_weights"] = dict(message.feedback_tuned_weights)
+    weight_source = _weight_source_from_proto(message)
+    if weight_source:
+        payload["weight_source"] = weight_source
     return payload or None
+
+
+def _weight_source_from_proto(message: Any) -> str:
+    enum_value = int(getattr(message, "weight_source_enum", 0) or 0)
+    if enum_value == 3:
+        return "feedback_tuned_weights"
+    if enum_value == 2:
+        return "adapted_weights"
+    if enum_value == 1:
+        return "static"
+    return ""
+
+
+def _weight_source_enum_from_string(source: Any) -> int:
+    normalized = str(source or "").strip()
+    if normalized == "feedback_tuned_weights":
+        return 3
+    if normalized == "adapted_weights":
+        return 2
+    if normalized == "static":
+        return 1
+    return 0
 
 
 def _active_signatures_payload(settings: Any) -> dict[str, str]:
@@ -211,6 +240,33 @@ def _copy_map(target: Any, payload: dict[str, float | None]) -> None:
         target[key] = float(value)
 
 
+def _copy_int_map(target: Any, payload: dict[str, Any]) -> None:
+    for key, value in payload.items():
+        if value is None:
+            continue
+        try:
+            target[key] = int(value)
+            continue
+        except (TypeError, ValueError):
+            pass
+        try:
+            target[key] = int(float(value))
+        except (TypeError, ValueError):
+            continue
+
+
+def _struct_to_dict(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {}
+    try:
+        return dict(value)
+    except TypeError:
+        pass
+    if hasattr(value, "items"):
+        return {str(key): item for key, item in value.items()}
+    return {}
+
+
 def _track_payload(track: ScoringTrackContext) -> dict[str, Any]:
     return {
         "track_id": track.track_id,
@@ -297,7 +353,14 @@ def _applied_weight_adaptation(
     config: dict[str, Any],
 ) -> dict[str, Any]:
     effective_weights = resolve_effective_weights(playlist_stats, config)
-    if playlist_stats and playlist_stats.get("adapted_weights"):
+    source = str((playlist_stats or {}).get("weight_source") or resolve_weight_source(playlist_stats))
+    if source == "feedback_tuned_weights":
+        return {
+            "adaptation_id": "feedback_tuned_weights",
+            "component_weights": effective_weights,
+            "explanation": "Playlist feedback_tuned_weights were applied.",
+        }
+    if source == "adapted_weights":
         return {
             "adaptation_id": "adapted_weights",
             "component_weights": effective_weights,
@@ -308,6 +371,75 @@ def _applied_weight_adaptation(
         "component_weights": effective_weights,
         "explanation": "Using static scoring weights.",
     }
+
+
+def _feedback_playlist_stats_from_proto(message: Any) -> dict[str, Any]:
+    return {
+        "adapted_weights": dict(message.adapted_weights),
+        "feedback_tuned_weights": dict(message.feedback_tuned_weights),
+        "feedback_tuning_notes": list(message.feedback_tuning_notes),
+        "feedback_event_count": int(message.feedback_event_count),
+        "feedback_last_tuned_at": str(message.feedback_last_tuned_at or "") or None,
+        "feedback_tuning_metrics": _struct_to_dict(message.feedback_tuning_metrics),
+    }
+
+
+def _feedback_events_from_proto(items: Any) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for event in items:
+        events.append(
+            {
+                "id": str(event.event_id or ""),
+                "timestamp": str(event.timestamp or ""),
+                "track_chosen": str(event.track_chosen or ""),
+                "chosen_was_recommended": bool(event.chosen_was_recommended),
+                "items": [
+                    {
+                        "candidate_track_id": str(item.candidate_track_id or ""),
+                        "final_score": float(item.final_score),
+                        "lane_id": str(item.lane_id or ""),
+                        "primary_lane": str(item.primary_lane or ""),
+                    }
+                    for item in event.items
+                ],
+            }
+        )
+    return events
+
+
+def _set_feedback_summary_response(target: Any, payload: dict[str, Any]) -> None:
+    target.playlist_id = str(payload.get("playlist_id", "") or "")
+    target.playlist_name = str(payload.get("playlist_name", "") or "")
+    window = payload.get("window", {})
+    target.window.since = str(window.get("since", "") or "")
+    target.window.until = str(window.get("until", "") or "")
+
+    metrics = payload.get("metrics", {})
+    target.metrics.total_events = int(metrics.get("total_events", 0) or 0)
+    target.metrics.contributory_events = int(metrics.get("contributory_events", 0) or 0)
+    target.metrics.ranked_events = int(metrics.get("ranked_events", 0) or 0)
+    target.metrics.pairwise_comparison_count = int(metrics.get("pairwise_comparison_count", 0) or 0)
+    target.metrics.chosen_top1_rate = float(metrics.get("chosen_top1_rate", 0.0) or 0.0)
+    target.metrics.chosen_top3_rate = float(metrics.get("chosen_top3_rate", 0.0) or 0.0)
+    target.metrics.chosen_top5_rate = float(metrics.get("chosen_top5_rate", 0.0) or 0.0)
+    if metrics.get("mean_chosen_rank") is not None:
+        target.metrics.mean_chosen_rank = float(metrics["mean_chosen_rank"])
+    _copy_int_map(target.metrics.lane_acceptance_counts, metrics.get("lane_acceptance_counts", {}))
+    _copy_int_map(target.metrics.higher_scored_lane_skip_counts, metrics.get("higher_scored_lane_skip_counts", {}))
+
+    weights = payload.get("weights", {})
+    target.weights.source = _weight_source_enum_from_string(weights.get("source"))
+    _copy_map(target.weights.static_weights, weights.get("static", {}))
+    _copy_map(target.weights.base_weights, weights.get("base", {}))
+    _copy_map(target.weights.tuned_weights, weights.get("tuned") or {})
+    _copy_map(target.weights.effective_weights, weights.get("effective", {}))
+
+    tuning = payload.get("tuning", {})
+    target.tuning.last_tuned_at = str(tuning.get("last_tuned_at", "") or "")
+    target.tuning.feedback_event_count = int(tuning.get("feedback_event_count", 0) or 0)
+    target.tuning.notes.extend(str(item) for item in tuning.get("notes", []) if item)
+    if tuning.get("metrics"):
+        target.tuning.metrics.update(tuning.get("metrics", {}))
 
 
 def _populate_scored_candidate(
@@ -541,6 +673,24 @@ class ScoringServiceServicer:
         response.engine_version = str(metadata.get("engine_version", "") or "")
         response.status_note = str(metadata.get("status_note", "") or "")
         response.expected_relative_signature = str(metadata.get("expected_relative_signature", "") or "")
+        return response
+
+    def GetFeedbackSummary(self, request: Any, context: grpc.ServicerContext) -> Any:
+        pb2, _ = load_scoring_proto_modules()
+        if not request.playlist_id:
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "playlist_id is required.")
+
+        summary = build_feedback_summary_from_payload(
+            settings=self.settings,
+            playlist_id=request.playlist_id,
+            playlist_name=request.playlist_name or request.playlist_id,
+            playlist_stats=_feedback_playlist_stats_from_proto(request.playlist_stats),
+            events=_feedback_events_from_proto(request.events),
+            since=str(request.window.since or "") or None,
+            until=str(request.window.until or "") or None,
+        )
+        response = pb2.GetFeedbackSummaryResponse()
+        _set_feedback_summary_response(response, summary)
         return response
 
 

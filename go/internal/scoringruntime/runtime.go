@@ -20,6 +20,7 @@ var (
 type Client interface {
 	GetScoringMetadata(ctx context.Context, req *scoringv1.GetScoringMetadataRequest, opts ...grpc.CallOption) (*scoringv1.GetScoringMetadataResponse, error)
 	GetRecommendations(ctx context.Context, req *scoringv1.GetRecommendationsRequest, opts ...grpc.CallOption) (*scoringv1.GetRecommendationsResponse, error)
+	GetFeedbackSummary(ctx context.Context, req *scoringv1.GetFeedbackSummaryRequest, opts ...grpc.CallOption) (*scoringv1.GetFeedbackSummaryResponse, error)
 	Close() error
 }
 
@@ -82,9 +83,30 @@ func (r *Runtime) GetRecommendations(ctx context.Context, req *scoringv1.GetReco
 	if open, _ := r.State(); open {
 		return nil, ErrCircuitOpen
 	}
-	resp, err := r.client.GetRecommendations(ctx, req)
+	rpcCtx, cancel := context.WithTimeout(ctx, scoringclient.DefaultScoringRPCTimeout)
+	defer cancel()
+	resp, err := r.client.GetRecommendations(rpcCtx, req)
 	if err != nil {
-		r.recordFailure(err)
+		if !IsUnimplemented(err) {
+			r.recordFailure(err)
+		}
+		return nil, err
+	}
+	r.resetFailures()
+	return resp, nil
+}
+
+func (r *Runtime) GetFeedbackSummary(ctx context.Context, req *scoringv1.GetFeedbackSummaryRequest) (*scoringv1.GetFeedbackSummaryResponse, error) {
+	if open, _ := r.State(); open {
+		return nil, ErrCircuitOpen
+	}
+	rpcCtx, cancel := context.WithTimeout(ctx, scoringclient.DefaultScoringRPCTimeout)
+	defer cancel()
+	resp, err := r.client.GetFeedbackSummary(rpcCtx, req)
+	if err != nil {
+		if !IsUnimplemented(err) {
+			r.recordFailure(err)
+		}
 		return nil, err
 	}
 	r.resetFailures()
@@ -141,6 +163,14 @@ func IsUnavailable(err error) bool {
 	default:
 		return false
 	}
+}
+
+func IsUnimplemented(err error) bool {
+	st, ok := status.FromError(err)
+	if !ok || st == nil {
+		return false
+	}
+	return st.Code() == codes.Unimplemented
 }
 
 func DescribeUnavailable(err error) string {

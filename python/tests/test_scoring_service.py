@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import sys
+from importlib import resources
 from pathlib import Path
 
 import grpc
@@ -63,6 +64,7 @@ def scoring_proto_runtime(tmp_path, monkeypatch):
         [
             "grpc_tools.protoc",
             f"-I{repo_root / 'proto'}",
+            f"-I{resources.files('grpc_tools').joinpath('_proto')}",
             f"--python_out={out_root}",
             f"--grpc_python_out={out_root}",
             str(proto_file),
@@ -331,3 +333,27 @@ def test_service_rejects_missing_signatures(scoring_proto_runtime):
         server.stop(0.5)
 
     assert exc_info.value.code() == grpc.StatusCode.FAILED_PRECONDITION
+
+
+def test_playlist_stats_proto_uses_weight_source_enum(scoring_proto_runtime):
+    pb2, _ = scoring_proto_runtime
+    from cuemate_analysis.scoring_service import _playlist_stats_from_proto
+
+    message = pb2.PlaylistStatsContext()
+    message.weight_source_enum = pb2.WEIGHT_SOURCE_FEEDBACK_TUNED
+
+    payload = _playlist_stats_from_proto(message)
+
+    assert payload is not None
+    assert payload["weight_source"] == "feedback_tuned_weights"
+
+
+def test_playlist_stats_proto_omits_unknown_weight_source(scoring_proto_runtime):
+    pb2, _ = scoring_proto_runtime
+    from cuemate_analysis.scoring_service import _playlist_stats_from_proto
+
+    message = pb2.PlaylistStatsContext()
+
+    payload = _playlist_stats_from_proto(message)
+
+    assert payload is None

@@ -26,6 +26,20 @@ type PlaylistRef struct {
 	Name string
 }
 
+type PlaylistSummary struct {
+	ID                  string
+	Name                string
+	TrackCount          int
+	CreatedAt           string
+	UpdatedAt           string
+	TrackCountAnalyzed  int
+	EligibleTrackCount  int
+	IsStale             bool
+	StaleReason         string
+	FeedbackEventCount  int
+	FeedbackLastTunedAt *string
+}
+
 type TrackContextRecord struct {
 	TrackID                   string
 	FilePath                  string
@@ -55,15 +69,20 @@ func (r TrackContextRecord) Scoreable() bool {
 }
 
 type PlaylistStats struct {
-	PlaylistID         string
-	TrackCountTotal    int
-	TrackCountAnalyzed int
-	EligibleTrackCount int
-	EnergySpread       *float64
-	RelativeSignature  string
-	IsStale            bool
-	StaleReason        string
-	AdaptedWeights     map[string]float64
+	PlaylistID            string
+	TrackCountTotal       int
+	TrackCountAnalyzed    int
+	EligibleTrackCount    int
+	EnergySpread          *float64
+	RelativeSignature     string
+	IsStale               bool
+	StaleReason           string
+	AdaptedWeights        map[string]float64
+	FeedbackTunedWeights  map[string]float64
+	FeedbackTuningNotes   []string
+	FeedbackEventCount    int
+	FeedbackLastTunedAt   *string
+	FeedbackTuningMetrics map[string]any
 }
 
 type RecommendationEventRecord struct {
@@ -81,6 +100,27 @@ type RecommendationEventRecord struct {
 	AdaptedWeightsJSON       *string
 	ScoringContractID        string
 	Timestamp                string
+	PlayedAt                 *string
+}
+
+type RecommendationEventItemRecord struct {
+	EventID                string
+	LaneID                 string
+	LaneRank               int
+	CandidateTrackID       string
+	FinalScore             float64
+	RawScore               float64
+	PenaltyMultiplier      float64
+	Move                   string
+	MoveConfidence         float64
+	Risk                   string
+	RiskScore              float64
+	PrimaryLane            *string
+	SecondaryLane          bool
+	ComponentScoresJSON    string
+	ConfidencesJSON        string
+	WeightsUsedJSON        string
+	TransitionFeaturesJSON string
 }
 
 type ManualCorrectionRecord struct {
@@ -113,6 +153,56 @@ type PlaylistTrackSnapshot struct {
 	AnalysisState string
 }
 
+type TrackFeatureDetail struct {
+	TrackID                    string
+	Title                      string
+	Artist                     string
+	BPM                        *float64
+	Key                        *string
+	KeyConfidence              *float64
+	KeySource                  *string
+	KeyAgreement               *int32
+	EnergyAbs                  *float64
+	EnergyHeuristicAbs         *float64
+	EnergySustained            *float64
+	EnergyPeak                 *float64
+	LoudnessNorm               *float64
+	BassAbs                    *float64
+	DrumsAbs                   *float64
+	HarmonicAbs                *float64
+	GrooveAbs                  *float64
+	VocalsAbs                  *float64
+	VocalsConfidence           *float64
+	DanceabilityAbs            *float64
+	ArousalAbs                 *float64
+	ValenceAbs                 *float64
+	MoodAggressiveAbs          *float64
+	MoodPartyAbs               *float64
+	MoodRelaxedAbs             *float64
+	EnergyEssentiaFused        *float64
+	EnergyEssentiaBucket       *string
+	EssentiaSemanticSource     *string
+	EssentiaSemanticInferredAt *string
+	AnalysisMode               *string
+	AnalyzedAt                 *string
+	AnalysisSignature          *string
+	ConfigSignature            *string
+	ScoringContractAtAnalysis  *string
+	EnergyRel                  *float64
+	BassRel                    *float64
+	DrumsRel                   *float64
+	VocalsRel                  *float64
+	GrooveRel                  *float64
+	EnergySpread               *float64
+	BassSpread                 *float64
+	DrumsSpread                *float64
+	VocalsSpread               *float64
+	GrooveSpread               *float64
+	IntensityBand              *string
+	IntensityMembership        map[string]float64
+	RoleHints                  []string
+}
+
 type PlaylistSyncState struct {
 	PlaylistID              string
 	LastSnapshotID          string
@@ -125,6 +215,14 @@ type execContexter interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }
 
+type prepareContexter interface {
+	PrepareContext(ctx context.Context, query string) (*sql.Stmt, error)
+}
+
+type queryRowContexter interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
 type SyncOutboxItem struct {
 	ID          int64
 	EntityType  string
@@ -133,6 +231,33 @@ type SyncOutboxItem struct {
 	PayloadJSON string
 	CreatedAt   string
 	SyncedAt    *string
+}
+
+type FeedbackTuningJobRecord struct {
+	ID             int64
+	PlaylistID     string
+	Status         string
+	TriggerEventID *string
+	CreatedAt      string
+	StartedAt      *string
+	FinishedAt     *string
+	ErrorMessage   *string
+}
+
+type AnalysisJobRecord struct {
+	ID              int64
+	PlaylistID      *string
+	TrackID         *string
+	TrackPath       string
+	Status          string
+	Priority        int
+	AnalysisMode    string
+	JobKind         string
+	ErrorMessage    *string
+	DurationSeconds *float64
+	CreatedAt       string
+	StartedAt       *string
+	CompletedAt     *string
 }
 
 type Repository struct {
@@ -194,6 +319,58 @@ func (r *Repository) ResolvePlaylist(ctx context.Context, playlistID, playlistNa
 		return PlaylistRef{}, err
 	}
 	return playlist, nil
+}
+
+func (r *Repository) ListPlaylists(ctx context.Context) ([]PlaylistSummary, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT
+		  p.id,
+		  p.name,
+		  p.track_count,
+		  p.created_at,
+		  p.updated_at,
+		  COALESCE(ps.track_count_analyzed, 0),
+		  COALESCE(ps.eligible_track_count, 0),
+		  COALESCE(ps.is_stale, 0),
+		  COALESCE(ps.stale_reason, ''),
+		  COALESCE(ps.feedback_event_count, 0),
+		  ps.feedback_last_tuned_at
+		FROM playlists p
+		LEFT JOIN playlist_stats ps ON ps.playlist_id = p.id
+		ORDER BY p.updated_at DESC, p.name ASC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []PlaylistSummary
+	for rows.Next() {
+		var item PlaylistSummary
+		var staleInt int64
+		var tunedAt sql.NullString
+		if err := rows.Scan(
+			&item.ID,
+			&item.Name,
+			&item.TrackCount,
+			&item.CreatedAt,
+			&item.UpdatedAt,
+			&item.TrackCountAnalyzed,
+			&item.EligibleTrackCount,
+			&staleInt,
+			&item.StaleReason,
+			&item.FeedbackEventCount,
+			&tunedAt,
+		); err != nil {
+			return nil, err
+		}
+		item.IsStale = staleInt != 0
+		if tunedAt.Valid {
+			item.FeedbackLastTunedAt = &tunedAt.String
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
 }
 
 func (r *Repository) HydrateRecommendations(
@@ -327,6 +504,315 @@ func (r *Repository) GetPlaylistSnapshotTracks(ctx context.Context, playlistID s
 	return out, rows.Err()
 }
 
+func (r *Repository) ListPlaylistTracks(ctx context.Context, playlistID, query, analysisState string, limit, offset int) ([]PlaylistTrackSnapshot, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	tracks, err := r.GetPlaylistSnapshotTracks(ctx, playlistID)
+	if err != nil {
+		return nil, err
+	}
+	query = strings.ToLower(strings.TrimSpace(query))
+	analysisState = strings.TrimSpace(analysisState)
+	filtered := make([]PlaylistTrackSnapshot, 0, len(tracks))
+	for _, track := range tracks {
+		if query != "" {
+			haystack := strings.ToLower(track.Title + " " + track.Artist + " " + track.TrackID)
+			if !strings.Contains(haystack, query) {
+				continue
+			}
+		}
+		if analysisState != "" && track.AnalysisState != analysisState {
+			continue
+		}
+		filtered = append(filtered, track)
+	}
+	if offset >= len(filtered) {
+		return []PlaylistTrackSnapshot{}, nil
+	}
+	end := offset + limit
+	if end > len(filtered) {
+		end = len(filtered)
+	}
+	return filtered[offset:end], nil
+}
+
+func (r *Repository) GetTrackFeatureDetail(ctx context.Context, playlistID, trackID string) (TrackFeatureDetail, error) {
+	row := r.db.QueryRowContext(ctx, `
+		SELECT
+		  t.id,
+		  COALESCE(t.title, ''),
+		  COALESCE(t.artist, ''),
+		  f.bpm,
+		  f.key,
+		  f.key_confidence,
+		  f.key_source,
+		  f.key_agreement,
+		  f.energy_abs,
+		  f.energy_heuristic_abs,
+		  f.energy_sustained,
+		  f.energy_peak,
+		  f.loudness_norm,
+		  f.bass_abs,
+		  f.drums_abs,
+		  f.harmonic_abs,
+		  f.groove_abs,
+		  f.vocals_abs,
+		  f.vocals_confidence,
+		  f.danceability_abs,
+		  f.arousal_abs,
+		  f.valence_abs,
+		  f.mood_aggressive_abs,
+		  f.mood_party_abs,
+		  f.mood_relaxed_abs,
+		  f.energy_essentia_fused,
+		  f.energy_essentia_bucket,
+		  f.essentia_semantic_source,
+		  f.essentia_semantic_inferred_at,
+		  f.analysis_mode,
+		  f.analyzed_at,
+		  f.analysis_signature,
+		  f.config_signature,
+		  f.scoring_contract_id_at_analysis,
+		  rel.energy_rel,
+		  rel.bass_rel,
+		  rel.drums_rel,
+		  rel.vocals_rel,
+		  rel.groove_rel,
+		  rel.energy_spread,
+		  rel.bass_spread,
+		  rel.drums_spread,
+		  rel.vocals_spread,
+		  rel.groove_spread,
+		  rel.intensity_band,
+		  rel.intensity_membership,
+		  rel.role_hints
+		FROM playlist_tracks pt
+		JOIN tracks t ON t.id = pt.track_id
+		LEFT JOIN track_features_abs f ON f.track_id = t.id
+		LEFT JOIN track_features_rel rel ON rel.track_id = t.id AND rel.playlist_id = pt.playlist_id
+		WHERE pt.playlist_id = ? AND t.id = ?
+	`, playlistID, trackID)
+
+	var detail TrackFeatureDetail
+	var bpm, keyConfidence, energyAbs, energyHeuristicAbs, energySustained, energyPeak sql.NullFloat64
+	var loudnessNorm, bassAbs, drumsAbs, harmonicAbs, grooveAbs, vocalsAbs, vocalsConfidence sql.NullFloat64
+	var danceabilityAbs, arousalAbs, valenceAbs, moodAggressiveAbs, moodPartyAbs, moodRelaxedAbs sql.NullFloat64
+	var energyEssentiaFused sql.NullFloat64
+	var energyRel, bassRel, drumsRel, vocalsRel, grooveRel sql.NullFloat64
+	var energySpread, bassSpread, drumsSpread, vocalsSpread, grooveSpread sql.NullFloat64
+	var keyAgreement sql.NullInt64
+	var key, keySource, energyEssentiaBucket, semanticSource, semanticInferredAt sql.NullString
+	var analysisMode, analyzedAt, analysisSignature, configSignature, scoringContract sql.NullString
+	var intensityBand, intensityMembership, roleHints sql.NullString
+	if err := row.Scan(
+		&detail.TrackID,
+		&detail.Title,
+		&detail.Artist,
+		&bpm,
+		&key,
+		&keyConfidence,
+		&keySource,
+		&keyAgreement,
+		&energyAbs,
+		&energyHeuristicAbs,
+		&energySustained,
+		&energyPeak,
+		&loudnessNorm,
+		&bassAbs,
+		&drumsAbs,
+		&harmonicAbs,
+		&grooveAbs,
+		&vocalsAbs,
+		&vocalsConfidence,
+		&danceabilityAbs,
+		&arousalAbs,
+		&valenceAbs,
+		&moodAggressiveAbs,
+		&moodPartyAbs,
+		&moodRelaxedAbs,
+		&energyEssentiaFused,
+		&energyEssentiaBucket,
+		&semanticSource,
+		&semanticInferredAt,
+		&analysisMode,
+		&analyzedAt,
+		&analysisSignature,
+		&configSignature,
+		&scoringContract,
+		&energyRel,
+		&bassRel,
+		&drumsRel,
+		&vocalsRel,
+		&grooveRel,
+		&energySpread,
+		&bassSpread,
+		&drumsSpread,
+		&vocalsSpread,
+		&grooveSpread,
+		&intensityBand,
+		&intensityMembership,
+		&roleHints,
+	); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return TrackFeatureDetail{}, ErrTrackNotFound
+		}
+		return TrackFeatureDetail{}, err
+	}
+
+	detail.BPM = nullableFloatPtr(bpm)
+	detail.Key = nullableStringPtr(key)
+	detail.KeyConfidence = nullableFloatPtr(keyConfidence)
+	detail.KeySource = nullableStringPtr(keySource)
+	if keyAgreement.Valid {
+		value := int32(keyAgreement.Int64)
+		detail.KeyAgreement = &value
+	}
+	detail.EnergyAbs = nullableFloatPtr(energyAbs)
+	detail.EnergyHeuristicAbs = nullableFloatPtr(energyHeuristicAbs)
+	detail.EnergySustained = nullableFloatPtr(energySustained)
+	detail.EnergyPeak = nullableFloatPtr(energyPeak)
+	detail.LoudnessNorm = nullableFloatPtr(loudnessNorm)
+	detail.BassAbs = nullableFloatPtr(bassAbs)
+	detail.DrumsAbs = nullableFloatPtr(drumsAbs)
+	detail.HarmonicAbs = nullableFloatPtr(harmonicAbs)
+	detail.GrooveAbs = nullableFloatPtr(grooveAbs)
+	detail.VocalsAbs = nullableFloatPtr(vocalsAbs)
+	detail.VocalsConfidence = nullableFloatPtr(vocalsConfidence)
+	detail.DanceabilityAbs = nullableFloatPtr(danceabilityAbs)
+	detail.ArousalAbs = nullableFloatPtr(arousalAbs)
+	detail.ValenceAbs = nullableFloatPtr(valenceAbs)
+	detail.MoodAggressiveAbs = nullableFloatPtr(moodAggressiveAbs)
+	detail.MoodPartyAbs = nullableFloatPtr(moodPartyAbs)
+	detail.MoodRelaxedAbs = nullableFloatPtr(moodRelaxedAbs)
+	detail.EnergyEssentiaFused = nullableFloatPtr(energyEssentiaFused)
+	detail.EnergyEssentiaBucket = nullableStringPtr(energyEssentiaBucket)
+	detail.EssentiaSemanticSource = nullableStringPtr(semanticSource)
+	detail.EssentiaSemanticInferredAt = nullableStringPtr(semanticInferredAt)
+	detail.AnalysisMode = nullableStringPtr(analysisMode)
+	detail.AnalyzedAt = nullableStringPtr(analyzedAt)
+	detail.AnalysisSignature = nullableStringPtr(analysisSignature)
+	detail.ConfigSignature = nullableStringPtr(configSignature)
+	detail.ScoringContractAtAnalysis = nullableStringPtr(scoringContract)
+	detail.EnergyRel = nullableFloatPtr(energyRel)
+	detail.BassRel = nullableFloatPtr(bassRel)
+	detail.DrumsRel = nullableFloatPtr(drumsRel)
+	detail.VocalsRel = nullableFloatPtr(vocalsRel)
+	detail.GrooveRel = nullableFloatPtr(grooveRel)
+	detail.EnergySpread = nullableFloatPtr(energySpread)
+	detail.BassSpread = nullableFloatPtr(bassSpread)
+	detail.DrumsSpread = nullableFloatPtr(drumsSpread)
+	detail.VocalsSpread = nullableFloatPtr(vocalsSpread)
+	detail.GrooveSpread = nullableFloatPtr(grooveSpread)
+	detail.IntensityBand = nullableStringPtr(intensityBand)
+	if intensityMembership.Valid && strings.TrimSpace(intensityMembership.String) != "" {
+		if err := json.Unmarshal([]byte(intensityMembership.String), &detail.IntensityMembership); err != nil {
+			log.Printf("warning: failed to decode intensity_membership %q: %v", intensityMembership.String, err)
+		}
+	}
+	if roleHints.Valid && strings.TrimSpace(roleHints.String) != "" {
+		if err := json.Unmarshal([]byte(roleHints.String), &detail.RoleHints); err != nil {
+			log.Printf("warning: failed to decode role_hints %q: %v", roleHints.String, err)
+		}
+	}
+	return detail, nil
+}
+
+func nullableFloatPtr(value sql.NullFloat64) *float64 {
+	if !value.Valid {
+		return nil
+	}
+	return &value.Float64
+}
+
+func nullableStringPtr(value sql.NullString) *string {
+	if !value.Valid {
+		return nil
+	}
+	return &value.String
+}
+
+func (r *Repository) SearchTracks(ctx context.Context, playlistID, query string, limit int) ([]PlaylistTrackSnapshot, error) {
+	if strings.TrimSpace(playlistID) != "" {
+		return r.ListPlaylistTracks(ctx, playlistID, query, "", limit, 0)
+	}
+	if limit <= 0 || limit > 100 {
+		limit = 25
+	}
+	like := "%" + strings.ToLower(strings.TrimSpace(query)) + "%"
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT
+		  t.id,
+		  COALESCE(t.title, ''),
+		  COALESCE(t.artist, ''),
+		  0,
+		  f.bpm,
+		  f.key,
+		  NULL,
+		  NULL,
+		  f.analysis_signature,
+		  f.config_signature,
+		  f.scoring_contract_id_at_analysis
+		FROM tracks t
+		LEFT JOIN track_features_abs f ON f.track_id = t.id
+		WHERE ? = '%%' OR lower(t.title) LIKE ? OR lower(t.artist) LIKE ? OR lower(t.id) LIKE ?
+		ORDER BY COALESCE(t.artist, ''), COALESCE(t.title, ''), t.id
+		LIMIT ?
+	`, like, like, like, like, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PlaylistTrackSnapshot
+	for rows.Next() {
+		var track PlaylistTrackSnapshot
+		var bpm sql.NullFloat64
+		var musicalKey sql.NullString
+		var intensityBand sql.NullString
+		var roleHints sql.NullString
+		var analysisSig sql.NullString
+		var configSig sql.NullString
+		var scoringContract sql.NullString
+		if err := rows.Scan(
+			&track.TrackID,
+			&track.Title,
+			&track.Artist,
+			&track.Position,
+			&bpm,
+			&musicalKey,
+			&intensityBand,
+			&roleHints,
+			&analysisSig,
+			&configSig,
+			&scoringContract,
+		); err != nil {
+			return nil, err
+		}
+		if bpm.Valid {
+			track.BPM = &bpm.Float64
+		}
+		if musicalKey.Valid {
+			track.Key = &musicalKey.String
+		}
+		if intensityBand.Valid {
+			track.IntensityBand = &intensityBand.String
+		}
+		if roleHints.Valid && strings.TrimSpace(roleHints.String) != "" {
+			_ = json.Unmarshal([]byte(roleHints.String), &track.RoleHints)
+		}
+		if !analysisSig.Valid || !configSig.Valid || !scoringContract.Valid {
+			track.AnalysisState = "unanalysed"
+		} else {
+			track.AnalysisState = "ready"
+		}
+		out = append(out, track)
+	}
+	return out, rows.Err()
+}
+
 func (r *Repository) GetTrackForCorrection(ctx context.Context, trackID string) (TrackContextRecord, error) {
 	row := r.db.QueryRowContext(
 		ctx,
@@ -367,6 +853,176 @@ func (r *Repository) GetTrackForCorrection(ctx context.Context, trackID string) 
 		return TrackContextRecord{}, err
 	}
 	return record, nil
+}
+
+func (r *Repository) QueuePlaylistAnalysis(
+	ctx context.Context,
+	playlistID string,
+	analysisMode string,
+	force bool,
+	analysisSignature string,
+	configSignature string,
+) (int, error) {
+	if strings.TrimSpace(analysisMode) == "" {
+		analysisMode = "staged"
+	}
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT
+		  t.id,
+		  t.file_path,
+		  t.file_hash,
+		  f.track_id,
+		  f.analysis_signature,
+		  f.config_signature
+		FROM playlist_tracks pt
+		JOIN tracks t ON t.id = pt.track_id
+		LEFT JOIN track_features_abs f ON f.track_id = t.id
+		WHERE pt.playlist_id = ?
+		ORDER BY pt.position ASC
+	`, playlistID)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	type pendingTrack struct {
+		id                string
+		path              string
+		fileHash          *string
+		analyzed          bool
+		storedAnalysisSig *string
+		storedConfigSig   *string
+	}
+	var tracks []pendingTrack
+	for rows.Next() {
+		var item pendingTrack
+		var fileHash sql.NullString
+		var analyzedID sql.NullString
+		var storedAnalysisSig sql.NullString
+		var storedConfigSig sql.NullString
+		if err := rows.Scan(&item.id, &item.path, &fileHash, &analyzedID, &storedAnalysisSig, &storedConfigSig); err != nil {
+			return 0, err
+		}
+		if fileHash.Valid {
+			item.fileHash = &fileHash.String
+		}
+		if storedAnalysisSig.Valid {
+			item.storedAnalysisSig = &storedAnalysisSig.String
+		}
+		if storedConfigSig.Valid {
+			item.storedConfigSig = &storedConfigSig.String
+		}
+		item.analyzed = analyzedID.Valid
+		tracks = append(tracks, item)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	count := 0
+	for _, track := range tracks {
+		if track.analyzed && !force && stringPtrEqual(track.storedAnalysisSig, analysisSignature) && stringPtrEqual(track.storedConfigSig, configSignature) {
+			continue
+		}
+		if _, err := r.CreateAnalysisJobWithKind(
+			ctx,
+			&playlistID,
+			track.id,
+			track.path,
+			"enrichment",
+			analysisMode,
+			analysisSignature,
+			configSignature,
+			track.fileHash,
+			50,
+			NowUTC(),
+		); err != nil {
+			return count, err
+		}
+		count++
+	}
+	return count, nil
+}
+
+func stringPtrEqual(value *string, expected string) bool {
+	return value != nil && *value == expected
+}
+
+func (r *Repository) ListAnalysisJobs(ctx context.Context, playlistID, status string, limit int) ([]AnalysisJobRecord, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	where := []string{"1=1"}
+	args := []any{}
+	if strings.TrimSpace(playlistID) != "" {
+		where = append(where, "playlist_id = ?")
+		args = append(args, playlistID)
+	}
+	if strings.TrimSpace(status) != "" {
+		where = append(where, "status = ?")
+		args = append(args, status)
+	}
+	args = append(args, limit)
+	rows, err := r.db.QueryContext(ctx, fmt.Sprintf(`
+		SELECT
+		  id, playlist_id, track_id, track_path, status, priority, analysis_mode,
+		  job_kind, error_message, duration_seconds, created_at, started_at, completed_at
+		FROM analysis_jobs
+		WHERE %s
+		ORDER BY created_at DESC, id DESC
+		LIMIT ?
+	`, strings.Join(where, " AND ")), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AnalysisJobRecord
+	for rows.Next() {
+		var item AnalysisJobRecord
+		var playlistIDValue sql.NullString
+		var trackID sql.NullString
+		var errorMessage sql.NullString
+		var duration sql.NullFloat64
+		var startedAt sql.NullString
+		var completedAt sql.NullString
+		if err := rows.Scan(
+			&item.ID,
+			&playlistIDValue,
+			&trackID,
+			&item.TrackPath,
+			&item.Status,
+			&item.Priority,
+			&item.AnalysisMode,
+			&item.JobKind,
+			&errorMessage,
+			&duration,
+			&item.CreatedAt,
+			&startedAt,
+			&completedAt,
+		); err != nil {
+			return nil, err
+		}
+		if playlistIDValue.Valid {
+			item.PlaylistID = &playlistIDValue.String
+		}
+		if trackID.Valid {
+			item.TrackID = &trackID.String
+		}
+		if errorMessage.Valid {
+			item.ErrorMessage = &errorMessage.String
+		}
+		if duration.Valid {
+			item.DurationSeconds = &duration.Float64
+		}
+		if startedAt.Valid {
+			item.StartedAt = &startedAt.String
+		}
+		if completedAt.Valid {
+			item.CompletedAt = &completedAt.String
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
 }
 
 func (r *Repository) GetTrackImportedValues(ctx context.Context, trackID string) (*float64, *string, error) {
@@ -657,14 +1313,22 @@ func (r *Repository) insertManualCorrection(ctx context.Context, exec execContex
 }
 
 func (r *Repository) InsertRecommendationEvent(ctx context.Context, record RecommendationEventRecord) error {
-	_, err := r.db.ExecContext(
+	return r.insertRecommendationEvent(ctx, r.db, record)
+}
+
+func (r *Repository) InsertRecommendationEventTx(ctx context.Context, tx *sql.Tx, record RecommendationEventRecord) error {
+	return r.insertRecommendationEvent(ctx, tx, record)
+}
+
+func (r *Repository) insertRecommendationEvent(ctx context.Context, exec execContexter, record RecommendationEventRecord) error {
+	_, err := exec.ExecContext(
 		ctx,
 		`
 		INSERT INTO recommendation_events (
 		  id, user_id, playlist_id, current_track_id, target, candidate_count,
 		  recommendation_confidence, recommendations_status, lanes_returned, track_chosen,
-		  chosen_was_recommended, skipped_over, adapted_weights, scoring_contract_id, timestamp
-		) VALUES (?, 'local', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		  chosen_was_recommended, skipped_over, adapted_weights, scoring_contract_id, timestamp, played_at
+		) VALUES (?, 'local', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		`,
 		record.ID,
 		record.PlaylistID,
@@ -680,8 +1344,73 @@ func (r *Repository) InsertRecommendationEvent(ctx context.Context, record Recom
 		nullString(record.AdaptedWeightsJSON),
 		record.ScoringContractID,
 		record.Timestamp,
+		nullString(record.PlayedAt),
 	)
 	return err
+}
+
+func (r *Repository) InsertRecommendationEventItems(ctx context.Context, items []RecommendationEventItemRecord) error {
+	return r.RunInTx(ctx, func(tx *sql.Tx) error {
+		return r.insertRecommendationEventItems(ctx, tx, items)
+	})
+}
+
+func (r *Repository) InsertRecommendationEventItemsTx(ctx context.Context, tx *sql.Tx, items []RecommendationEventItemRecord) error {
+	return r.insertRecommendationEventItems(ctx, tx, items)
+}
+
+func (r *Repository) insertRecommendationEventItems(ctx context.Context, exec execContexter, items []RecommendationEventItemRecord) error {
+	if len(items) == 0 {
+		return nil
+	}
+	preparer, ok := exec.(prepareContexter)
+	if !ok {
+		return errors.New("exec context does not support prepared statements")
+	}
+	stmt, err := preparer.PrepareContext(
+		ctx,
+		`
+		INSERT INTO recommendation_event_items (
+		  event_id, lane_id, lane_rank, candidate_track_id, final_score, raw_score,
+		  penalty_multiplier, move, move_confidence, risk, risk_score, primary_lane,
+		  secondary_lane, component_scores_json, confidences_json, weights_used_json,
+		  transition_features_json
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`,
+	)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for _, item := range items {
+		secondaryLane := int64(0)
+		if item.SecondaryLane {
+			secondaryLane = 1
+		}
+		if _, err := stmt.ExecContext(
+			ctx,
+			item.EventID,
+			item.LaneID,
+			item.LaneRank,
+			item.CandidateTrackID,
+			item.FinalScore,
+			item.RawScore,
+			item.PenaltyMultiplier,
+			item.Move,
+			item.MoveConfidence,
+			item.Risk,
+			item.RiskScore,
+			nullString(item.PrimaryLane),
+			secondaryLane,
+			item.ComponentScoresJSON,
+			item.ConfidencesJSON,
+			item.WeightsUsedJSON,
+			item.TransitionFeaturesJSON,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (r *Repository) GetRecommendationEvent(ctx context.Context, eventID string) (*RecommendationEventRecord, error) {
@@ -691,7 +1420,7 @@ func (r *Repository) GetRecommendationEvent(ctx context.Context, eventID string)
 		SELECT
 		  id, playlist_id, current_track_id, target, candidate_count,
 		  recommendation_confidence, recommendations_status, lanes_returned, track_chosen,
-		  chosen_was_recommended, skipped_over, adapted_weights, scoring_contract_id, timestamp
+		  chosen_was_recommended, skipped_over, adapted_weights, scoring_contract_id, timestamp, played_at
 		FROM recommendation_events
 		WHERE id = ?
 		`,
@@ -703,6 +1432,7 @@ func (r *Repository) GetRecommendationEvent(ctx context.Context, eventID string)
 	var chosenWasRecommended sql.NullInt64
 	var skippedOver sql.NullString
 	var adaptedWeights sql.NullString
+	var playedAt sql.NullString
 	if err := row.Scan(
 		&record.ID,
 		&record.PlaylistID,
@@ -718,6 +1448,7 @@ func (r *Repository) GetRecommendationEvent(ctx context.Context, eventID string)
 		&adaptedWeights,
 		&record.ScoringContractID,
 		&record.Timestamp,
+		&playedAt,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrRecommendationEventNotFound
@@ -740,7 +1471,173 @@ func (r *Repository) GetRecommendationEvent(ctx context.Context, eventID string)
 	if adaptedWeights.Valid {
 		record.AdaptedWeightsJSON = &adaptedWeights.String
 	}
+	if playedAt.Valid {
+		record.PlayedAt = &playedAt.String
+	}
 	return &record, nil
+}
+
+func (r *Repository) GetRecommendationEventItems(ctx context.Context, eventID string) ([]RecommendationEventItemRecord, error) {
+	itemsByEvent, err := r.ListRecommendationEventItemsByEventIDs(ctx, []string{eventID})
+	if err != nil {
+		return nil, err
+	}
+	return itemsByEvent[eventID], nil
+}
+
+func (r *Repository) ListRecommendationEventItemsByEventIDs(ctx context.Context, eventIDs []string) (map[string][]RecommendationEventItemRecord, error) {
+	itemsByEvent := make(map[string][]RecommendationEventItemRecord, len(eventIDs))
+	if len(eventIDs) == 0 {
+		return itemsByEvent, nil
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(eventIDs)), ",")
+	rows, err := r.db.QueryContext(
+		ctx,
+		fmt.Sprintf(`
+		SELECT
+		  event_id, lane_id, lane_rank, candidate_track_id, final_score, raw_score,
+		  penalty_multiplier, move, move_confidence, risk, risk_score, primary_lane,
+		  secondary_lane, component_scores_json, confidences_json, weights_used_json,
+		  transition_features_json
+		FROM recommendation_event_items
+		WHERE event_id IN (%s)
+		ORDER BY event_id ASC, lane_id ASC, lane_rank ASC, candidate_track_id ASC
+		`, placeholders),
+		stringSliceArgs(eventIDs)...,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var item RecommendationEventItemRecord
+		var primaryLane sql.NullString
+		var secondaryLane int64
+		if err := rows.Scan(
+			&item.EventID,
+			&item.LaneID,
+			&item.LaneRank,
+			&item.CandidateTrackID,
+			&item.FinalScore,
+			&item.RawScore,
+			&item.PenaltyMultiplier,
+			&item.Move,
+			&item.MoveConfidence,
+			&item.Risk,
+			&item.RiskScore,
+			&primaryLane,
+			&secondaryLane,
+			&item.ComponentScoresJSON,
+			&item.ConfidencesJSON,
+			&item.WeightsUsedJSON,
+			&item.TransitionFeaturesJSON,
+		); err != nil {
+			return nil, err
+		}
+		if primaryLane.Valid {
+			item.PrimaryLane = &primaryLane.String
+		}
+		item.SecondaryLane = secondaryLane != 0
+		itemsByEvent[item.EventID] = append(itemsByEvent[item.EventID], item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return itemsByEvent, nil
+}
+
+func (r *Repository) ListRecommendationEventsByPlaylist(ctx context.Context, playlistID string) ([]RecommendationEventRecord, error) {
+	return r.ListRecommendationEventsByPlaylistWindow(ctx, playlistID, "", "")
+}
+
+func (r *Repository) ListRecommendationEventsByPlaylistWindow(ctx context.Context, playlistID, since, until string) ([]RecommendationEventRecord, error) {
+	where := []string{"playlist_id = ?"}
+	args := []any{playlistID}
+	if strings.TrimSpace(since) != "" {
+		where = append(where, "played_at >= ?")
+		args = append(args, since)
+	}
+	if strings.TrimSpace(until) != "" {
+		where = append(where, "played_at <= ?")
+		args = append(args, until)
+	}
+	rows, err := r.db.QueryContext(
+		ctx,
+		fmt.Sprintf(`
+		SELECT
+		  id, playlist_id, current_track_id, target, candidate_count,
+		  recommendation_confidence, recommendations_status, lanes_returned, track_chosen,
+		  chosen_was_recommended, skipped_over, adapted_weights, scoring_contract_id, timestamp, played_at
+		FROM recommendation_events
+		WHERE %s
+		ORDER BY COALESCE(played_at, timestamp) ASC, id ASC
+		`, strings.Join(where, " AND ")),
+		args...,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var items []RecommendationEventRecord
+	for rows.Next() {
+		var record RecommendationEventRecord
+		var recommendationConfidence sql.NullFloat64
+		var trackChosen sql.NullString
+		var chosenWasRecommended sql.NullInt64
+		var skippedOver sql.NullString
+		var adaptedWeights sql.NullString
+		var playedAt sql.NullString
+		if err := rows.Scan(
+			&record.ID,
+			&record.PlaylistID,
+			&record.CurrentTrackID,
+			&record.Target,
+			&record.CandidateCount,
+			&recommendationConfidence,
+			&record.RecommendationsStatus,
+			&record.LanesReturnedJSON,
+			&trackChosen,
+			&chosenWasRecommended,
+			&skippedOver,
+			&adaptedWeights,
+			&record.ScoringContractID,
+			&record.Timestamp,
+			&playedAt,
+		); err != nil {
+			return nil, err
+		}
+		if recommendationConfidence.Valid {
+			record.RecommendationConfidence = &recommendationConfidence.Float64
+		}
+		if trackChosen.Valid {
+			record.TrackChosen = &trackChosen.String
+		}
+		if chosenWasRecommended.Valid {
+			value := chosenWasRecommended.Int64 != 0
+			record.ChosenWasRecommended = &value
+		}
+		if skippedOver.Valid {
+			record.SkippedOverJSON = &skippedOver.String
+		}
+		if adaptedWeights.Valid {
+			record.AdaptedWeightsJSON = &adaptedWeights.String
+		}
+		if playedAt.Valid {
+			record.PlayedAt = &playedAt.String
+		}
+		items = append(items, record)
+	}
+	return items, rows.Err()
+}
+
+func stringSliceArgs(values []string) []any {
+	args := make([]any, 0, len(values))
+	for _, value := range values {
+		args = append(args, value)
+	}
+	return args
 }
 
 func (r *Repository) UpdateRecommendationEventChoice(
@@ -749,8 +1646,9 @@ func (r *Repository) UpdateRecommendationEventChoice(
 	chosenTrackID string,
 	chosenWasRecommended bool,
 	skippedOverJSON string,
+	playedAt string,
 ) error {
-	return r.updateRecommendationEventChoice(ctx, r.db, eventID, chosenTrackID, chosenWasRecommended, skippedOverJSON)
+	return r.updateRecommendationEventChoice(ctx, r.db, eventID, chosenTrackID, chosenWasRecommended, skippedOverJSON, playedAt)
 }
 
 func (r *Repository) UpdateRecommendationEventChoiceTx(
@@ -760,8 +1658,9 @@ func (r *Repository) UpdateRecommendationEventChoiceTx(
 	chosenTrackID string,
 	chosenWasRecommended bool,
 	skippedOverJSON string,
+	playedAt string,
 ) error {
-	return r.updateRecommendationEventChoice(ctx, tx, eventID, chosenTrackID, chosenWasRecommended, skippedOverJSON)
+	return r.updateRecommendationEventChoice(ctx, tx, eventID, chosenTrackID, chosenWasRecommended, skippedOverJSON, playedAt)
 }
 
 func (r *Repository) updateRecommendationEventChoice(
@@ -771,6 +1670,7 @@ func (r *Repository) updateRecommendationEventChoice(
 	chosenTrackID string,
 	chosenWasRecommended bool,
 	skippedOverJSON string,
+	playedAt string,
 ) error {
 	value := int64(0)
 	if chosenWasRecommended {
@@ -780,12 +1680,13 @@ func (r *Repository) updateRecommendationEventChoice(
 		ctx,
 		`
 		UPDATE recommendation_events
-		SET track_chosen = ?, chosen_was_recommended = ?, skipped_over = ?
+		SET track_chosen = ?, chosen_was_recommended = ?, skipped_over = ?, played_at = ?
 		WHERE id = ?
 		`,
 		chosenTrackID,
 		value,
 		skippedOverJSON,
+		playedAt,
 		eventID,
 	)
 	if err != nil {
@@ -799,6 +1700,94 @@ func (r *Repository) updateRecommendationEventChoice(
 		return ErrRecommendationEventNotFound
 	}
 	return nil
+}
+
+func (r *Repository) UpsertFeedbackTuningJob(
+	ctx context.Context,
+	playlistID string,
+	triggerEventID *string,
+	createdAt string,
+) (int64, error) {
+	var jobID int64
+	err := r.RunInTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		jobID, err = r.upsertFeedbackTuningJob(ctx, tx, playlistID, triggerEventID, createdAt)
+		return err
+	})
+	if err != nil {
+		return 0, err
+	}
+	return jobID, nil
+}
+
+func (r *Repository) UpsertFeedbackTuningJobTx(
+	ctx context.Context,
+	tx *sql.Tx,
+	playlistID string,
+	triggerEventID *string,
+	createdAt string,
+) (int64, error) {
+	return r.upsertFeedbackTuningJob(ctx, tx, playlistID, triggerEventID, createdAt)
+}
+
+func (r *Repository) upsertFeedbackTuningJob(
+	ctx context.Context,
+	exec execContexter,
+	playlistID string,
+	triggerEventID *string,
+	createdAt string,
+) (int64, error) {
+	_, err := exec.ExecContext(
+		ctx,
+		`
+		UPDATE feedback_tuning_jobs
+		SET trigger_event_id = COALESCE(?, trigger_event_id)
+		WHERE playlist_id = ?
+		  AND status = 'pending'
+		`,
+		nullString(triggerEventID),
+		playlistID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	queryer, ok := exec.(queryRowContexter)
+	if !ok {
+		return 0, fmt.Errorf("feedback tuning job upsert requires query-capable exec context")
+	}
+	row := queryer.QueryRowContext(
+		ctx,
+		`
+		SELECT id
+		FROM feedback_tuning_jobs
+		WHERE playlist_id = ?
+		  AND status = 'pending'
+		ORDER BY id DESC
+		LIMIT 1
+		`,
+		playlistID,
+	)
+	var existingID int64
+	if err := row.Scan(&existingID); err == nil {
+		return existingID, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return 0, err
+	}
+	result, err := exec.ExecContext(
+		ctx,
+		`
+		INSERT INTO feedback_tuning_jobs (
+		  playlist_id, status, trigger_event_id, created_at
+		) VALUES (?, 'pending', ?, ?)
+		`,
+		playlistID,
+		nullString(triggerEventID),
+		createdAt,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.LastInsertId()
 }
 
 func (r *Repository) InsertSyncOutbox(
@@ -1005,6 +1994,58 @@ func NowUTC() string {
 	return time.Now().UTC().Format(time.RFC3339)
 }
 
+func (r *Repository) ListFeedbackTuningJobsByPlaylist(ctx context.Context, playlistID string) ([]FeedbackTuningJobRecord, error) {
+	rows, err := r.db.QueryContext(
+		ctx,
+		`
+		SELECT id, playlist_id, status, trigger_event_id, created_at, started_at, finished_at, error_message
+		FROM feedback_tuning_jobs
+		WHERE playlist_id = ?
+		ORDER BY id ASC
+		`,
+		playlistID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var jobs []FeedbackTuningJobRecord
+	for rows.Next() {
+		var item FeedbackTuningJobRecord
+		var triggerEventID sql.NullString
+		var startedAt sql.NullString
+		var finishedAt sql.NullString
+		var errorMessage sql.NullString
+		if err := rows.Scan(
+			&item.ID,
+			&item.PlaylistID,
+			&item.Status,
+			&triggerEventID,
+			&item.CreatedAt,
+			&startedAt,
+			&finishedAt,
+			&errorMessage,
+		); err != nil {
+			return nil, err
+		}
+		if triggerEventID.Valid {
+			item.TriggerEventID = &triggerEventID.String
+		}
+		if startedAt.Valid {
+			item.StartedAt = &startedAt.String
+		}
+		if finishedAt.Valid {
+			item.FinishedAt = &finishedAt.String
+		}
+		if errorMessage.Valid {
+			item.ErrorMessage = &errorMessage.String
+		}
+		jobs = append(jobs, item)
+	}
+	return jobs, rows.Err()
+}
+
 func scanPlaylistSyncState(scanner interface{ Scan(...any) error }) (*PlaylistSyncState, error) {
 	var state PlaylistSyncState
 	var ackedAt sql.NullString
@@ -1135,7 +2176,12 @@ func (r *Repository) getPlaylistStats(ctx context.Context, playlistID string) (*
 		  relative_signature,
 		  is_stale,
 		  COALESCE(stale_reason, ''),
-		  adapted_weights
+		  adapted_weights,
+		  feedback_tuned_weights,
+		  feedback_tuning_notes,
+		  feedback_event_count,
+		  feedback_last_tuned_at,
+		  feedback_tuning_metrics
 		FROM playlist_stats
 		WHERE playlist_id = ?
 		`,
@@ -1145,7 +2191,12 @@ func (r *Repository) getPlaylistStats(ctx context.Context, playlistID string) (*
 	var stats PlaylistStats
 	var energy sql.NullFloat64
 	var adapted sql.NullString
+	var feedbackTuned sql.NullString
+	var feedbackNotes sql.NullString
 	var staleInt int64
+	var feedbackEventCount sql.NullInt64
+	var feedbackLastTunedAt sql.NullString
+	var feedbackMetrics sql.NullString
 	if err := row.Scan(
 		&stats.PlaylistID,
 		&stats.TrackCountTotal,
@@ -1156,6 +2207,11 @@ func (r *Repository) getPlaylistStats(ctx context.Context, playlistID string) (*
 		&staleInt,
 		&stats.StaleReason,
 		&adapted,
+		&feedbackTuned,
+		&feedbackNotes,
+		&feedbackEventCount,
+		&feedbackLastTunedAt,
+		&feedbackMetrics,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
@@ -1169,6 +2225,27 @@ func (r *Repository) getPlaylistStats(ctx context.Context, playlistID string) (*
 	if adapted.Valid && strings.TrimSpace(adapted.String) != "" {
 		if err := json.Unmarshal([]byte(adapted.String), &stats.AdaptedWeights); err != nil {
 			return nil, fmt.Errorf("decode adapted_weights: %w", err)
+		}
+	}
+	if feedbackTuned.Valid && strings.TrimSpace(feedbackTuned.String) != "" {
+		if err := json.Unmarshal([]byte(feedbackTuned.String), &stats.FeedbackTunedWeights); err != nil {
+			return nil, fmt.Errorf("decode feedback_tuned_weights: %w", err)
+		}
+	}
+	if feedbackNotes.Valid && strings.TrimSpace(feedbackNotes.String) != "" {
+		if err := json.Unmarshal([]byte(feedbackNotes.String), &stats.FeedbackTuningNotes); err != nil {
+			return nil, fmt.Errorf("decode feedback_tuning_notes: %w", err)
+		}
+	}
+	if feedbackEventCount.Valid {
+		stats.FeedbackEventCount = int(feedbackEventCount.Int64)
+	}
+	if feedbackLastTunedAt.Valid {
+		stats.FeedbackLastTunedAt = &feedbackLastTunedAt.String
+	}
+	if feedbackMetrics.Valid && strings.TrimSpace(feedbackMetrics.String) != "" {
+		if err := json.Unmarshal([]byte(feedbackMetrics.String), &stats.FeedbackTuningMetrics); err != nil {
+			return nil, fmt.Errorf("decode feedback_tuning_metrics: %w", err)
 		}
 	}
 	return &stats, nil

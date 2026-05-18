@@ -111,6 +111,7 @@ class ScoringSettings:
     static_weights: dict[str, float]
     weight_floors: dict[str, float]
     harmonic_confidence_floor: float = 0.15
+    key_confidence_threshold: float = 0.5
     thresholds: dict[str, Any] = None  # type: ignore[assignment]
     move_types: dict[str, Any] = None  # type: ignore[assignment]
     penalties: dict[str, Any] = None  # type: ignore[assignment]
@@ -132,6 +133,15 @@ class ScoringSettings:
 class WeightAdaptationSettings:
     mode: str
     adaptation_strength: float
+
+
+@dataclass(frozen=True)
+class FeedbackSettings:
+    learning_rate: float = 0.35
+    max_component_shift: float = 0.25
+    min_contributory_events: int = 20
+    min_pairwise_comparisons: int = 40
+    min_new_events_since_last_tune: int = 5
 
 
 @dataclass(frozen=True)
@@ -171,6 +181,7 @@ class RuntimeSettings:
     thresholds: ThresholdSettings
     scoring: ScoringSettings
     weight_adaptation: WeightAdaptationSettings
+    feedback: FeedbackSettings
     semantic_calibration: SemanticCalibrationSettings
 
 
@@ -322,7 +333,7 @@ def resolve_image_digest(image_name: str) -> str:
                 if isinstance(entry, str) and "@sha256:" in entry:
                     return entry
         return image_name
-    except Exception:
+    except (subprocess.SubprocessError, OSError, json.JSONDecodeError, ValueError):
         return image_name
 
 
@@ -424,6 +435,7 @@ def load_runtime_settings(repo_root: Path | None = None) -> RuntimeSettings:
     thresholds_payload = config_payload.get("thresholds", {})
     scoring_payload = config_payload.get("scoring", {})
     weight_adaptation_payload = config_payload.get("weight_adaptation", {})
+    feedback_payload = config_payload.get("feedback", {})
 
     parallel_workers = int(analysis_payload.get("parallel_workers", 4))
     max_workers_auto = bool(analysis_payload.get("max_workers_auto", True))
@@ -477,6 +489,7 @@ def load_runtime_settings(repo_root: Path | None = None) -> RuntimeSettings:
             for key, value in scoring_payload.get("weight_floors", DEFAULT_WEIGHT_FLOORS).items()
         },
         harmonic_confidence_floor=float(scoring_payload.get("harmonic_confidence_floor", 0.15)),
+        key_confidence_threshold=float(scoring_payload.get("key_confidence_threshold", 0.5)),
         thresholds={**DEFAULT_SCORING_THRESHOLDS, **scoring_payload.get("thresholds", {})},
         move_types={**DEFAULT_SCORING_MOVE_TYPES, **scoring_payload.get("move_types", {})},
         penalties={**DEFAULT_SCORING_PENALTIES, **scoring_payload.get("penalties", {})},
@@ -487,6 +500,13 @@ def load_runtime_settings(repo_root: Path | None = None) -> RuntimeSettings:
     weight_adaptation = WeightAdaptationSettings(
         mode=str(weight_adaptation_payload.get("mode", "auto")),
         adaptation_strength=float(weight_adaptation_payload.get("adaptation_strength", 0.7)),
+    )
+    feedback = FeedbackSettings(
+        learning_rate=float(feedback_payload.get("learning_rate", 0.35)),
+        max_component_shift=float(feedback_payload.get("max_component_shift", 0.25)),
+        min_contributory_events=int(feedback_payload.get("min_contributory_events", 20)),
+        min_pairwise_comparisons=int(feedback_payload.get("min_pairwise_comparisons", 40)),
+        min_new_events_since_last_tune=int(feedback_payload.get("min_new_events_since_last_tune", 5)),
     )
 
     config_signature = str(config_payload.get("config_signature", "default"))
@@ -513,6 +533,7 @@ def load_runtime_settings(repo_root: Path | None = None) -> RuntimeSettings:
         thresholds=thresholds,
         scoring=scoring,
         weight_adaptation=weight_adaptation,
+        feedback=feedback,
         semantic_calibration=semantic_calibration,
     )
 
@@ -546,6 +567,7 @@ def build_scoring_config(settings: RuntimeSettings, *, target: str = "maintain")
         "static_weights": s.static_weights,
         "weight_floors": s.weight_floors,
         "harmonic_confidence_floor": s.harmonic_confidence_floor,
+        "key_confidence_threshold": s.key_confidence_threshold,
         "thresholds": s.thresholds,
         "move_types": s.move_types,
         "penalties": s.penalties,

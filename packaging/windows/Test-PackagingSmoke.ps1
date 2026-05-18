@@ -37,9 +37,14 @@ Assert-Path -Path (Join-Path $StageRoot "web\dist\index.html") -Description "bui
 Assert-Path -Path (Join-Path $StageRoot "python\pyproject.toml") -Description "Python package"
 Assert-Path -Path (Join-Path $StageRoot "docs\Decision_Engine_Plan.md") -Description "Python repo-root sentinel"
 Assert-Path -Path (Join-Path $StageRoot "docker") -Description "Docker runtime assets"
+Assert-Path -Path (Join-Path $StageRoot "config") -Description "runtime config"
 Assert-Path -Path (Join-Path $StageRoot "db\schema.sql") -Description "SQLite schema"
+Assert-Path -Path (Join-Path $StageRoot "scripts\docker-compose.ps1") -Description "runtime scripts"
 Assert-Path -Path (Join-Path $StageRoot "Bootstrap-CueMate.ps1") -Description "bootstrap script"
 Assert-Path -Path (Join-Path $StageRoot "Start-CueMate.ps1") -Description "launcher script"
+Assert-Path -Path (Join-Path $StageRoot ".env.example") -Description "environment example"
+Assert-Path -Path (Join-Path $StageRoot "README.md") -Description "user README"
+Assert-Path -Path (Join-Path $StageRoot "VERSION") -Description "runtime version file"
 
 Assert-PowerShellParses -Path (Join-Path $StageRoot "Bootstrap-CueMate.ps1")
 Assert-PowerShellParses -Path (Join-Path $StageRoot "Start-CueMate.ps1")

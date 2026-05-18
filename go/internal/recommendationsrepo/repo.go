@@ -40,6 +40,26 @@ type PlaylistSummary struct {
 	FeedbackLastTunedAt *string
 }
 
+type AnalysisJobCounts struct {
+	Pending   int
+	Running   int
+	Completed int
+	Failed    int
+}
+
+type PlaylistAnalysisStatus struct {
+	PlaylistID      string
+	PlaylistName    string
+	TotalTracks     int
+	ReadyTracks     int
+	Counts          AnalysisJobCounts
+	IsStale         bool
+	StaleReason     string
+	LatestError     *string
+	PercentComplete int
+	NextAction      string
+}
+
 type TrackContextRecord struct {
 	TrackID                   string
 	FilePath                  string
@@ -299,6 +319,10 @@ func (r *Repository) Close() error {
 	return r.db.Close()
 }
 
+func (r *Repository) DB() *sql.DB {
+	return r.db
+}
+
 func (r *Repository) RunInTx(ctx context.Context, fn func(*sql.Tx) error) error {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -388,6 +412,129 @@ func (r *Repository) ListPlaylists(ctx context.Context) ([]PlaylistSummary, erro
 		out = append(out, item)
 	}
 	return out, rows.Err()
+}
+
+func (r *Repository) GetPlaylistAnalysisStatus(ctx context.Context, playlistID string) (PlaylistAnalysisStatus, error) {
+	playlist, err := r.ResolvePlaylist(ctx, playlistID, "")
+	if err != nil {
+		return PlaylistAnalysisStatus{}, err
+	}
+	tracks, err := r.GetPlaylistSnapshotTracks(ctx, playlist.ID)
+	if err != nil {
+		return PlaylistAnalysisStatus{}, err
+	}
+	status := PlaylistAnalysisStatus{
+		PlaylistID:   playlist.ID,
+		PlaylistName: playlist.Name,
+		TotalTracks:  len(tracks),
+		NextAction:   "none",
+	}
+	for _, track := range tracks {
+		if track.AnalysisState == "ready" {
+			status.ReadyTracks++
+		}
+	}
+	stats, err := r.GetPlaylistStats(ctx, playlist.ID)
+	if err != nil {
+		return PlaylistAnalysisStatus{}, err
+	}
+	if stats != nil {
+		status.IsStale = stats.IsStale
+		status.StaleReason = stats.StaleReason
+	}
+	var latestError sql.NullString
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT status, COUNT(*)
+		FROM analysis_jobs
+		WHERE playlist_id = ?
+		GROUP BY status
+	`, playlist.ID)
+	if err != nil {
+		return PlaylistAnalysisStatus{}, err
+	}
+	for rows.Next() {
+		var jobStatus string
+		var count int
+		if err := rows.Scan(&jobStatus, &count); err != nil {
+			_ = rows.Close()
+			return PlaylistAnalysisStatus{}, err
+		}
+		switch jobStatus {
+		case "pending":
+			status.Counts.Pending = count
+		case "running":
+			status.Counts.Running = count
+		case "completed":
+			status.Counts.Completed = count
+		case "failed":
+			status.Counts.Failed = count
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return PlaylistAnalysisStatus{}, err
+	}
+	if err := r.db.QueryRowContext(ctx, `
+		SELECT error_message
+		FROM analysis_jobs
+		WHERE playlist_id = ? AND status = 'failed' AND error_message IS NOT NULL
+		ORDER BY completed_at DESC, started_at DESC, created_at DESC, id DESC
+		LIMIT 1
+	`, playlist.ID).Scan(&latestError); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return PlaylistAnalysisStatus{}, err
+	}
+	if latestError.Valid {
+		status.LatestError = &latestError.String
+	}
+	if status.TotalTracks > 0 {
+		status.PercentComplete = int(float64(status.ReadyTracks) / float64(status.TotalTracks) * 100)
+	}
+	switch {
+	case status.Counts.Failed > 0:
+		status.NextAction = "inspect_failures"
+	case status.Counts.Running > 0 || status.Counts.Pending > 0:
+		status.NextAction = "run_worker"
+	case status.IsStale || status.ReadyTracks < status.TotalTracks:
+		status.NextAction = "smart_refresh"
+	default:
+		status.NextAction = "none"
+	}
+	return status, nil
+}
+
+func (r *Repository) DeletePlaylist(ctx context.Context, playlistID string) error {
+	playlist, err := r.ResolvePlaylist(ctx, playlistID, "")
+	if err != nil {
+		return err
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if tx != nil {
+			_ = tx.Rollback()
+		}
+	}()
+	for _, statement := range []string{
+		`DELETE FROM recommendation_event_items WHERE event_id IN (SELECT id FROM recommendation_events WHERE playlist_id = ?)`,
+		`DELETE FROM feedback_tuning_jobs WHERE playlist_id = ?`,
+		`DELETE FROM recommendation_events WHERE playlist_id = ?`,
+		`DELETE FROM playlist_sync_state WHERE playlist_id = ?`,
+		`DELETE FROM track_features_rel WHERE playlist_id = ?`,
+		`DELETE FROM playlist_stats WHERE playlist_id = ?`,
+		`DELETE FROM analysis_jobs WHERE playlist_id = ?`,
+		`DELETE FROM playlist_tracks WHERE playlist_id = ?`,
+		`DELETE FROM playlists WHERE id = ?`,
+	} {
+		if _, err := tx.ExecContext(ctx, statement, playlist.ID); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	tx = nil
+	return nil
 }
 
 func (r *Repository) HydrateRecommendations(

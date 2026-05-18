@@ -17,6 +17,7 @@ $remoteConfigPath = Join-Path $AppDataRoot "remote.json"
 $apiUrl = "http://127.0.0.1:8080"
 
 New-Item -ItemType Directory -Force -Path $dataDir, $logDir | Out-Null
+Start-Transcript -Path (Join-Path $logDir "launcher.log") -Append | Out-Null
 
 function Get-FixedDriveLetters {
     $letters = Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" |
@@ -193,6 +194,9 @@ function Start-LoggedProcess {
 
     $stdout = Join-Path $logDir "$Name.out.log"
     $stderr = Join-Path $logDir "$Name.err.log"
+    if (-not (Test-Path $FilePath -PathType Leaf)) {
+        throw "Cannot start $Name because $FilePath is missing. Reinstall CueMate or rerun setup."
+    }
     Start-Process -FilePath $FilePath `
         -ArgumentList $Arguments `
         -WorkingDirectory $WorkingDirectory `
@@ -209,40 +213,48 @@ function Ensure-BootstrapComplete {
     if (-not (Test-Path $bootstrap -PathType Leaf)) {
         throw "CueMate bootstrap script is missing at $bootstrap"
     }
+    Write-Host "CueMate needs to finish first-time setup. Logs are in $logDir."
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $bootstrap -InstallDir $InstallDir -AppDataRoot $AppDataRoot
     if ($LASTEXITCODE -ne 0) {
-        throw "CueMate bootstrap failed. See logs in $logDir."
+        throw "CueMate setup could not finish. Check bootstrap.log in $logDir, fix any Python/Docker prompt, then launch CueMate again."
     }
     if ((-not (Test-Path $venvPython -PathType Leaf)) -or (-not (Test-Path $databasePath -PathType Leaf))) {
         throw "CueMate core setup is not ready yet. Finish any required prerequisite prompts, then launch CueMate again. See logs in $logDir."
     }
 }
 
-Set-CueMateEnvironment
-Ensure-BootstrapComplete
-Set-CueMateEnvironment
-Ensure-TailscaleServe
-Set-CueMateEnvironment
-
-Push-Location $InstallDir
 try {
-    if (-not (Test-TcpPort -HostName "127.0.0.1" -Port 47834)) {
-        Start-LoggedProcess -Name "scorer" -FilePath $venvPython -Arguments @("-m", "cuemate_analysis", "serve-scoring", "--host", "127.0.0.1", "--port", "47834")
-        Wait-Until -Predicate { Test-TcpPort -HostName "127.0.0.1" -Port 47834 } -TimeoutSeconds 45 -Description "CueMate scorer" | Out-Null
-    }
+    Set-CueMateEnvironment
+    Ensure-BootstrapComplete
+    Set-CueMateEnvironment
+    Ensure-TailscaleServe
+    Set-CueMateEnvironment
 
-    if (-not (Test-HttpOk -Url "$apiUrl/healthz")) {
-        $apiExe = Join-Path $InstallDir "apiserver.exe"
-        if (-not (Test-Path $apiExe -PathType Leaf)) {
-            throw "CueMate API executable is missing at $apiExe"
+    Push-Location $InstallDir
+    try {
+        if (-not (Test-TcpPort -HostName "127.0.0.1" -Port 47834)) {
+            Write-Host "Starting CueMate scorer..."
+            Start-LoggedProcess -Name "scorer" -FilePath $venvPython -Arguments @("-m", "cuemate_analysis", "serve-scoring", "--host", "127.0.0.1", "--port", "47834")
+            Wait-Until -Predicate { Test-TcpPort -HostName "127.0.0.1" -Port 47834 } -TimeoutSeconds 45 -Description "CueMate scorer" | Out-Null
         }
-        Start-LoggedProcess -Name "apiserver" -FilePath $apiExe -Arguments @()
-        Wait-Until -Predicate { Test-HttpOk -Url "$apiUrl/healthz" } -TimeoutSeconds 45 -Description "CueMate API" | Out-Null
-    }
 
-    if (-not $NoBrowser) {
-        Start-Process $apiUrl | Out-Null
+        if (-not (Test-HttpOk -Url "$apiUrl/healthz")) {
+            Write-Host "Starting CueMate API..."
+            $apiExe = Join-Path $InstallDir "apiserver.exe"
+            if (-not (Test-Path $apiExe -PathType Leaf)) {
+                throw "CueMate API executable is missing at $apiExe"
+            }
+            Start-LoggedProcess -Name "apiserver" -FilePath $apiExe -Arguments @()
+            Wait-Until -Predicate { Test-HttpOk -Url "$apiUrl/healthz" } -TimeoutSeconds 45 -Description "CueMate API" | Out-Null
+        }
+
+        if (-not $NoBrowser) {
+            Write-Host "Opening CueMate at $apiUrl"
+            Start-Process $apiUrl | Out-Null
+        }
+    } finally {
+        Pop-Location
     }
 } finally {
-    Pop-Location
+    Stop-Transcript | Out-Null
 }

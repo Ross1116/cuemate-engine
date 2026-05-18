@@ -1123,6 +1123,101 @@ func TestRemoteAccessBlocksAdminRoutesEvenWithSession(t *testing.T) {
 	}
 }
 
+func TestPlaylistAnalysisStatusSummarizesJobs(t *testing.T) {
+	srv := newTestServer(t, true, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+	if _, err := srv.repo.DB().Exec(`INSERT INTO analysis_jobs (playlist_id, track_id, track_path, status, priority, analysis_mode, analysis_signature, config_signature, created_at, error_message, job_kind) VALUES
+		('pl_1', 'trk_current', '/music/current.flac', 'pending', 1, 'staged', 'm1-ebd25381ebad', 'default', '2026-04-09T00:00:00Z', NULL, 'full'),
+		('pl_1', 'trk_candidate', '/music/candidate.flac', 'running', 1, 'staged', 'm1-ebd25381ebad', 'default', '2026-04-09T00:00:01Z', NULL, 'full'),
+		('pl_1', 'trk_history', '/music/history.flac', 'failed', 1, 'staged', 'm1-ebd25381ebad', 'default', '2026-04-09T00:00:02Z', 'model unavailable', 'full')`); err != nil {
+		t.Fatalf("insert jobs: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/playlists/pl_1/analysis/status", nil)
+	srv.handlePlaylistAnalysisStatus(rec, req, "pl_1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	jobs := payload["jobs"].(map[string]any)
+	if payload["next_action"] != "inspect_failures" || jobs["pending"].(float64) != 1 || jobs["running"].(float64) != 1 || jobs["failed"].(float64) != 1 {
+		t.Fatalf("payload = %#v", payload)
+	}
+}
+
+func TestPlaylistAnalysisRefreshQueuesSmartAndForce(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/playlists/pl_1/analysis/refresh", bytes.NewBufferString(`{"analysis_mode":"staged"}`))
+	srv.handlePlaylistAnalysisRefresh(rec, req, "pl_1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("smart status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var smart map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &smart); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	if smart["queued_count"].(float64) != 0 {
+		t.Fatalf("smart queued = %#v", smart)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/playlists/pl_1/analysis/refresh", bytes.NewBufferString(`{"analysis_mode":"staged","force":true}`))
+	srv.handlePlaylistAnalysisRefresh(rec, req, "pl_1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("force status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var force map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &force); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	if force["queued_count"].(float64) != 3 {
+		t.Fatalf("force queued = %#v", force)
+	}
+}
+
+func TestDeletePlaylistRemovesAppStateButKeepsTracks(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, "/playlists/pl_1", nil)
+	srv.handlePlaylistRoutes(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("delete status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var playlistCount, trackCount int
+	if err := srv.repo.DB().QueryRow(`SELECT COUNT(*) FROM playlists WHERE id = 'pl_1'`).Scan(&playlistCount); err != nil {
+		t.Fatalf("playlist count: %v", err)
+	}
+	if err := srv.repo.DB().QueryRow(`SELECT COUNT(*) FROM tracks`).Scan(&trackCount); err != nil {
+		t.Fatalf("track count: %v", err)
+	}
+	if playlistCount != 0 || trackCount != 3 {
+		t.Fatalf("playlistCount=%d trackCount=%d", playlistCount, trackCount)
+	}
+}
+
+func TestToolRunRejectsUnknownAndUnsafeIDs(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+	for _, path := range []string{"/tools/runs/missing", "/tools/runs/..%2Fsecret"} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		srv.handleToolRun(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("%s status = %d body=%s", path, rec.Code, rec.Body.String())
+		}
+	}
+}
+
 func TestSetupStatusReadsInstallerState(t *testing.T) {
 	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
 		metadataResp: fakeMetadata("rel_sig_current"),

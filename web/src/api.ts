@@ -151,6 +151,24 @@ export type AnalysisJob = {
   completed_at: string | null;
 };
 
+export type PlaylistAnalysisStatus = {
+  playlist_id: string;
+  playlist_name: string;
+  total_tracks: number;
+  ready_tracks: number;
+  percent_complete: number;
+  is_stale: boolean;
+  stale_reason: string | null;
+  latest_error: string | null;
+  next_action: "none" | "smart_refresh" | "run_worker" | "inspect_failures" | string;
+  jobs: {
+    pending: number;
+    running: number;
+    completed: number;
+    failed: number;
+  };
+};
+
 export type ToolCommandRequest = {
   action: string;
   name?: string;
@@ -166,6 +184,7 @@ export type ToolCommandRequest = {
 };
 
 export type ToolCommandResult = {
+  run_id?: string;
   status: string;
   mode: "foreground" | "background";
   command: string[];
@@ -173,6 +192,18 @@ export type ToolCommandResult = {
   output?: string;
   pid?: number;
   log_path?: string;
+};
+
+export type ToolRunStatus = {
+  run_id: string;
+  status: "running" | "completed" | "failed" | "unknown" | string;
+  command: string[];
+  pid?: number;
+  log_path?: string;
+  started_at?: string;
+  finished_at?: string;
+  error?: string;
+  output_tail?: string;
 };
 
 export type PickPathRequest = {
@@ -271,6 +302,18 @@ export const api = {
     ),
   trackFeatures: (playlistId: string, trackId: string) =>
     request<TrackFeatureDetail>(`/playlists/${encodeURIComponent(playlistId)}/tracks/${encodeURIComponent(trackId)}/features`),
+  playlistAnalysisStatus: (playlistId: string) =>
+    request<PlaylistAnalysisStatus>(`/playlists/${encodeURIComponent(playlistId)}/analysis/status`),
+  refreshPlaylistAnalysis: (playlistId: string, body?: { force?: boolean; analysis_mode?: "fast_pass" | "staged" | "full" }) =>
+    request<{ playlist_id: string; queued_count: number; status: PlaylistAnalysisStatus }>(
+      `/playlists/${encodeURIComponent(playlistId)}/analysis/refresh`,
+      {
+        method: "POST",
+        body: JSON.stringify(body ?? {}),
+      },
+    ),
+  removePlaylist: (playlistId: string) =>
+    request<{ removed: boolean; playlist_id: string }>(`/playlists/${encodeURIComponent(playlistId)}`, { method: "DELETE" }),
   trackSearch: (playlistId: string, query: string) =>
     request<{ items: Track[] }>(
       `/tracks/search?playlist_id=${encodeURIComponent(playlistId)}&query=${encodeURIComponent(query)}&limit=50`,
@@ -335,6 +378,7 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     }),
+  toolRun: (runId: string) => request<ToolRunStatus>(`/tools/runs/${encodeURIComponent(runId)}`),
   pickPath: (body: PickPathRequest) =>
     request<PickPathResult>("/tools/pick-path", {
       method: "POST",

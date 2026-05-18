@@ -19,13 +19,24 @@ import {
   RefreshCw,
   Search,
   Settings,
-  SlidersHorizontal,
   Sparkles,
   TerminalSquare,
-  Waves,
 } from "lucide-react";
 import { Bar, BarChart, LabelList, ResponsiveContainer, XAxis, YAxis } from "recharts";
-import { api, FeedbackSummary, LaneItem, PickPathRequest, Playlist, RecommendationResponse, SetupStatus, ToolCommandRequest, ToolCommandResult, Track } from "./api";
+import {
+  api,
+  FeedbackSummary,
+  LaneItem,
+  PickPathRequest,
+  Playlist,
+  PlaylistAnalysisStatus,
+  RecommendationResponse,
+  SetupStatus,
+  ToolCommandRequest,
+  ToolCommandResult,
+  ToolRunStatus,
+  Track,
+} from "./api";
 
 const targets = ["maintain", "build", "reset", "jump", "contrast"];
 
@@ -203,6 +214,24 @@ function pillClass(value?: string | null) {
   return "pill";
 }
 
+function operationStartedMessage(action: string) {
+  switch (action) {
+    case "import_playlist":
+    case "import_dj_playlist":
+      return "Import started...";
+    case "analyze_playlist":
+      return "Analysis started...";
+    case "run_analysis_worker":
+      return "Worker running...";
+    case "download_essentia_models":
+      return "Downloading models...";
+    case "prewarm_model_services":
+      return "Prewarming model services...";
+    default:
+      return "Working...";
+  }
+}
+
 export function App() {
   const queryClient = useQueryClient();
   const [selectedPlaylistId, setSelectedPlaylistId] = useState<string>(() => localStorage.getItem("cuemate.playlist") ?? "");
@@ -217,6 +246,8 @@ export function App() {
   const [remotePairUrl, setRemotePairUrl] = useState("");
   const [remotePairExpiresAt, setRemotePairExpiresAt] = useState("");
   const [remotePairQr, setRemotePairQr] = useState("");
+  const [operationMessage, setOperationMessage] = useState("");
+  const [activeRunId, setActiveRunId] = useState("");
   const consumedPairTokenRef = useRef("");
 
   const health = useQuery({ queryKey: ["health"], queryFn: api.health, refetchInterval: 15_000 });
@@ -232,7 +263,25 @@ export function App() {
   const jobs = useQuery({
     queryKey: ["jobs", selectedPlaylistId],
     queryFn: () => api.jobs(selectedPlaylistId || undefined),
-    refetchInterval: 20_000,
+    refetchInterval: (query) => {
+      const items = query.state.data?.items ?? [];
+      return items.some((job) => job.status === "pending" || job.status === "running") ? 3_000 : 20_000;
+    },
+  });
+  const analysisStatus = useQuery({
+    queryKey: ["analysisStatus", selectedPlaylistId],
+    queryFn: () => api.playlistAnalysisStatus(selectedPlaylistId),
+    enabled: !!selectedPlaylistId,
+    refetchInterval: (query) => {
+      const status = query.state.data;
+      return status && (status.jobs.pending > 0 || status.jobs.running > 0) ? 3_000 : 15_000;
+    },
+  });
+  const activeToolRun = useQuery({
+    queryKey: ["toolRun", activeRunId],
+    queryFn: () => api.toolRun(activeRunId),
+    enabled: !!activeRunId,
+    refetchInterval: (query) => (query.state.data?.status === "running" ? 2_000 : false),
   });
   const feedback = useQuery({
     queryKey: ["feedback", selectedPlaylistId],
@@ -272,12 +321,44 @@ export function App() {
     },
   });
 
-  const enqueueMutation = useMutation({
-    mutationFn: () => api.enqueueAnalysis(selectedPlaylistId, true),
-    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["jobs"] }),
+  const refreshMutation = useMutation({
+    mutationFn: (body?: { force?: boolean; analysis_mode?: "fast_pass" | "staged" | "full" }) =>
+      api.refreshPlaylistAnalysis(selectedPlaylistId, body),
+    onMutate: (body) => setOperationMessage(body?.force ? "Force reanalysis queued..." : "Smart refresh queued..."),
+    onSuccess: (result) => {
+      setOperationMessage(result.queued_count ? `${result.queued_count} analysis job${result.queued_count === 1 ? "" : "s"} queued.` : "Playlist is already up to date.");
+      void queryClient.invalidateQueries({ queryKey: ["jobs"] });
+      void queryClient.invalidateQueries({ queryKey: ["analysisStatus"] });
+      void queryClient.invalidateQueries({ queryKey: ["playlists"] });
+    },
+    onError: (error) => setOperationMessage(`Failed: ${error instanceof Error ? error.message : "analysis refresh failed"}`),
+  });
+  const removePlaylistMutation = useMutation({
+    mutationFn: (playlistId: string) => api.removePlaylist(playlistId),
+    onMutate: () => setOperationMessage("Removing playlist from CueMate..."),
+    onSuccess: (result) => {
+      setOperationMessage("Playlist removed from CueMate. Your music files were not touched.");
+      queryClient.setQueryData<{ items: Playlist[] }>(["playlists"], (current) =>
+        current ? { items: current.items.filter((item) => item.playlist_id !== result.playlist_id) } : current,
+      );
+      if (selectedPlaylistId === result.playlist_id) {
+        setSelectedPlaylistId("");
+        setCurrentTrackId("");
+        setHistory([]);
+        localStorage.removeItem("cuemate.playlist");
+        localStorage.removeItem("cuemate.current");
+        localStorage.removeItem("cuemate.history");
+      }
+      void queryClient.invalidateQueries({ queryKey: ["playlists"] });
+      void queryClient.invalidateQueries({ queryKey: ["playlistTracks"] });
+      void queryClient.invalidateQueries({ queryKey: ["recommendations"] });
+      void queryClient.invalidateQueries({ queryKey: ["feedback"] });
+      void queryClient.invalidateQueries({ queryKey: ["jobs"] });
+      void queryClient.invalidateQueries({ queryKey: ["analysisStatus"] });
+    },
+    onError: (error) => setOperationMessage(`Remove failed: ${error instanceof Error ? error.message : "unknown error"}`),
   });
 
-  const snapshotMutation = useMutation({ mutationFn: () => api.snapshot(selectedPlaylistId) });
   const remotePairMutation = useMutation({
     mutationFn: () => api.remotePairingToken(),
     onSuccess: async (result) => {
@@ -298,19 +379,18 @@ export function App() {
     },
   });
 
-  const correctionMutation = useMutation({
-    mutationFn: (payload: { field: "bpm" | "key"; new_value: number | string }) =>
-      api.correction({ track_id: currentTrackId, ...payload }),
-    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["jobs"] }),
-  });
-
   const toolMutation = useMutation({
     mutationFn: (payload: ToolCommandRequest) => api.toolCommand(payload),
+    onMutate: (payload) => setOperationMessage(operationStartedMessage(payload.action)),
     onSuccess: (result) => {
       setLastToolResult(result);
+      if (result.run_id) setActiveRunId(result.run_id);
+      setOperationMessage(result.mode === "background" ? "Started. Progress will update below." : "Completed.");
       void queryClient.invalidateQueries({ queryKey: ["playlists"] });
       void queryClient.invalidateQueries({ queryKey: ["jobs"] });
+      void queryClient.invalidateQueries({ queryKey: ["analysisStatus"] });
     },
+    onError: (error) => setOperationMessage(`Failed: ${error instanceof Error ? error.message : "tool command failed"}`),
   });
 
   useEffect(() => {
@@ -379,33 +459,57 @@ export function App() {
         </div>
       ) : null}
       <SetupStatusBanner status={setupStatus.data} />
+      <OperationBanner message={operationMessage} run={activeToolRun.data} />
 
       <aside className="library-pane panel mobile-library">
         <PaneTitle icon={<Library />} title="Library" action={`${playlists.data?.items.length ?? 0} playlists`} />
-        <PlaylistList
-          playlists={playlists.data?.items ?? []}
-          selectedId={selectedPlaylistId}
-          onSelect={(id) => {
-            setSelectedPlaylistId(id);
-            localStorage.setItem("cuemate.playlist", id);
-            setCurrentTrackId("");
-            setHistory([]);
-            localStorage.removeItem("cuemate.current");
-            localStorage.removeItem("cuemate.history");
-          }}
-        />
+        {playlists.isLoading ? (
+          <SkeletonRows count={4} />
+        ) : (playlists.data?.items.length ?? 0) === 0 ? (
+          <div className="empty-library">
+            <strong>No playlists yet</strong>
+            <span>Import local files or a DJ library from Full Mode to get started.</span>
+            <button
+              className="wide-action secondary"
+              onClick={() => {
+                setWorkMode("full");
+                setMobileTab("admin");
+                localStorage.setItem("cuemate.mode", "full");
+              }}
+            >
+              Open import tools
+            </button>
+          </div>
+        ) : (
+          <PlaylistList
+            playlists={playlists.data?.items ?? []}
+            selectedId={selectedPlaylistId}
+            onSelect={(id) => {
+              setSelectedPlaylistId(id);
+              localStorage.setItem("cuemate.playlist", id);
+              setCurrentTrackId("");
+              setHistory([]);
+              localStorage.removeItem("cuemate.current");
+              localStorage.removeItem("cuemate.history");
+            }}
+          />
+        )}
         <div className="searchbox">
           <Search size={16} />
           <input value={trackQuery} onChange={(event) => setTrackQuery(event.target.value)} placeholder="Search tracks" />
         </div>
-        <TrackList
-          tracks={tracks.data?.items ?? []}
-          currentTrackId={currentTrackId}
-          onSelect={(track) => {
-            setCurrentTrackId(track.track_id);
-            localStorage.setItem("cuemate.current", track.track_id);
-          }}
-        />
+        {tracks.isLoading ? (
+          <SkeletonRows count={6} />
+        ) : (
+          <TrackList
+            tracks={tracks.data?.items ?? []}
+            currentTrackId={currentTrackId}
+            onSelect={(track) => {
+              setCurrentTrackId(track.track_id);
+              localStorage.setItem("cuemate.current", track.track_id);
+            }}
+          />
+        )}
       </aside>
 
       <main className="recommend-pane mobile-recommend">
@@ -484,19 +588,21 @@ export function App() {
             playlist={selectedPlaylist}
             candidate={selectedCandidate}
             playlistId={selectedPlaylist?.playlist_id}
-            playlists={playlists.data?.items ?? []}
             jobs={jobs.data?.items ?? []}
-            onQueue={() => enqueueMutation.mutate()}
-            queueBusy={enqueueMutation.isPending}
-            queueResult={enqueueMutation.data?.queued_count}
-            onSnapshot={() => snapshotMutation.mutate()}
-            snapshotBusy={snapshotMutation.isPending}
-            onCorrection={(field, value) => correctionMutation.mutate({ field, new_value: value })}
-            correctionBusy={correctionMutation.isPending}
+            analysisStatus={analysisStatus.data}
+            analysisStatusLoading={analysisStatus.isLoading}
+            onSmartRefresh={() => refreshMutation.mutate({ analysis_mode: "staged" })}
+            onForceRefresh={() => refreshMutation.mutate({ analysis_mode: "staged", force: true })}
+            queueBusy={refreshMutation.isPending}
+            queueResult={refreshMutation.data?.queued_count}
+            onRemovePlaylist={(id) => removePlaylistMutation.mutate(id)}
+            removeBusy={removePlaylistMutation.isPending}
+            onRunWorker={() => toolMutation.mutate({ action: "run_analysis_worker", limit: 25 })}
             onTool={(payload) => toolMutation.mutate(payload)}
             toolBusy={toolMutation.isPending}
             toolResult={lastToolResult}
             toolError={toolMutation.error}
+            toolRun={activeToolRun.data}
             setupStatus={setupStatus.data}
             remoteStatus={remoteStatus.data}
             remoteStatusLoading={remoteStatus.isLoading}
@@ -554,6 +660,24 @@ function SetupStatusBanner({ status }: { status?: SetupStatus }) {
   );
 }
 
+function OperationBanner({ message, run }: { message: string; run?: ToolRunStatus }) {
+  const runMessage =
+    run?.status === "running"
+      ? "Background tool is running."
+      : run?.status === "completed"
+        ? "Background tool finished."
+        : run?.status === "failed"
+          ? `Background tool failed${run.error ? `: ${run.error}` : "."}`
+          : "";
+  if (!message && !runMessage) return null;
+  return (
+    <div className={run?.status === "failed" ? "operation-banner danger" : "operation-banner"}>
+      <span>{runMessage || message}</span>
+      {run?.log_path ? <small>Log: {run.log_path}</small> : null}
+    </div>
+  );
+}
+
 function PaneTitle({ icon, title, action }: { icon: React.ReactNode; title: string; action?: string }) {
   return (
     <div className="pane-title">
@@ -576,6 +700,16 @@ function PlaylistList({ playlists, selectedId, onSelect }: { playlists: Playlist
             {playlist.track_count_analyzed}/{playlist.track_count} ready
           </small>
         </button>
+      ))}
+    </div>
+  );
+}
+
+function SkeletonRows({ count }: { count: number }) {
+  return (
+    <div className="skeleton-list" aria-label="Loading">
+      {Array.from({ length: count }).map((_, index) => (
+        <span key={index} />
       ))}
     </div>
   );
@@ -1514,19 +1648,21 @@ function FullToolsPanel({
   playlist,
   candidate,
   playlistId,
-  playlists,
   jobs,
-  onQueue,
+  analysisStatus,
+  analysisStatusLoading,
+  onSmartRefresh,
+  onForceRefresh,
   queueBusy,
   queueResult,
-  onSnapshot,
-  snapshotBusy,
-  onCorrection,
-  correctionBusy,
+  onRemovePlaylist,
+  removeBusy,
+  onRunWorker,
   onTool,
   toolBusy,
   toolResult,
   toolError,
+  toolRun,
   setupStatus,
   remoteStatus,
   remoteStatusLoading,
@@ -1540,19 +1676,21 @@ function FullToolsPanel({
   playlist?: Playlist;
   candidate: LaneItem | null;
   playlistId?: string;
-  playlists: Playlist[];
   jobs: { id: number; status: string; track_id: string | null; created_at: string; error_message: string | null }[];
-  onQueue: () => void;
+  analysisStatus?: PlaylistAnalysisStatus;
+  analysisStatusLoading: boolean;
+  onSmartRefresh: () => void;
+  onForceRefresh: () => void;
   queueBusy: boolean;
   queueResult?: number;
-  onSnapshot: () => void;
-  snapshotBusy: boolean;
-  onCorrection: (field: "bpm" | "key", value: string | number) => void;
-  correctionBusy: boolean;
+  onRemovePlaylist: (playlistId: string) => void;
+  removeBusy: boolean;
+  onRunWorker: () => void;
   onTool: (payload: ToolCommandRequest) => void;
   toolBusy: boolean;
   toolResult: ToolCommandResult | null;
   toolError: Error | null;
+  toolRun?: ToolRunStatus;
   setupStatus?: SetupStatus;
   remoteStatus?: { enabled: boolean; remote_url: string | null; paired: boolean; request_local: boolean };
   remoteStatusLoading: boolean;
@@ -1569,23 +1707,12 @@ function FullToolsPanel({
   const [djLibrary, setDjLibrary] = useState("");
   const [djPlaylist, setDjPlaylist] = useState("");
   const [djName, setDjName] = useState("");
-  const [analysisPlaylist, setAnalysisPlaylist] = useState(() => playlist?.name ?? "");
-  const [analysisMode, setAnalysisMode] = useState<"fast_pass" | "staged" | "full">("staged");
-  const [forceAnalysis, setForceAnalysis] = useState(false);
-  const [workerLimit, setWorkerLimit] = useState("25");
-  const [warmupPath, setWarmupPath] = useState("");
   const pickPathMutation = useMutation({ mutationFn: api.pickPath });
 
-  useEffect(() => {
-    if (!analysisPlaylist && playlist?.name) setAnalysisPlaylist(playlist.name);
-  }, [analysisPlaylist, playlist?.name]);
-
-  const selectedAnalysisName = analysisPlaylist || playlist?.name || "";
   const localPathList = localPaths
     .split(/\r?\n/)
     .map((item) => item.trim())
     .filter(Boolean);
-  const parsedLimit = Math.max(1, Number.parseInt(workerLimit, 10) || 25);
   const pickerBusy = pickPathMutation.isPending;
   const pickerError = pickPathMutation.error instanceof Error ? pickPathMutation.error.message : null;
 
@@ -1625,39 +1752,27 @@ function FullToolsPanel({
 
   return (
     <div className="full-tools">
-      <PaneTitle icon={<TerminalSquare />} title="Full Mode" action="library + analysis" />
-      <p className="mode-note">Full mode exposes import, analysis, worker, sync, and correction tools. Live mode keeps only the performance surface.</p>
-      <ToolSection icon={<Radar />} title="Connect phone" description="Generate a short-lived QR link for the mobile web app.">
-        <div className="remote-card">
-          <div>
-            <p className={remoteStatus?.enabled ? "pill cyan" : "pill amber"}>
-              {remoteStatusLoading ? "checking" : remoteStatus?.enabled ? "remote ready" : "remote setup needed"}
-            </p>
-            <p className="muted">
-              {remoteStatus?.remote_url ??
-                "Mobile access requires Tailscale on this PC and your phone. Local CueMate works without it; launch again after signing in to enable QR pairing."}
-            </p>
-            {setupStatus?.available && !setupStatus.mobile_ready ? (
-              <p className="action-note">Tailscale was skipped or is not ready. Install and sign in to Tailscale on both devices to use phone access.</p>
-            ) : null}
-          </div>
-          <button className="wide-action secondary" disabled={!remoteStatus?.enabled || remotePairBusy} onClick={onGenerateRemotePair}>
-            {remotePairBusy ? "Generating..." : "Generate QR"}
-          </button>
-        </div>
-        {remotePairQr ? (
-          <div className="qr-wrap">
-            <img src={remotePairQr} alt="CueMate mobile pairing QR code" />
-            <div>
-              <p className="field-label">Pairing link</p>
-              <p className="muted breakable">{remotePairUrl}</p>
-              <p className="action-note">Expires {remotePairExpiresAt ? new Date(remotePairExpiresAt).toLocaleTimeString() : "soon"}.</p>
-            </div>
-          </div>
-        ) : null}
-        {remotePairError ? <p className="action-note">{remotePairError.message}</p> : null}
-      </ToolSection>
+      <PaneTitle icon={<TerminalSquare />} title="Full Mode" action="setup" />
+      <p className="mode-note">Full Mode starts with the selected song analysis. Playlist setup and imports sit below it when you need maintenance tasks.</p>
+
       <FullCandidateAnalysisPanel candidate={candidate} playlistId={playlistId} />
+
+      <ToolSection icon={<PlayCircle />} title="Playlist Health" description="Refresh stale analysis, run queued work, or remove this playlist from CueMate.">
+        <PlaylistSetupPanel
+          playlist={playlist}
+          status={analysisStatus}
+          loading={analysisStatusLoading}
+          jobs={jobs}
+          queueBusy={queueBusy}
+          queueResult={queueResult}
+          workerBusy={toolBusy}
+          onSmartRefresh={onSmartRefresh}
+          onForceRefresh={onForceRefresh}
+          onRunWorker={onRunWorker}
+          onRemovePlaylist={onRemovePlaylist}
+          removeBusy={removeBusy}
+        />
+      </ToolSection>
 
       <ToolSection icon={<FolderPlus />} title="Import local files" description="Build a CueMate playlist from folders or individual audio files.">
         <div className="field-group">
@@ -1728,83 +1843,151 @@ function FullToolsPanel({
         </div>
       </ToolSection>
 
+      <ToolSection icon={<Radar />} title="Connect phone" description="Generate a short-lived QR link for the mobile web app.">
+        <div className="remote-card">
+          <div>
+            <p className={remoteStatus?.enabled ? "pill cyan" : "pill amber"}>
+              {remoteStatusLoading ? "checking" : remoteStatus?.enabled ? "remote ready" : "remote setup needed"}
+            </p>
+            <p className="muted">
+              {remoteStatus?.remote_url ??
+                "Mobile access requires Tailscale on this PC and your phone. Local CueMate works without it; launch again after signing in to enable QR pairing."}
+            </p>
+            {setupStatus?.available && !setupStatus.mobile_ready ? (
+              <p className="action-note">Tailscale was skipped or is not ready. Install and sign in to Tailscale on both devices to use phone access.</p>
+            ) : null}
+          </div>
+          <button className="wide-action secondary" disabled={!remoteStatus?.enabled || remotePairBusy} onClick={onGenerateRemotePair}>
+            {remotePairBusy ? "Generating..." : "Generate QR"}
+          </button>
+        </div>
+        {remotePairQr ? (
+          <div className="qr-wrap">
+            <img src={remotePairQr} alt="CueMate mobile pairing QR code" />
+            <div>
+              <p className="field-label">Pairing link</p>
+              <p className="muted breakable">{remotePairUrl}</p>
+              <p className="action-note">Expires {remotePairExpiresAt ? new Date(remotePairExpiresAt).toLocaleTimeString() : "soon"}.</p>
+            </div>
+          </div>
+        ) : null}
+        {remotePairError ? <p className="action-note">{remotePairError.message}</p> : null}
+      </ToolSection>
+
       {pickerError ? <div className="tool-result danger">File picker failed: {pickerError}</div> : null}
 
-      <ToolSection icon={<PlayCircle />} title="Analyze and workers" description="Queue feature extraction, run workers, and warm model services.">
-        <div className="field-grid">
-          <div className="field-group">
-            <label className="field-label">Playlist</label>
-            <select value={selectedAnalysisName} onChange={(event) => setAnalysisPlaylist(event.target.value)}>
-              <option value="">Choose playlist</option>
-              {playlists.map((item) => (
-                <option key={item.playlist_id} value={item.name}>
-                  {item.name}
-                </option>
-              ))}
-            </select>
-          </div>
-          <div className="field-group">
-            <label className="field-label">Mode</label>
-            <select value={analysisMode} onChange={(event) => setAnalysisMode(event.target.value as "fast_pass" | "staged" | "full")}>
-              <option value="staged">staged</option>
-              <option value="full">full</option>
-              <option value="fast_pass">fast pass</option>
-            </select>
-          </div>
-        </div>
-        <label className="check-row">
-          <input type="checkbox" checked={forceAnalysis} onChange={(event) => setForceAnalysis(event.target.checked)} />
-          force re-analysis
-        </label>
-        <button
-          className="wide-action"
-          disabled={toolBusy || !selectedAnalysisName}
-          onClick={() => onTool({ action: "analyze_playlist", playlist: selectedAnalysisName, analysis_mode: analysisMode, force: forceAnalysis })}
-        >
-          Run analyze-playlist
-        </button>
-        <button className="wide-action secondary" disabled={!playlist || queueBusy} onClick={onQueue}>
-          <RefreshCw size={16} /> {queueBusy ? "Queueing..." : "Queue staged jobs"}
-        </button>
-        {queueResult != null ? <p className="muted">{queueResult} analysis jobs queued.</p> : null}
-        <div className="inline-inputs">
-          <input value={workerLimit} onChange={(event) => setWorkerLimit(event.target.value)} inputMode="numeric" />
-          <button disabled={toolBusy} onClick={() => onTool({ action: "run_analysis_worker", limit: parsedLimit })}>Run worker</button>
-        </div>
-        <button className="wide-action secondary" disabled={toolBusy} onClick={() => onTool({ action: "run_feedback_worker", limit: parsedLimit })}>
-          Run feedback worker
-        </button>
-        <div className="field-group">
-          <label className="field-label">Warmup audio path</label>
-          <input value={warmupPath} onChange={(event) => setWarmupPath(event.target.value)} placeholder="Optional path" />
-        </div>
-        <div className="split-actions">
-          <button className="wide-action secondary" disabled={toolBusy} onClick={() => onTool({ action: "prewarm_model_services", path: warmupPath || undefined })}>
-            Prewarm
-          </button>
-          <button className="wide-action secondary" disabled={toolBusy} onClick={() => onTool({ action: "download_essentia_models" })}>
-            Models
-          </button>
-        </div>
-      </ToolSection>
-
-      <ToolSection icon={<SlidersHorizontal />} title="Ops" description="Manual corrections, snapshots, and recent analysis queue state.">
-        <OpsPanel
-          playlist={playlist}
-          jobs={jobs}
-          onQueue={onQueue}
-          queueBusy={queueBusy}
-          queueResult={queueResult}
-          onSnapshot={onSnapshot}
-          snapshotBusy={snapshotBusy}
-          onCorrection={onCorrection}
-          correctionBusy={correctionBusy}
-        />
-      </ToolSection>
-
-      <ToolResultBox result={toolResult} error={toolError} busy={toolBusy} />
+      <ToolResultBox result={toolResult} error={toolError} busy={toolBusy} run={toolRun} />
     </div>
   );
+}
+
+function PlaylistSetupPanel({
+  playlist,
+  status,
+  loading,
+  jobs,
+  queueBusy,
+  queueResult,
+  workerBusy,
+  onSmartRefresh,
+  onForceRefresh,
+  onRunWorker,
+  onRemovePlaylist,
+  removeBusy,
+}: {
+  playlist?: Playlist;
+  status?: PlaylistAnalysisStatus;
+  loading: boolean;
+  jobs: { id: number; status: string; track_id: string | null; created_at: string; error_message: string | null }[];
+  queueBusy: boolean;
+  queueResult?: number;
+  workerBusy: boolean;
+  onSmartRefresh: () => void;
+  onForceRefresh: () => void;
+  onRunWorker: () => void;
+  onRemovePlaylist: (playlistId: string) => void;
+  removeBusy: boolean;
+}) {
+  const total = status?.total_tracks ?? playlist?.track_count ?? 0;
+  const ready = status?.ready_tracks ?? playlist?.track_count_analyzed ?? 0;
+  const percent = status?.percent_complete ?? (total ? Math.round((ready / total) * 100) : 0);
+  const stateLabel = setupStateLabel(status, playlist);
+  const latestFailed = jobs.find((job) => job.status === "failed");
+  const confirmRemove = () => {
+    if (!playlist) return;
+    if (window.confirm(`Remove "${playlist.name}" from CueMate? This will not delete any music files.`)) {
+      onRemovePlaylist(playlist.playlist_id);
+    }
+  };
+  return (
+    <div className="playlist-setup-card">
+      {!playlist ? (
+        <div className="empty-state compact">
+          <strong>No playlist selected</strong>
+          <span>Import a playlist or choose one from the library to start analysis.</span>
+        </div>
+      ) : (
+        <>
+          <div className="setup-head">
+            <div>
+              <p className="eyebrow">Selected playlist</p>
+              <h3>{playlist.name}</h3>
+            </div>
+            <span className={pillClass(stateLabel)}>{loading ? "checking" : stateLabel}</span>
+          </div>
+          <div className="progress-row">
+            <div className="progress-track">
+              <span style={{ width: `${Math.max(0, Math.min(100, percent))}%` }} />
+            </div>
+            <strong>{ready}/{total} ready</strong>
+          </div>
+          <div className="metric-grid">
+            <Metric label="Queued" value={(status?.jobs.pending ?? 0).toString()} />
+            <Metric label="Running" value={(status?.jobs.running ?? 0).toString()} />
+            <Metric label="Failed" value={(status?.jobs.failed ?? 0).toString()} />
+          </div>
+          <p className="setup-guidance">{setupGuidance(status, total, ready)}</p>
+          {latestFailed?.error_message || status?.latest_error ? <p className="action-note danger">Latest failure: {latestFailed?.error_message ?? status?.latest_error}</p> : null}
+          <div className="split-actions">
+            <button className="wide-action" disabled={queueBusy} onClick={onSmartRefresh}>
+              <RefreshCw size={16} /> {queueBusy ? "Queueing..." : "Smart refresh playlist"}
+            </button>
+            <button className="wide-action secondary" disabled={queueBusy} onClick={onForceRefresh}>
+              Force reanalyse all tracks
+            </button>
+          </div>
+          <button className="wide-action secondary" disabled={workerBusy} onClick={onRunWorker}>
+            <PlayCircle size={16} /> {workerBusy ? "Worker running..." : "Run analysis worker"}
+          </button>
+          {queueResult != null ? <p className="muted">{queueResult} analysis jobs queued.</p> : null}
+          <button className="wide-action danger" disabled={removeBusy} onClick={confirmRemove}>
+            {removeBusy ? "Removing..." : "Remove playlist from CueMate"}
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
+
+function setupStateLabel(status?: PlaylistAnalysisStatus, playlist?: Playlist) {
+  if (status?.jobs.failed) return "Failed";
+  if (status?.jobs.running) return "Running";
+  if (status?.jobs.pending) return "Queued";
+  if (status?.is_stale || playlist?.is_stale) return "Out of date";
+  const total = status?.total_tracks ?? playlist?.track_count ?? 0;
+  const ready = status?.ready_tracks ?? playlist?.track_count_analyzed ?? 0;
+  if (total > 0 && ready >= total) return "Ready";
+  return "Needs analysis";
+}
+
+function setupGuidance(status: PlaylistAnalysisStatus | undefined, total: number, ready: number) {
+  if (!total) return "Import tracks first. CueMate will analyse them before recommendations become useful.";
+  if (status?.jobs.failed) return "Some analysis jobs failed. Check the tool output below, then try Smart refresh again.";
+  if (status?.jobs.running) return "Analysis is running. This page will update as tracks become ready.";
+  if (status?.jobs.pending) return "Analysis is queued. Run the analysis worker if nothing is moving.";
+  if (status?.is_stale) return `Out of date: ${status.stale_reason || "playlist analysis needs refresh"}. Smart refresh will queue only what changed.`;
+  if (ready < total) return "Some tracks still need analysis. Smart refresh queues only missing or outdated work.";
+  return "Ready. Recommendations can use this playlist now.";
 }
 
 function ToolSection({ icon, title, description, children }: { icon: React.ReactNode; title: string; description?: string; children: React.ReactNode }) {
@@ -1822,76 +2005,18 @@ function ToolSection({ icon, title, description, children }: { icon: React.React
   );
 }
 
-function ToolResultBox({ result, error, busy }: { result: ToolCommandResult | null; error: Error | null; busy: boolean }) {
+function ToolResultBox({ result, error, busy, run }: { result: ToolCommandResult | null; error: Error | null; busy: boolean; run?: ToolRunStatus }) {
   if (busy) return <div className="tool-result">Running tool...</div>;
   if (error) return <div className="tool-result danger">{error.message}</div>;
-  if (!result) return null;
+  if (!result && !run) return null;
   return (
     <div className="tool-result">
-      <strong>{result.mode === "background" ? "Started" : "Completed"}</strong>
-      <small>{result.command.join(" ")}</small>
-      {result.pid ? <span>PID {result.pid}</span> : null}
-      {result.log_path ? <span>Log: {result.log_path}</span> : null}
-      {result.output ? <pre>{result.output}</pre> : null}
-    </div>
-  );
-}
-
-function OpsPanel({
-  playlist,
-  jobs,
-  onQueue,
-  queueBusy,
-  queueResult,
-  onSnapshot,
-  snapshotBusy,
-  onCorrection,
-  correctionBusy,
-}: {
-  playlist?: Playlist;
-  jobs: { id: number; status: string; track_id: string | null; created_at: string; error_message: string | null }[];
-  onQueue: () => void;
-  queueBusy: boolean;
-  queueResult?: number;
-  onSnapshot: () => void;
-  snapshotBusy: boolean;
-  onCorrection: (field: "bpm" | "key", value: string | number) => void;
-  correctionBusy: boolean;
-}) {
-  const [bpm, setBpm] = useState("");
-  const [keyValue, setKeyValue] = useState("");
-  return (
-    <div className="ops">
-      <div className="metric-grid">
-        <Metric label="Ready" value={`${playlist?.track_count_analyzed ?? 0}/${playlist?.track_count ?? 0}`} />
-        <Metric label="Feedback" value={(playlist?.feedback_event_count ?? 0).toString()} />
-      </div>
-      <button className="wide-action" disabled={!playlist || queueBusy} onClick={onQueue}>
-        <RefreshCw size={16} /> {queueBusy ? "Queueing..." : "Queue staged analysis"}
-      </button>
-      {queueResult != null ? <p className="muted">{queueResult} analysis jobs queued.</p> : null}
-      <button className="wide-action secondary" disabled={!playlist || snapshotBusy} onClick={onSnapshot}>
-        <Waves size={16} /> {snapshotBusy ? "Generating..." : "Generate mobile snapshot"}
-      </button>
-      <div className="correction-box">
-        <p className="eyebrow">Manual correction</p>
-        <div className="inline-inputs">
-          <input value={bpm} onChange={(event) => setBpm(event.target.value)} placeholder="BPM" inputMode="decimal" />
-          <button disabled={!bpm || correctionBusy} onClick={() => onCorrection("bpm", Number(bpm))}>Save</button>
-        </div>
-        <div className="inline-inputs">
-          <input value={keyValue} onChange={(event) => setKeyValue(event.target.value)} placeholder="Key e.g. 8A" />
-          <button disabled={!keyValue || correctionBusy} onClick={() => onCorrection("key", keyValue)}>Save</button>
-        </div>
-      </div>
-      <div className="job-list">
-        {jobs.slice(0, 8).map((job) => (
-          <div key={job.id} className="job">
-            <span className={pillClass(job.status)}>{job.status}</span>
-            <small>{job.track_id ?? job.created_at}</small>
-          </div>
-        ))}
-      </div>
+      <strong>{run ? `Tool ${run.status}` : result?.mode === "background" ? "Started" : "Completed"}</strong>
+      {result?.command ? <small>{result.command.join(" ")}</small> : null}
+      {result?.pid ? <span>PID {result.pid}</span> : null}
+      {result?.log_path ? <span>Log: {result.log_path}</span> : null}
+      {result?.output ? <pre>{result.output}</pre> : null}
+      {run?.output_tail ? <pre>{run.output_tail}</pre> : null}
     </div>
   );
 }

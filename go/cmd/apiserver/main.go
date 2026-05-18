@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -174,6 +175,7 @@ func run() int {
 	mux.HandleFunc("/remote/pair", srv.handleRemotePair)
 	mux.HandleFunc("/remote/logout", srv.handleRemoteLogout)
 	mux.HandleFunc("/tools/cli", srv.handleToolCommand)
+	mux.HandleFunc("/tools/runs/", srv.handleToolRun)
 	mux.HandleFunc("/tools/pick-path", srv.handlePickPath)
 	mux.HandleFunc("/", handleWebApp(cfg.WebDist))
 
@@ -465,7 +467,7 @@ func (s *server) handlePlaylistRoutes(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(rest, "/")
 	playlistID := parts[0]
 	switch {
-	case len(parts) == 1 && r.Method == http.MethodGet:
+	case len(parts) == 1 && (r.Method == http.MethodGet || r.Method == http.MethodDelete):
 		s.handlePlaylistDetail(w, r, playlistID)
 	case len(parts) == 2 && parts[1] == "tracks":
 		s.handlePlaylistTracks(w, r, playlistID)
@@ -478,12 +480,32 @@ func (s *server) handlePlaylistRoutes(w http.ResponseWriter, r *http.Request) {
 		s.handleTrackFeatureDetail(w, r, playlistID, trackID)
 	case len(parts) == 3 && parts[1] == "analysis" && parts[2] == "enqueue":
 		s.handlePlaylistAnalysisEnqueue(w, r, playlistID)
+	case len(parts) == 3 && parts[1] == "analysis" && parts[2] == "refresh":
+		s.handlePlaylistAnalysisRefresh(w, r, playlistID)
+	case len(parts) == 3 && parts[1] == "analysis" && parts[2] == "status":
+		s.handlePlaylistAnalysisStatus(w, r, playlistID)
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "playlist route not found"})
 	}
 }
 
 func (s *server) handlePlaylistDetail(w http.ResponseWriter, r *http.Request, playlistID string) {
+	if r.Method == http.MethodDelete {
+		if err := s.repo.DeletePlaylist(r.Context(), playlistID); err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, recommendationsrepo.ErrPlaylistNotFound) {
+				status = http.StatusNotFound
+			}
+			writeJSON(w, status, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"removed": true, "playlist_id": playlistID})
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
 	playlist, err := s.repo.ResolvePlaylist(r.Context(), playlistID, "")
 	if err != nil {
 		status := http.StatusBadRequest
@@ -726,6 +748,53 @@ func (s *server) handlePickPath(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"paths": paths})
 }
 
+func (s *server) handleToolRun(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	runID := strings.Trim(strings.TrimPrefix(r.URL.Path, "/tools/runs/"), "/")
+	if !validRunID(runID) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "tool run not found"})
+		return
+	}
+	metaPath := toolRunMetaPath(runID)
+	data, err := os.ReadFile(metaPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "tool run not found"})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(data, &payload); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "tool run metadata is invalid"})
+		return
+	}
+	logPath, _ := payload["log_path"].(string)
+	tail, err := readToolRunTail(logPath, 16*1024)
+	if err != nil {
+		tail = ""
+	}
+	payload["output_tail"] = tail
+	writeJSON(w, http.StatusOK, payload)
+}
+
+func validRunID(runID string) bool {
+	if runID == "" || len(runID) > 80 {
+		return false
+	}
+	for _, r := range runID {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
 func pickerScript(kind string) (string, error) {
 	switch strings.TrimSpace(kind) {
 	case "folder":
@@ -879,11 +948,13 @@ func buildToolCommand(req toolCommandRequest) ([]string, bool, error) {
 }
 
 func startBackgroundToolCommand(pythonExe string, cliArgs []string) (map[string]any, error) {
-	logDir := filepath.Join("tmp", "tool-runs")
+	runID := uuid.NewString()
+	logDir := toolRunDir()
 	if err := os.MkdirAll(logDir, 0o755); err != nil {
 		return nil, err
 	}
-	logPath := filepath.Join(logDir, fmt.Sprintf("%s.log", time.Now().UTC().Format("20060102T150405.000000000Z")))
+	startedAt := time.Now().UTC().Format(time.RFC3339Nano)
+	logPath := filepath.Join(logDir, runID+".log")
 	logFile, err := os.Create(logPath)
 	if err != nil {
 		return nil, err
@@ -895,19 +966,100 @@ func startBackgroundToolCommand(pythonExe string, cliArgs []string) (map[string]
 		_ = logFile.Close()
 		return nil, err
 	}
+	meta := map[string]any{
+		"run_id":     runID,
+		"status":     "running",
+		"mode":       "background",
+		"pid":        cmd.Process.Pid,
+		"command":    append([]string{pythonExe}, cliArgs...),
+		"log_path":   logPath,
+		"started_at": startedAt,
+	}
+	if err := writeToolRunMeta(runID, meta); err != nil {
+		_ = logFile.Close()
+		return nil, err
+	}
 	go func() {
 		err := cmd.Wait()
+		finishedAt := time.Now().UTC().Format(time.RFC3339Nano)
+		status := "completed"
 		if err != nil {
+			status = "failed"
 			_, _ = fmt.Fprintf(logFile, "\n[cuemate] command failed: %v\n", err)
 		}
 		_ = logFile.Close()
+		meta["status"] = status
+		meta["finished_at"] = finishedAt
+		if err != nil {
+			meta["error"] = err.Error()
+		}
+		_ = writeToolRunMeta(runID, meta)
 	}()
 	return map[string]any{
+		"run_id":   runID,
 		"status":   "started",
 		"mode":     "background",
 		"pid":      cmd.Process.Pid,
 		"log_path": logPath,
 	}, nil
+}
+
+func toolRunDir() string {
+	if logDir := strings.TrimSpace(os.Getenv("CUEMATE_LOG_DIR")); logDir != "" {
+		return filepath.Join(logDir, "tool-runs")
+	}
+	return filepath.Join("tmp", "tool-runs")
+}
+
+func toolRunMetaPath(runID string) string {
+	return filepath.Join(toolRunDir(), runID+".json")
+}
+
+func writeToolRunMeta(runID string, payload map[string]any) error {
+	data, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(toolRunMetaPath(runID), data, 0o644)
+}
+
+func readToolRunTail(logPath string, maxBytes int64) (string, error) {
+	if strings.TrimSpace(logPath) == "" {
+		return "", nil
+	}
+	logDir, err := filepath.Abs(toolRunDir())
+	if err != nil {
+		return "", err
+	}
+	cleanLogPath, err := filepath.Abs(filepath.Clean(logPath))
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(logDir, cleanLogPath)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", errors.New("invalid tool log path")
+	}
+	file, err := os.Open(cleanLogPath)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return "", err
+	}
+	offset := int64(0)
+	if info.Size() > maxBytes {
+		offset = info.Size() - maxBytes
+	}
+	if _, err := file.Seek(offset, 0); err != nil {
+		return "", err
+	}
+	data, err := io.ReadAll(file)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
 }
 
 func pythonExecutable() (string, error) {
@@ -1030,6 +1182,77 @@ func (s *server) handlePlaylistAnalysisEnqueue(w http.ResponseWriter, r *http.Re
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"playlist_id": playlistID, "queued_count": queued})
+}
+
+func (s *server) handlePlaylistAnalysisStatus(w http.ResponseWriter, r *http.Request, playlistID string) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	status, err := s.repo.GetPlaylistAnalysisStatus(r.Context(), playlistID)
+	if err != nil {
+		httpStatus := http.StatusInternalServerError
+		if errors.Is(err, recommendationsrepo.ErrPlaylistNotFound) {
+			httpStatus = http.StatusNotFound
+		}
+		writeJSON(w, httpStatus, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, playlistAnalysisStatusPayload(status))
+}
+
+func (s *server) handlePlaylistAnalysisRefresh(w http.ResponseWriter, r *http.Request, playlistID string) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	var req enqueueAnalysisRequest
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON request"})
+			return
+		}
+	}
+	if !validAnalysisMode(req.AnalysisMode) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "analysis_mode must be fast_pass, staged, or full"})
+		return
+	}
+	if _, err := s.repo.ResolvePlaylist(r.Context(), playlistID, ""); err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, recommendationsrepo.ErrPlaylistNotFound) {
+			status = http.StatusNotFound
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	metadata, err := s.runtime.RefreshMetadata(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": scoringruntime.DescribeUnavailable(err)})
+		return
+	}
+	active := metadata.GetActiveSignatures()
+	queued, err := s.repo.QueuePlaylistAnalysis(
+		r.Context(),
+		playlistID,
+		req.AnalysisMode,
+		req.Force,
+		active.GetAnalysisSignature(),
+		active.GetConfigSignature(),
+	)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	status, err := s.repo.GetPlaylistAnalysisStatus(r.Context(), playlistID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"playlist_id":  playlistID,
+		"queued_count": queued,
+		"status":       playlistAnalysisStatusPayload(status),
+	})
 }
 
 func (s *server) handleRecommendations(w http.ResponseWriter, r *http.Request) {
@@ -2694,6 +2917,26 @@ func playlistTrackPayload(track recommendationsrepo.PlaylistTrackSnapshot) map[s
 		"intensity_band": stringOrNil(track.IntensityBand),
 		"role_hints":     append([]string{}, track.RoleHints...),
 		"analysis_state": track.AnalysisState,
+	}
+}
+
+func playlistAnalysisStatusPayload(status recommendationsrepo.PlaylistAnalysisStatus) map[string]any {
+	return map[string]any{
+		"playlist_id":      status.PlaylistID,
+		"playlist_name":    status.PlaylistName,
+		"total_tracks":     status.TotalTracks,
+		"ready_tracks":     status.ReadyTracks,
+		"percent_complete": status.PercentComplete,
+		"is_stale":         status.IsStale,
+		"stale_reason":     nullIfEmpty(status.StaleReason),
+		"latest_error":     stringOrNil(status.LatestError),
+		"next_action":      status.NextAction,
+		"jobs": map[string]any{
+			"pending":   status.Counts.Pending,
+			"running":   status.Counts.Running,
+			"completed": status.Counts.Completed,
+			"failed":    status.Counts.Failed,
+		},
 	}
 }
 

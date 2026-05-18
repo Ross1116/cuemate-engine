@@ -1,78 +1,111 @@
 # CueMate
 
-CueMate is a local-first DJ recommendation app that helps you choose the next track while you are building a set.
+CueMate is a local DJ recommendation app. It imports your playlists, analyzes your tracks, and helps you pick the next song based on what you are trying to do in the mix: maintain, build, reset, jump, or contrast.
 
-It imports playlists, analyzes tracks, learns the shape of a playlist, and gives transition suggestions grouped by intent: maintain, build, reset, jump, or contrast. It runs on your own machine, keeps your library data local, and can optionally expose the app to your phone through Tailscale for QR-based mobile access.
+It runs on your own computer, stores data locally, and opens in your browser. Optional phone access is available through Tailscale, so you can scan a QR code and use the same CueMate session from your mobile device.
 
-## What It Does
+## Who It Is For
 
-- Imports local folders and DJ library exports from Rekordbox, Traktor, and Serato.
-- Analyzes BPM, key, loudness, bass, energy, groove, danceability, and mood signals.
-- Builds playlist-relative context so recommendations fit the specific set, not just the individual songs.
-- Scores next-track candidates into practical DJ lanes: maintain, build, reset, jump, and contrast.
-- Records played choices and uses feedback to tune playlist-level scoring weights.
-- Runs as a local web app with a Windows installer, desktop/start-menu launcher, and optional phone pairing.
+- DJs who want better next-track suggestions without uploading their library.
+- Bedroom, club, and radio workflows where playlist context matters.
+- Technical reviewers who want to see a local-first product with Go, React, Python, SQLite, gRPC, Docker model services, and Windows packaging.
 
-## Quick Start For Users
+## One-Click Windows Install
 
-### Windows Installer
+Download or build `CueMateSetup.exe`, then double-click it.
 
-Build or download `CueMateSetup.exe`, then run it.
-
-The installer sets up CueMate under:
+The installer puts app files here:
 
 ```text
 %LOCALAPPDATA%\Programs\CueMate
 ```
 
-CueMate stores your local data under:
+CueMate stores your database, logs, Python environment, and setup state here:
 
 ```text
 %LOCALAPPDATA%\CueMate
 ```
 
-After install, open CueMate from the Start Menu or Desktop shortcut. The launcher starts the local services and opens the app in your browser.
+After installation, open **CueMate** from the Start Menu or Desktop shortcut. The launcher starts the local scorer and API, then opens:
 
-### Mobile Access
+```text
+http://127.0.0.1:8080
+```
 
-Mobile access is optional.
+The first launch can take a while because CueMate may install Python, install Docker Desktop, create its private Python environment, build model-service images, and download model assets. If Docker asks you to sign in, update WSL, or restart Windows, finish that prompt and launch CueMate again. Setup resumes from its saved state.
 
-For phone access, install and sign in to Tailscale on both your computer and phone. CueMate will use Tailscale Serve to create a private HTTPS URL, then the app can generate a QR code from **Full Mode -> Connect phone**.
+## First Use
 
-Without Tailscale, CueMate still works locally on your computer. Only phone access is unavailable.
+1. Open CueMate.
+2. Switch to **Full** mode.
+3. Import music from a local folder, audio files, or a DJ library export.
+4. Select a playlist from the Library panel.
+5. Use **Smart refresh playlist** to queue missing or stale analysis.
+6. Run the analysis worker if work is queued and not moving.
+7. Return to the main recommendation view and choose your current track.
+
+CueMate never deletes your audio files. Removing a playlist from CueMate only removes CueMate's local playlist state.
+
+## Phone Access
+
+Phone access is optional. Local desktop use does not need it.
+
+To use CueMate on your phone:
+
+1. Install and sign in to Tailscale on your computer.
+2. Install and sign in to Tailscale on your phone using the same tailnet.
+3. Open CueMate on your computer.
+4. Go to **Full -> Connect phone**.
+5. Scan the QR code.
+
+CueMate uses Tailscale Serve so the app stays private to your tailnet instead of being exposed publicly.
+
+## Troubleshooting
+
+**CueMate opens but analysis is unavailable**
+
+Docker Desktop may not be ready. Open Docker Desktop, finish any login, WSL, update, or restart prompt, then launch CueMate again.
+
+**The installer or launcher says Python is missing**
+
+Install Python 3.12 or rerun CueMate setup with internet access so it can install Python through `winget`. If Python was just installed, close and reopen CueMate so Windows refreshes PATH.
+
+**A playlist looks stale or recommendations are weak**
+
+Open **Full -> Playlist Health** and click **Smart refresh playlist**. This queues only tracks that are missing, stale, or signature-mismatched.
+
+**Where are logs?**
+
+```text
+%LOCALAPPDATA%\CueMate\logs
+```
+
+Useful files include `bootstrap.log`, `launcher.log`, `apiserver.err.log`, `apiserver.out.log`, `scorer.err.log`, and `scorer.out.log`.
+
+**Phone QR is not available**
+
+CueMate still works locally. For mobile access, make sure Tailscale is installed, signed in, and allowed to use Serve on your tailnet.
 
 ## Developer Setup
 
-This repository has three main runtimes:
-
-- `web/`: React/Vite client
-- `go/`: local HTTP API and scoring client
-- `python/`: analysis engine and gRPC scoring service
-
-### Prerequisites
+Prerequisites:
 
 - Windows 10/11 recommended
 - Go 1.24+
 - Python 3.12+
 - Node.js/npm
-- Docker Desktop for model-backed analysis
-- Tailscale for optional mobile access
+- Docker Desktop
+- Tailscale for optional mobile testing
 
-### Install Python Package
+Install dependencies:
 
 ```powershell
+npm --prefix web install
 python -m pip install --user -e ".\python[dev]"
-```
-
-### Initialize Database
-
-```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\dbmate.ps1 up
 ```
 
-### Start Development Services
-
-Terminal 1, scoring service:
+Start the scorer:
 
 ```powershell
 $env:DATABASE_URL="sqlite:data/cuemate.db"
@@ -80,14 +113,13 @@ $env:CUEMATE_INFERENCE_CACHE_PATH="data/inference-cache.db"
 python -m cuemate_analysis serve-scoring --host 127.0.0.1 --port 47834
 ```
 
-Terminal 2, web client:
+Start the web app:
 
 ```powershell
-npm --prefix web install
 npm --prefix web run dev
 ```
 
-Terminal 3, Go API:
+Start the Go API:
 
 ```powershell
 $env:DATABASE_URL="sqlite:data/cuemate.db"
@@ -103,16 +135,9 @@ Open:
 http://127.0.0.1:8080
 ```
 
-For mobile development with Tailscale:
+## Build The Installer
 
-```powershell
-tailscale serve --bg http://127.0.0.1:8080
-$env:CUEMATE_REMOTE_URL="https://your-machine.your-tailnet.ts.net"
-```
-
-Restart the Go API after setting `CUEMATE_REMOTE_URL`.
-
-## Building The Windows Installer
+Build the full Windows installer:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\packaging\windows\build-installer.ps1
@@ -124,60 +149,44 @@ Output:
 dist\windows-installer\output\CueMateSetup.exe
 ```
 
-The build script:
-
-- builds `web/dist`
-- compiles `apiserver.exe`
-- stages Python, Docker, config, database schema, scripts, and web assets
-- runs packaging smoke checks
-- invokes Inno Setup to create the installer
-
-## Technical Overview
-
-CueMate is intentionally local-first. The web app talks to a Go API on localhost. The Go API hydrates data from SQLite and calls a Python gRPC scorer. Python owns analysis, feature extraction, and recommendation semantics.
-
-```text
-React PWA
-  -> Go HTTP API
-    -> SQLite catalog/features/events
-    -> Python gRPC scoring service
-      -> DSP + Docker-backed model workers
-```
-
-### Data Flow
-
-1. Import tracks from folders or DJ library exports.
-2. Store tracks, playlists, and playlist order in SQLite.
-3. Run fast analysis for immediate BPM/key availability.
-4. Run full or staged analysis for richer absolute features.
-5. Compute playlist-relative features and playlist stats.
-6. Score candidates against current track, history, target lane, and tuned playlist weights.
-7. Capture played outcomes and feed them back into playlist-specific tuning.
-
-### Core Engineering Choices
-
-- **Local-first SQLite** keeps user music metadata and feedback on the machine.
-- **Go API boundary** gives the UI a small, stable HTTP surface with health/readiness handling.
-- **Python scoring service** keeps analysis and recommendation math close to the audio feature pipeline.
-- **gRPC/protobuf contract** makes the scorer boundary typed and testable.
-- **Docker model workers** isolate heavier ML dependencies for BPM, key, and semantic analysis.
-- **Tailscale remote mode** avoids public exposure while still enabling phone use.
-- **Resumable Windows bootstrap** lets setup recover after Docker, Python, or Tailscale prerequisite prompts.
-
-## Important Commands
+Fast staging-only check:
 
 ```powershell
-# Run tests
+powershell -ExecutionPolicy Bypass -File .\packaging\windows\build-installer.ps1 -SkipInstaller
+```
+
+More packaging details live in `packaging/windows/README.md`.
+
+## Validation
+
+```powershell
 go test ./go/...
 npm --prefix web run lint
 npm --prefix web run build
-
-# Build installer
-powershell -ExecutionPolicy Bypass -File .\packaging\windows\build-installer.ps1
-
-# Packaging smoke check
-powershell -ExecutionPolicy Bypass -File .\packaging\windows\Test-PackagingSmoke.ps1 -RequireInstaller
+powershell -ExecutionPolicy Bypass -File .\packaging\windows\Test-PackagingSmoke.ps1
 ```
+
+## Technical Architecture
+
+CueMate is local-first:
+
+```text
+React/Vite UI
+  -> Go HTTP API
+    -> SQLite database
+    -> Python gRPC scoring service
+      -> audio analysis + Docker-backed model services
+```
+
+Key engineering choices:
+
+- **SQLite local data model** for tracks, playlists, analysis jobs, recommendation events, and feedback.
+- **Go API** for local HTTP endpoints, health checks, remote pairing, and safe tool execution.
+- **Python analysis service** for import, feature extraction, model-backed analysis, and scoring.
+- **gRPC/protobuf boundary** between Go and Python for typed scorer contracts.
+- **Docker model services** for heavier BPM, key, and semantic analysis dependencies.
+- **Tailscale remote mode** for private phone access without opening public ports.
+- **Windows installer bootstrap** for resumable setup on non-developer machines.
 
 ## Project Layout
 
@@ -186,15 +195,13 @@ config/              runtime configuration
 db/                  SQLite migrations and schema snapshot
 docker/              model-service Docker assets
 go/                  local API, gRPC client, and Go tests
-packaging/windows/   Windows installer, bootstrap, and launcher scripts
+packaging/windows/   Windows installer, bootstrap, launcher, smoke checks
 proto/               scoring protobuf contract
 python/              analysis engine, scorer, CLI, and Python tests
 scripts/             developer and model-service helpers
 web/                 React/Vite app
 ```
 
-## Current Status
+## Status
 
-CueMate is a Windows-first private beta. The installer builds and the local app flow works, including optional QR-based phone pairing over Tailscale.
-
-The remaining production-readiness items are code signing, clean-VM acceptance testing, and broader packaging hardening for machines with unusual Python, Docker, or network policies.
+CueMate is a Windows-first private beta. The installer is unsigned. The next production-readiness steps are clean-VM acceptance testing, code signing, and broader hardening for locked-down enterprise Windows environments.

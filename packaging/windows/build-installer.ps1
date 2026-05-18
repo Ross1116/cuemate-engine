@@ -13,6 +13,34 @@ $stageRoot = Join-Path $distRoot "stage\CueMate"
 $outputRoot = Join-Path $distRoot "output"
 $goExe = Join-Path $stageRoot "apiserver.exe"
 
+function Get-RequiredCommand {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+        [Parameter(Mandatory = $true)]
+        [string]$InstallHint
+    )
+
+    $cmd = Get-Command $Name -ErrorAction SilentlyContinue
+    if (-not $cmd) {
+        throw "Missing required command '$Name'. $InstallHint"
+    }
+    return $cmd.Source
+}
+
+function Assert-SourcePath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+        [Parameter(Mandatory = $true)]
+        [string]$Description
+    )
+
+    if (-not (Test-Path $Path)) {
+        throw "Cannot build installer because $Description is missing at $Path"
+    }
+}
+
 function Invoke-LoggedCommand {
     param(
         [Parameter(Mandatory = $true)]
@@ -42,11 +70,30 @@ function Invoke-RobocopyChecked {
         [string[]]$ExtraArgs = @()
     )
 
+    Assert-SourcePath -Path $Source -Description "source folder"
+    $robocopy = Get-RequiredCommand -Name "robocopy.exe" -InstallHint "Robocopy is included with Windows; run this from a normal Windows PowerShell session."
     New-Item -ItemType Directory -Force -Path $Destination | Out-Null
-    & robocopy $Source $Destination /MIR /NFL /NDL /NJH /NJS /NP @ExtraArgs | Out-Host
+    & $robocopy $Source $Destination /MIR /NFL /NDL /NJH /NJS /NP @ExtraArgs | Out-Host
     if ($LASTEXITCODE -gt 7) {
         throw "robocopy failed copying $Source to $Destination with exit code $LASTEXITCODE"
     }
+}
+
+function Invoke-PackagingSmoke {
+    param([switch]$RequireInstaller)
+
+    $powershell = Get-RequiredCommand -Name "powershell.exe" -InstallHint "PowerShell is required to run CueMate packaging checks."
+    $args = @(
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        (Join-Path $packagingRoot "Test-PackagingSmoke.ps1")
+    )
+    if ($RequireInstaller) {
+        $args += "-RequireInstaller"
+    }
+    Invoke-LoggedCommand -FilePath $powershell -Arguments $args -WorkingDirectory $repoRoot
 }
 
 function Get-InnoCompiler {
@@ -84,15 +131,49 @@ function Get-InnoCompiler {
         }
     }
 
-    throw "Could not find ISCC.exe. Install Inno Setup 6 or rerun without -SkipInstaller after winget is available."
+    throw "Could not find Inno Setup compiler (ISCC.exe). Install Inno Setup 6, or rerun with -SkipInstaller to stage and smoke-test without producing CueMateSetup.exe."
+}
+
+function Assert-StagedRuntime {
+    foreach ($item in @(
+        @{ Path = (Join-Path $stageRoot "apiserver.exe"); Description = "Go API executable" },
+        @{ Path = (Join-Path $stageRoot "web\dist\index.html"); Description = "built web app" },
+        @{ Path = (Join-Path $stageRoot "python\pyproject.toml"); Description = "Python package" },
+        @{ Path = (Join-Path $stageRoot "docker"); Description = "Docker runtime assets" },
+        @{ Path = (Join-Path $stageRoot "config"); Description = "runtime config" },
+        @{ Path = (Join-Path $stageRoot "db\schema.sql"); Description = "SQLite schema" },
+        @{ Path = (Join-Path $stageRoot "scripts\docker-compose.ps1"); Description = "runtime scripts" },
+        @{ Path = (Join-Path $stageRoot "docs\Decision_Engine_Plan.md"); Description = "Python root sentinel" },
+        @{ Path = (Join-Path $stageRoot "Bootstrap-CueMate.ps1"); Description = "bootstrap script" },
+        @{ Path = (Join-Path $stageRoot "Start-CueMate.ps1"); Description = "launcher script" },
+        @{ Path = (Join-Path $stageRoot "README.md"); Description = "user README" },
+        @{ Path = (Join-Path $stageRoot ".env.example"); Description = "environment example" }
+    )) {
+        Assert-SourcePath -Path $item.Path -Description $item.Description
+    }
 }
 
 Write-Host "Preparing CueMate installer build $Version"
+Get-RequiredCommand -Name "npm.cmd" -InstallHint "Install Node.js LTS, then rerun this script." | Out-Null
+Get-RequiredCommand -Name "go.exe" -InstallHint "Install Go 1.24 or newer, then rerun this script." | Out-Null
+Get-RequiredCommand -Name "powershell.exe" -InstallHint "PowerShell is required to build CueMate." | Out-Null
+
+foreach ($source in @(
+    @{ Path = (Join-Path $repoRoot "web\package.json"); Description = "web package manifest" },
+    @{ Path = (Join-Path $repoRoot "go\go.mod"); Description = "Go module" },
+    @{ Path = (Join-Path $repoRoot "python\pyproject.toml"); Description = "Python package" },
+    @{ Path = (Join-Path $repoRoot "docker"); Description = "Docker assets" },
+    @{ Path = (Join-Path $repoRoot "db\schema.sql"); Description = "database schema" },
+    @{ Path = (Join-Path $repoRoot "docs\Decision_Engine_Plan.md"); Description = "Python root sentinel" }
+)) {
+    Assert-SourcePath -Path $source.Path -Description $source.Description
+}
+
 Remove-Item $distRoot -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $stageRoot, $outputRoot | Out-Null
 
-Invoke-LoggedCommand -FilePath "npm" -Arguments @("run", "build") -WorkingDirectory (Join-Path $repoRoot "web")
-Invoke-LoggedCommand -FilePath "go" -Arguments @("build", "-o", $goExe, "./cmd/apiserver") -WorkingDirectory (Join-Path $repoRoot "go")
+Invoke-LoggedCommand -FilePath (Get-RequiredCommand -Name "npm.cmd" -InstallHint "Install Node.js LTS, then rerun this script.") -Arguments @("run", "build") -WorkingDirectory (Join-Path $repoRoot "web")
+Invoke-LoggedCommand -FilePath (Get-RequiredCommand -Name "go.exe" -InstallHint "Install Go 1.24 or newer, then rerun this script.") -Arguments @("build", "-o", $goExe, "./cmd/apiserver") -WorkingDirectory (Join-Path $repoRoot "go")
 
 Invoke-RobocopyChecked -Source (Join-Path $repoRoot "python") -Destination (Join-Path $stageRoot "python") -ExtraArgs @(
     "/XD", ".venv", "__pycache__", ".pytest_cache", ".ruff_cache", "*.egg-info",
@@ -112,13 +193,8 @@ Copy-Item (Join-Path $packagingRoot "Bootstrap-CueMate.ps1") (Join-Path $stageRo
 Copy-Item (Join-Path $packagingRoot "Start-CueMate.ps1") (Join-Path $stageRoot "Start-CueMate.ps1") -Force
 Set-Content -Path (Join-Path $stageRoot "VERSION") -Value $Version -Encoding UTF8
 
-Invoke-LoggedCommand -FilePath "powershell.exe" -Arguments @(
-    "-NoProfile",
-    "-ExecutionPolicy",
-    "Bypass",
-    "-File",
-    (Join-Path $packagingRoot "Test-PackagingSmoke.ps1")
-) -WorkingDirectory $repoRoot
+Assert-StagedRuntime
+Invoke-PackagingSmoke
 
 if ($SkipInstaller) {
     Write-Host "Staged CueMate runtime at $stageRoot"
@@ -134,13 +210,6 @@ Invoke-LoggedCommand -FilePath $iscc -Arguments @(
     $iss
 ) -WorkingDirectory $packagingRoot
 
-Invoke-LoggedCommand -FilePath "powershell.exe" -Arguments @(
-    "-NoProfile",
-    "-ExecutionPolicy",
-    "Bypass",
-    "-File",
-    (Join-Path $packagingRoot "Test-PackagingSmoke.ps1"),
-    "-RequireInstaller"
-) -WorkingDirectory $repoRoot
+Invoke-PackagingSmoke -RequireInstaller
 
 Write-Host "Installer written to $outputRoot"

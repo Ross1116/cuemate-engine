@@ -206,6 +206,8 @@ function Get-FixedDriveLetters {
 function Set-CueMateEnvironment {
     $env:DATABASE_URL = "sqlite:$databasePath"
     $env:CUEMATE_INFERENCE_CACHE_PATH = $cachePath
+    $env:CUEMATE_SETUP_STATE_PATH = $statePath
+    $env:CUEMATE_LOG_DIR = $logDir
     $env:WEB_DIST_DIR = (Join-Path $InstallDir "web\dist")
     $env:CUEMATE_PYTHON = $venvPython
     $env:SCORING_GRPC_ADDR = "127.0.0.1:47834"
@@ -241,12 +243,13 @@ try {
     Invoke-Step "install-prerequisites" {
         if (-not (Get-PythonCommand)) {
             if ($SkipWingetInstall) {
-                throw "Python 3.12 is required but was not found. Rerun setup without -SkipWingetInstall."
+                throw "CueMate needs Python 3.12. Install Python 3.12, or rerun setup without -SkipWingetInstall so CueMate can install it with winget."
             }
             $winget = Get-Command "winget.exe" -ErrorAction SilentlyContinue
             if (-not $winget) {
-                throw "winget is required to install Python 3.12 automatically."
+                throw "CueMate could not find winget, so it cannot install Python 3.12 automatically. Install Python 3.12 manually, then launch CueMate again."
             }
+            Write-SetupState -Step "install-prerequisites" -Status "running" -Message "Installing Python 3.12. If Windows updates PATH, launch CueMate again after this step finishes."
             Invoke-External -FilePath $winget.Source -Arguments @(
                 "install",
                 "--id", "Python.Python.3.12",
@@ -268,11 +271,13 @@ try {
     Invoke-Step "prepare-python" {
         $python = Get-PythonCommand
         if (-not $python) {
-            throw "Python 3.12 was not found after prerequisite installation. Open a new PowerShell and rerun CueMate."
+            throw "Python 3.12 was installed but is not visible to this shell yet. Close this window and launch CueMate again from the Start Menu."
         }
         if (-not (Test-Path $venvPython -PathType Leaf)) {
+            Write-SetupState -Step "prepare-python" -Status "running" -Message "Creating CueMate's private Python environment."
             Invoke-External -FilePath $python -Arguments @("-m", "venv", $venvDir)
         }
+        Write-SetupState -Step "prepare-python" -Status "running" -Message "Installing CueMate's Python analysis package. This can take a few minutes on first setup."
         Invoke-External -FilePath $venvPython -Arguments @("-m", "pip", "install", "--upgrade", "pip")
         Invoke-External -FilePath $venvPython -Arguments @("-m", "pip", "install", "--upgrade", (Join-Path $InstallDir "python"))
     }
@@ -296,12 +301,14 @@ CUEMATE_INFERENCE_CACHE_PATH=$cachePath
 
     if (-not $SkipDockerSetup) {
         Invoke-Step "prepare-docker" {
+            Write-SetupState -Step "prepare-docker" -Status "running" -Message "Starting Docker Desktop. If Docker asks you to sign in, update WSL, or restart Windows, finish that prompt and launch CueMate again."
             Start-DockerDesktop
             if (-not (Wait-DockerReady -TimeoutSeconds 300)) {
-                Write-SetupState -Step "prepare-docker" -Status "blocked" -Message "Docker Desktop is not ready. Start Docker Desktop, finish any required login/restart, then launch CueMate again."
+                Write-SetupState -Step "prepare-docker" -Status "blocked" -Message "Docker Desktop is not ready yet. Open Docker Desktop, finish any login, WSL, or restart prompt, then launch CueMate again. Setup will resume automatically."
                 Write-Warning "Docker Desktop is not ready yet. CueMate setup will resume on next launch."
                 return
             }
+            Write-SetupState -Step "prepare-docker" -Status "running" -Message "Building CueMate model-service Docker images."
             Invoke-External -FilePath "powershell.exe" -Arguments @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $InstallDir "scripts\build-essentia-semantics-image.ps1"))
             Invoke-External -FilePath "powershell.exe" -Arguments @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (Join-Path $InstallDir "scripts\build-musicalkeycnn-image.ps1"))
             Write-SetupState -Step "prepare-docker" -Status "running" -DockerReady $true
@@ -315,10 +322,11 @@ CUEMATE_INFERENCE_CACHE_PATH=$cachePath
         Invoke-Step "prepare-models" {
             Set-CueMateEnvironment
             if (-not $SkipDockerSetup -and -not (Wait-DockerReady -TimeoutSeconds 30)) {
-                Write-SetupState -Step "prepare-models" -Status "blocked" -Message "Docker Desktop is not ready. Model setup will resume on next launch."
+                Write-SetupState -Step "prepare-models" -Status "blocked" -Message "Docker Desktop is not ready yet. Model setup will resume the next time you launch CueMate."
                 Write-Warning "Skipping model setup until Docker Desktop is ready."
                 return
             }
+            Write-SetupState -Step "prepare-models" -Status "running" -Message "Downloading and prewarming analysis models. This needs internet access and can take several minutes."
             Invoke-External -FilePath $venvPython -Arguments @("-m", "cuemate_analysis", "download-essentia-semantic-models")
             Invoke-External -FilePath $venvPython -Arguments @("-m", "cuemate_analysis", "prewarm-model-services")
             Write-SetupState -Step "prepare-models" -Status "running" -ModelReady $true

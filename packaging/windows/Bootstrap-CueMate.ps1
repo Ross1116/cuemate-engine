@@ -207,6 +207,7 @@ try {
             )
         }
         Ensure-WingetPackage -CommandName "docker.exe" -PackageId "Docker.DockerDesktop"
+        Ensure-WingetPackage -CommandName "tailscale.exe" -PackageId "Tailscale.Tailscale"
     }
 
     Invoke-Step "prepare-python" {

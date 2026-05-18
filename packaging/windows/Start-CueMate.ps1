@@ -13,6 +13,7 @@ $logDir = Join-Path $AppDataRoot "logs"
 $venvPython = Join-Path $AppDataRoot ".venv\Scripts\python.exe"
 $databasePath = Join-Path $dataDir "cuemate.db"
 $cachePath = Join-Path $dataDir "inference-cache.db"
+$remoteConfigPath = Join-Path $AppDataRoot "remote.json"
 $apiUrl = "http://127.0.0.1:8080"
 
 New-Item -ItemType Directory -Force -Path $dataDir, $logDir | Out-Null
@@ -35,6 +36,102 @@ function Set-CueMateEnvironment {
     $env:GO_API_ADDR = "127.0.0.1:8080"
     $env:CUEMATE_MUSICALKEYCNN_DRIVES = Get-FixedDriveLetters
     $env:CUEMATE_ESSENTIA_SEMANTIC_DRIVES = $env:CUEMATE_MUSICALKEYCNN_DRIVES
+    $remoteUrl = Get-CueMateRemoteUrl
+    if ($remoteUrl) {
+        $env:CUEMATE_REMOTE_URL = $remoteUrl
+    }
+}
+
+function Get-TailscaleCommand {
+    $candidates = @(
+        "$env:ProgramFiles\Tailscale\tailscale.exe",
+        "${env:ProgramFiles(x86)}\Tailscale\tailscale.exe"
+    )
+    foreach ($candidate in $candidates) {
+        if (Test-Path $candidate -PathType Leaf) {
+            return $candidate
+        }
+    }
+    $cmd = Get-Command "tailscale.exe" -ErrorAction SilentlyContinue
+    if ($cmd) {
+        return $cmd.Source
+    }
+    return $null
+}
+
+function Get-CueMateRemoteUrl {
+    if (-not (Test-Path $remoteConfigPath -PathType Leaf)) {
+        return ""
+    }
+    try {
+        $payload = Get-Content $remoteConfigPath -Raw | ConvertFrom-Json
+        if ($payload.enabled -and $payload.remote_url) {
+            return [string]$payload.remote_url
+        }
+    } catch {
+        return ""
+    }
+    return ""
+}
+
+function Save-CueMateRemoteConfig {
+    param(
+        [bool]$Enabled,
+        [string]$RemoteUrl,
+        [string]$Message
+    )
+    [pscustomobject]@{
+        enabled = $Enabled
+        mode = "tailscale"
+        remote_url = $RemoteUrl
+        message = $Message
+        updated_at = (Get-Date).ToUniversalTime().ToString("o")
+    } | ConvertTo-Json -Depth 4 | Set-Content -Path $remoteConfigPath -Encoding UTF8
+}
+
+function Get-TailscaleRemoteUrl {
+    param([string]$Tailscale)
+    $json = & $Tailscale status --json 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $json) {
+        return ""
+    }
+    try {
+        $status = $json | ConvertFrom-Json
+        $dnsName = [string]$status.Self.DNSName
+        if (-not $dnsName) {
+            return ""
+        }
+        return "https://" + $dnsName.TrimEnd(".")
+    } catch {
+        return ""
+    }
+}
+
+function Ensure-TailscaleServe {
+    $tailscale = Get-TailscaleCommand
+    if (-not $tailscale) {
+        Save-CueMateRemoteConfig -Enabled $false -RemoteUrl "" -Message "Tailscale is not installed."
+        return
+    }
+    $remoteUrl = Get-TailscaleRemoteUrl -Tailscale $tailscale
+    if (-not $remoteUrl) {
+        Save-CueMateRemoteConfig -Enabled $false -RemoteUrl "" -Message "Tailscale is installed but not authenticated."
+        return
+    }
+
+    $serveAttempts = @(
+        @("serve", "--bg", "http://127.0.0.1:8080"),
+        @("serve", "--bg", "8080")
+    )
+    foreach ($args in $serveAttempts) {
+        & $tailscale @args *> (Join-Path $logDir "tailscale-serve.log")
+        if ($LASTEXITCODE -eq 0) {
+            Save-CueMateRemoteConfig -Enabled $true -RemoteUrl $remoteUrl -Message "Tailscale Serve configured."
+            $env:CUEMATE_REMOTE_URL = $remoteUrl
+            return
+        }
+    }
+    Save-CueMateRemoteConfig -Enabled $false -RemoteUrl $remoteUrl -Message "Tailscale is logged in, but Serve could not be configured. See tailscale-serve.log."
 }
 
 function Test-HttpOk {
@@ -118,6 +215,8 @@ function Ensure-BootstrapComplete {
 
 Set-CueMateEnvironment
 Ensure-BootstrapComplete
+Set-CueMateEnvironment
+Ensure-TailscaleServe
 Set-CueMateEnvironment
 
 Push-Location $InstallDir

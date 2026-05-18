@@ -1655,6 +1655,43 @@ h1 {
   line-height: 1.5;
 }
 
+.remote-pair-banner {
+  grid-column: 1 / -1;
+  margin: -8px 0 8px;
+  padding: 10px 14px;
+  border: 1px solid rgba(127, 145, 82, 0.22);
+  border-radius: 7px;
+  color: var(--text);
+  background: rgba(127, 145, 82, 0.08);
+  font-size: 0.86rem;
+  font-weight: 800;
+}
+
+.remote-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+}
+
+.qr-wrap {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 14px;
+}
+
+.qr-wrap img {
+  width: 140px;
+  height: 140px;
+  border-radius: 7px;
+  background: #fff;
+}
+
+.breakable {
+  overflow-wrap: anywhere;
+}
+
 .tool-section {
   display: grid;
   gap: 16px;

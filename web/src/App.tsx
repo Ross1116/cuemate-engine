@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import QRCode from "qrcode";
 import {
   AlertTriangle,
   BarChart3,
@@ -213,6 +214,10 @@ export function App() {
   const [mobileTab, setMobileTab] = useState<"recommend" | "library" | "feedback" | "admin">("recommend");
   const [workMode, setWorkMode] = useState<"live" | "full">(() => (localStorage.getItem("cuemate.mode") === "full" ? "full" : "live"));
   const [lastToolResult, setLastToolResult] = useState<ToolCommandResult | null>(null);
+  const [remotePairUrl, setRemotePairUrl] = useState("");
+  const [remotePairExpiresAt, setRemotePairExpiresAt] = useState("");
+  const [remotePairQr, setRemotePairQr] = useState("");
+  const consumedPairTokenRef = useRef("");
 
   const health = useQuery({ queryKey: ["health"], queryFn: api.health, refetchInterval: 15_000 });
   const readiness = useQuery({ queryKey: ["ready"], queryFn: api.readiness, refetchInterval: 15_000 });
@@ -233,6 +238,7 @@ export function App() {
     queryFn: () => api.feedback(selectedPlaylistId),
     enabled: !!selectedPlaylistId,
   });
+  const remoteStatus = useQuery({ queryKey: ["remoteStatus"], queryFn: api.remoteStatus, refetchInterval: 30_000 });
   const recommendations = useQuery({
     queryKey: ["recommendations", selectedPlaylistId, currentTrackId, target, history],
     queryFn: () =>
@@ -271,6 +277,25 @@ export function App() {
   });
 
   const snapshotMutation = useMutation({ mutationFn: () => api.snapshot(selectedPlaylistId) });
+  const remotePairMutation = useMutation({
+    mutationFn: () => api.remotePairingToken(),
+    onSuccess: async (result) => {
+      setRemotePairUrl(result.pair_url);
+      setRemotePairExpiresAt(result.expires_at);
+      setRemotePairQr(await QRCode.toDataURL(result.pair_url, { margin: 1, width: 220 }));
+    },
+  });
+  const remoteConsumePairMutation = useMutation({
+    mutationFn: (token: string) => api.remotePair(token),
+    onSuccess: () => {
+      const url = new URL(window.location.href);
+      url.searchParams.delete("pair_token");
+      window.history.replaceState({}, "", url.toString());
+      void queryClient.invalidateQueries({ queryKey: ["remoteStatus"] });
+      void queryClient.invalidateQueries({ queryKey: ["health"] });
+      void queryClient.invalidateQueries({ queryKey: ["playlists"] });
+    },
+  });
 
   const correctionMutation = useMutation({
     mutationFn: (payload: { field: "bpm" | "key"; new_value: number | string }) =>
@@ -286,6 +311,14 @@ export function App() {
       void queryClient.invalidateQueries({ queryKey: ["jobs"] });
     },
   });
+
+  useEffect(() => {
+    const token = new URLSearchParams(window.location.search).get("pair_token");
+    if (token && consumedPairTokenRef.current !== token) {
+      consumedPairTokenRef.current = token;
+      remoteConsumePairMutation.mutate(token);
+    }
+  }, [remoteConsumePairMutation]);
 
   const selectedPlaylist = playlists.data?.items.find((item) => item.playlist_id === selectedPlaylistId) ?? playlists.data?.items[0];
   const currentTrack = tracks.data?.items.find((item) => item.track_id === currentTrackId);
@@ -337,6 +370,13 @@ export function App() {
           </span>
         </div>
       </header>
+      {remoteConsumePairMutation.isPending || remoteConsumePairMutation.isSuccess || remoteConsumePairMutation.error ? (
+        <div className="remote-pair-banner">
+          {remoteConsumePairMutation.isPending ? "Pairing this phone..." : null}
+          {remoteConsumePairMutation.isSuccess ? "Phone paired. CueMate is ready here." : null}
+          {remoteConsumePairMutation.error ? `Pairing failed: ${remoteConsumePairMutation.error.message}` : null}
+        </div>
+      ) : null}
 
       <aside className="library-pane panel mobile-library">
         <PaneTitle icon={<Library />} title="Library" action={`${playlists.data?.items.length ?? 0} playlists`} />
@@ -455,6 +495,14 @@ export function App() {
             toolBusy={toolMutation.isPending}
             toolResult={lastToolResult}
             toolError={toolMutation.error}
+            remoteStatus={remoteStatus.data}
+            remoteStatusLoading={remoteStatus.isLoading}
+            remotePairUrl={remotePairUrl}
+            remotePairQr={remotePairQr}
+            remotePairExpiresAt={remotePairExpiresAt}
+            onGenerateRemotePair={() => remotePairMutation.mutate()}
+            remotePairBusy={remotePairMutation.isPending}
+            remotePairError={remotePairMutation.error}
           />
         </aside>
       ) : null}
@@ -1459,6 +1507,14 @@ function FullToolsPanel({
   toolBusy,
   toolResult,
   toolError,
+  remoteStatus,
+  remoteStatusLoading,
+  remotePairUrl,
+  remotePairQr,
+  remotePairExpiresAt,
+  onGenerateRemotePair,
+  remotePairBusy,
+  remotePairError,
 }: {
   playlist?: Playlist;
   candidate: LaneItem | null;
@@ -1476,6 +1532,14 @@ function FullToolsPanel({
   toolBusy: boolean;
   toolResult: ToolCommandResult | null;
   toolError: Error | null;
+  remoteStatus?: { enabled: boolean; remote_url: string | null; paired: boolean; request_local: boolean };
+  remoteStatusLoading: boolean;
+  remotePairUrl: string;
+  remotePairQr: string;
+  remotePairExpiresAt: string;
+  onGenerateRemotePair: () => void;
+  remotePairBusy: boolean;
+  remotePairError: Error | null;
 }) {
   const [localName, setLocalName] = useState("");
   const [localPaths, setLocalPaths] = useState("");
@@ -1541,6 +1605,30 @@ function FullToolsPanel({
     <div className="full-tools">
       <PaneTitle icon={<TerminalSquare />} title="Full Mode" action="library + analysis" />
       <p className="mode-note">Full mode exposes import, analysis, worker, sync, and correction tools. Live mode keeps only the performance surface.</p>
+      <ToolSection icon={<Radar />} title="Connect phone" description="Generate a short-lived QR link for the mobile web app.">
+        <div className="remote-card">
+          <div>
+            <p className={remoteStatus?.enabled ? "pill cyan" : "pill amber"}>
+              {remoteStatusLoading ? "checking" : remoteStatus?.enabled ? "remote ready" : "remote setup needed"}
+            </p>
+            <p className="muted">{remoteStatus?.remote_url ?? "Enable Tailscale Serve from the Windows launcher to get a remote HTTPS URL."}</p>
+          </div>
+          <button className="wide-action secondary" disabled={!remoteStatus?.enabled || remotePairBusy} onClick={onGenerateRemotePair}>
+            {remotePairBusy ? "Generating..." : "Generate QR"}
+          </button>
+        </div>
+        {remotePairQr ? (
+          <div className="qr-wrap">
+            <img src={remotePairQr} alt="CueMate mobile pairing QR code" />
+            <div>
+              <p className="field-label">Pairing link</p>
+              <p className="muted breakable">{remotePairUrl}</p>
+              <p className="action-note">Expires {remotePairExpiresAt ? new Date(remotePairExpiresAt).toLocaleTimeString() : "soon"}.</p>
+            </div>
+          </div>
+        ) : null}
+        {remotePairError ? <p className="action-note">{remotePairError.message}</p> : null}
+      </ToolSection>
       <FullCandidateAnalysisPanel candidate={candidate} playlistId={playlistId} />
 
       <ToolSection icon={<FolderPlus />} title="Import local files" description="Build a CueMate playlist from folders or individual audio files.">

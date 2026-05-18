@@ -3,11 +3,16 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -88,6 +93,15 @@ type outboxAckRequest struct {
 	AckedAt      string `json:"acked_at"`
 }
 
+type remotePairingTokenRequest struct {
+	DeviceLabel string `json:"device_label"`
+}
+
+type remotePairRequest struct {
+	Token       string `json:"token"`
+	DeviceLabel string `json:"device_label"`
+}
+
 type enqueueAnalysisRequest struct {
 	AnalysisMode string `json:"analysis_mode"`
 	Force        bool   `json:"force"`
@@ -154,13 +168,17 @@ func run() int {
 	mux.HandleFunc("/sync/playlists/snapshot/ack", srv.handleSnapshotAck)
 	mux.HandleFunc("/sync/outbox/pull", srv.handleOutboxPull)
 	mux.HandleFunc("/sync/outbox/ack", srv.handleOutboxAck)
+	mux.HandleFunc("/remote/status", srv.handleRemoteStatus)
+	mux.HandleFunc("/remote/pairing-token", srv.handleRemotePairingToken)
+	mux.HandleFunc("/remote/pair", srv.handleRemotePair)
+	mux.HandleFunc("/remote/logout", srv.handleRemoteLogout)
 	mux.HandleFunc("/tools/cli", srv.handleToolCommand)
 	mux.HandleFunc("/tools/pick-path", srv.handlePickPath)
 	mux.HandleFunc("/", handleWebApp(cfg.WebDist))
 
 	httpServer := &http.Server{
 		Addr:         cfg.Addr,
-		Handler:      mux,
+		Handler:      srv.remoteAccessMiddleware(mux),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,
@@ -279,6 +297,99 @@ func handleWebApp(webDist string) http.HandlerFunc {
 		}
 		http.ServeFile(w, r, filepath.Join(webDistAbs, "index.html"))
 	}
+}
+
+func (s *server) remoteAccessMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isLocalRequest(r) || isRemotePublicRequest(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if isRemoteBlockedPath(r.URL.Path) {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "remote sessions cannot access this endpoint"})
+			return
+		}
+		session, ok := s.remoteSession(r)
+		if !ok {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "remote pairing required"})
+			return
+		}
+		_ = session
+		next.ServeHTTP(w, r)
+	})
+}
+
+func isLocalRequest(r *http.Request) bool {
+	host := r.Host
+	if host == "" {
+		host = r.URL.Host
+	}
+	if strings.Contains(host, ":") {
+		if parsedHost, _, err := net.SplitHostPort(host); err == nil {
+			host = parsedHost
+		}
+	}
+	host = strings.Trim(strings.ToLower(host), "[]")
+	return host == "" || host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
+
+func isRemotePublicRequest(r *http.Request) bool {
+	switch {
+	case r.URL.Path == "/remote/status":
+		return true
+	case r.URL.Path == "/remote/pair" && r.Method == http.MethodPost:
+		return true
+	case r.Method == http.MethodGet || r.Method == http.MethodHead:
+		return !isAPIPath(r.URL.Path)
+	default:
+		return false
+	}
+}
+
+func isAPIPath(path string) bool {
+	for _, prefix := range []string{
+		"/healthz",
+		"/readyz",
+		"/scoring/",
+		"/playlists",
+		"/tracks/",
+		"/analysis/",
+		"/recommendation-events",
+		"/recommendations",
+		"/events/",
+		"/feedback/",
+		"/corrections",
+		"/sync/",
+		"/tools/",
+		"/remote/",
+	} {
+		if path == strings.TrimSuffix(prefix, "/") || strings.HasPrefix(path, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func isRemoteBlockedPath(path string) bool {
+	for _, prefix := range []string{"/tools/", "/analysis/", "/corrections", "/sync/outbox", "/remote/pairing-token"} {
+		if path == strings.TrimSuffix(prefix, "/") || strings.HasPrefix(path, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *server) remoteSession(r *http.Request) (*recommendationsrepo.RemoteSession, bool) {
+	cookie, err := r.Cookie("cuemate_remote_session")
+	if err != nil || strings.TrimSpace(cookie.Value) == "" {
+		return nil, false
+	}
+	session, err := s.repo.GetValidRemoteSession(r.Context(), hashSecret(cookie.Value), recommendationsrepo.NowUTC())
+	if err != nil {
+		log.Printf("remote session lookup failed: %v", err)
+		return nil, false
+	}
+	return session, session != nil
 }
 
 func (s *server) handlePlaylists(w http.ResponseWriter, r *http.Request) {
@@ -1481,6 +1592,148 @@ func (s *server) handleOutboxAck(w http.ResponseWriter, r *http.Request) {
 		"acked_count":    ackedCount,
 		"acked_at":       ackedAt,
 	})
+}
+
+func (s *server) handleRemoteStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	_, paired := s.remoteSession(r)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"enabled":       remoteBaseURL() != "",
+		"mode":          "tailscale",
+		"remote_url":    nullIfEmpty(remoteBaseURL()),
+		"request_local": isLocalRequest(r),
+		"paired":        paired,
+	})
+}
+
+func (s *server) handleRemotePairingToken(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	if !isLocalRequest(r) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "pairing tokens can only be created locally"})
+		return
+	}
+	var req remotePairingTokenRequest
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+	token, err := randomURLToken(32)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	now := time.Now().UTC()
+	expiresAt := now.Add(5 * time.Minute)
+	if err := s.repo.CreateRemotePairingToken(r.Context(), hashSecret(token), optionalString(req.DeviceLabel), now.Format(time.RFC3339), expiresAt.Format(time.RFC3339)); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	baseURL := remoteBaseURL()
+	if baseURL == "" {
+		baseURL = "http://" + r.Host
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"token":      token,
+		"expires_at": expiresAt.Format(time.RFC3339),
+		"pair_url":   strings.TrimRight(baseURL, "/") + "/?pair_token=" + url.QueryEscape(token),
+	})
+}
+
+func (s *server) handleRemotePair(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	var req remotePairRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON request"})
+		return
+	}
+	if strings.TrimSpace(req.Token) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "token is required"})
+		return
+	}
+	now := time.Now().UTC()
+	token, err := s.repo.ConsumeRemotePairingToken(r.Context(), hashSecret(req.Token), now.Format(time.RFC3339))
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if token == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "pairing token is invalid or expired"})
+		return
+	}
+	sessionSecret, err := randomURLToken(32)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	expiresAt := now.Add(30 * 24 * time.Hour)
+	deviceLabel := optionalString(firstNonEmpty(req.DeviceLabel, stringValue(token.DeviceLabel), "Mobile device"))
+	if err := s.repo.CreateRemoteSession(r.Context(), hashSecret(sessionSecret), deviceLabel, now.Format(time.RFC3339), expiresAt.Format(time.RFC3339)); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     "cuemate_remote_session",
+		Value:    sessionSecret,
+		Path:     "/",
+		Expires:  expiresAt,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   !isLocalRequest(r),
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"status": "paired", "expires_at": expiresAt.Format(time.RFC3339)})
+}
+
+func (s *server) handleRemoteLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	if cookie, err := r.Cookie("cuemate_remote_session"); err == nil {
+		_ = s.repo.RevokeRemoteSession(r.Context(), hashSecret(cookie.Value), recommendationsrepo.NowUTC())
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     "cuemate_remote_session",
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   !isLocalRequest(r),
+	})
+	writeJSON(w, http.StatusOK, map[string]string{"status": "logged_out"})
+}
+
+func remoteBaseURL() string {
+	return strings.TrimRight(strings.TrimSpace(os.Getenv("CUEMATE_REMOTE_URL")), "/")
+}
+
+func randomURLToken(size int) (string, error) {
+	buf := make([]byte, size)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(buf), nil
+}
+
+func hashSecret(secret string) string {
+	sum := sha256.Sum256([]byte(secret))
+	return hex.EncodeToString(sum[:])
+}
+
+func optionalString(value string) *string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return nil
+	}
+	return &trimmed
 }
 
 func relativeRefreshReason(stats *recommendationsrepo.PlaylistStats, expectedRelativeSignature string) string {

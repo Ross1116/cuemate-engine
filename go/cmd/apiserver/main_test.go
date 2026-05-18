@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	scoringv1 "github.com/Ross1116/cuemate-engine/go/gen/djengine/scoring/v1"
 	"github.com/Ross1116/cuemate-engine/go/internal/recommendationsrepo"
@@ -1030,6 +1031,95 @@ func TestOutboxPullAndAckLifecycle(t *testing.T) {
 	}
 	if secondItems[0].(map[string]any)["entity_id"] != "corr_1" {
 		t.Fatalf("remaining item = %#v", secondItems[0])
+	}
+}
+
+func TestRemotePairingTokenIsSingleUse(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+	tokenRec := httptest.NewRecorder()
+	tokenReq := httptest.NewRequest(http.MethodPost, "/remote/pairing-token", bytes.NewBufferString(`{"device_label":"Phone"}`))
+	tokenReq.Host = "127.0.0.1:8080"
+	srv.handleRemotePairingToken(tokenRec, tokenReq)
+	if tokenRec.Code != http.StatusOK {
+		t.Fatalf("token status = %d body=%s", tokenRec.Code, tokenRec.Body.String())
+	}
+	var tokenPayload map[string]any
+	if err := json.Unmarshal(tokenRec.Body.Bytes(), &tokenPayload); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	token := tokenPayload["token"].(string)
+
+	pairBody := `{"token":"` + token + `","device_label":"Phone"}`
+	pairRec := httptest.NewRecorder()
+	pairReq := httptest.NewRequest(http.MethodPost, "/remote/pair", bytes.NewBufferString(pairBody))
+	pairReq.Host = "cue.example"
+	srv.handleRemotePair(pairRec, pairReq)
+	if pairRec.Code != http.StatusOK {
+		t.Fatalf("pair status = %d body=%s", pairRec.Code, pairRec.Body.String())
+	}
+	if len(pairRec.Result().Cookies()) == 0 {
+		t.Fatalf("expected session cookie")
+	}
+
+	secondPairRec := httptest.NewRecorder()
+	secondPairReq := httptest.NewRequest(http.MethodPost, "/remote/pair", bytes.NewBufferString(pairBody))
+	secondPairReq.Host = "cue.example"
+	srv.handleRemotePair(secondPairRec, secondPairReq)
+	if secondPairRec.Code != http.StatusUnauthorized {
+		t.Fatalf("second pair status = %d body=%s", secondPairRec.Code, secondPairRec.Body.String())
+	}
+}
+
+func TestRemoteAccessRequiresSessionForAPI(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/playlists", nil)
+	req.Host = "cue.example"
+	srv.remoteAccessMiddleware(http.HandlerFunc(srv.handlePlaylists)).ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestRemoteAccessAllowsSessionForSafeAPI(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+	sessionSecret := "session-secret"
+	now := time.Now().UTC()
+	if err := srv.repo.CreateRemoteSession(context.Background(), hashSecret(sessionSecret), stringPtr("Phone"), now.Format(time.RFC3339), now.Add(time.Hour).Format(time.RFC3339)); err != nil {
+		t.Fatalf("CreateRemoteSession() error = %v", err)
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/playlists", nil)
+	req.Host = "cue.example"
+	req.AddCookie(&http.Cookie{Name: "cuemate_remote_session", Value: sessionSecret})
+	srv.remoteAccessMiddleware(http.HandlerFunc(srv.handlePlaylists)).ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestRemoteAccessBlocksAdminRoutesEvenWithSession(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+	sessionSecret := "session-secret"
+	now := time.Now().UTC()
+	if err := srv.repo.CreateRemoteSession(context.Background(), hashSecret(sessionSecret), stringPtr("Phone"), now.Format(time.RFC3339), now.Add(time.Hour).Format(time.RFC3339)); err != nil {
+		t.Fatalf("CreateRemoteSession() error = %v", err)
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/tools/cli", bytes.NewBufferString(`{}`))
+	req.Host = "cue.example"
+	req.AddCookie(&http.Cookie{Name: "cuemate_remote_session", Value: sessionSecret})
+	srv.remoteAccessMiddleware(http.HandlerFunc(srv.handleToolCommand)).ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
 	}
 }
 

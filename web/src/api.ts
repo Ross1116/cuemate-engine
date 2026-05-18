@@ -183,6 +183,20 @@ export type PickPathResult = {
   paths: string[];
 };
 
+export type RemoteStatus = {
+  enabled: boolean;
+  mode: "tailscale";
+  remote_url: string | null;
+  request_local: boolean;
+  paired: boolean;
+};
+
+export type RemotePairingToken = {
+  token: string;
+  expires_at: string;
+  pair_url: string;
+};
+
 const apiBase = import.meta.env.DEV ? "/api" : "";
 
 export class ApiError extends Error {
@@ -290,6 +304,18 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ playlist_id: playlistId }),
     }),
+  remoteStatus: () => request<RemoteStatus>("/remote/status"),
+  remotePairingToken: (deviceLabel = "Mobile device") =>
+    request<RemotePairingToken>("/remote/pairing-token", {
+      method: "POST",
+      body: JSON.stringify({ device_label: deviceLabel }),
+    }),
+  remotePair: (token: string, deviceLabel = "Mobile device") =>
+    request<{ status: string; expires_at: string }>("/remote/pair", {
+      method: "POST",
+      body: JSON.stringify({ token, device_label: deviceLabel }),
+    }),
+  remoteLogout: () => request<{ status: string }>("/remote/logout", { method: "POST" }),
   toolCommand: (body: ToolCommandRequest) =>
     request<ToolCommandResult>("/tools/cli", {
       method: "POST",

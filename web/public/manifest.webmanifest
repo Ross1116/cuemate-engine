@@ -1,0 +1,18 @@
+{
+  "name": "CueMate",
+  "short_name": "CueMate",
+  "description": "CueMate mobile performance control.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#080c10",
+  "theme_color": "#080c10",
+  "icons": [
+    {
+      "src": "/icons/cuemate.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

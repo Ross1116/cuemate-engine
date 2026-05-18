@@ -269,6 +269,25 @@ func TestRecommendationEventsClampsNegativeLimit(t *testing.T) {
 	}
 }
 
+func TestRecommendationEventsCapsExcessiveLimit(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/recommendation-events?playlist_id=pl_1&limit=999999", nil)
+	srv.handleRecommendationEvents(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	if got := len(payload["items"].([]any)); got > maxRecommendationEventsResponse {
+		t.Fatalf("items len = %d, want <= %d", got, maxRecommendationEventsResponse)
+	}
+}
+
 func TestPlayedEventUpdatesRecommendationEvent(t *testing.T) {
 	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
 		metadataResp: fakeMetadata("rel_sig_current"),
@@ -600,6 +619,77 @@ func TestFeedbackSummaryHonorsWindowFilters(t *testing.T) {
 	}
 	if client.lastFeedbackReq.Events[0].EventId != "evt_new" {
 		t.Fatalf("filtered event = %#v", client.lastFeedbackReq.Events[0])
+	}
+}
+
+func TestFeedbackSummaryNormalizesWindowToUTC(t *testing.T) {
+	since, until, err := validateFeedbackSummaryWindow("2026-04-10T22:00:00+10:00", "2026-04-11T01:30:00+10:00")
+	if err != nil {
+		t.Fatalf("validateFeedbackSummaryWindow() error = %v", err)
+	}
+	if since != "2026-04-10T12:00:00Z" {
+		t.Fatalf("since = %q", since)
+	}
+	if until != "2026-04-10T15:30:00Z" {
+		t.Fatalf("until = %q", until)
+	}
+}
+
+func TestFeedbackSummaryExcludesUnplayedEvents(t *testing.T) {
+	client := &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+		feedbackResp: &scoringv1.GetFeedbackSummaryResponse{
+			PlaylistId:   "pl_1",
+			PlaylistName: "Test Playlist",
+			Window:       &scoringv1.FeedbackSummaryWindow{},
+			Metrics:      &scoringv1.FeedbackSummaryMetrics{},
+			Weights: &scoringv1.FeedbackSummaryWeights{
+				StaticWeights:    map[string]float64{},
+				BaseWeights:      map[string]float64{},
+				EffectiveWeights: map[string]float64{},
+			},
+			Tuning: &scoringv1.FeedbackSummaryTuning{},
+		},
+	}
+	srv := newTestServer(t, false, "rel_sig_current", client)
+	ctx := context.Background()
+	for _, event := range []struct {
+		id       string
+		playedAt *string
+	}{
+		{id: "evt_played", playedAt: stringPtr("2026-04-10T00:00:00Z")},
+		{id: "evt_unplayed", playedAt: nil},
+	} {
+		err := srv.repo.InsertRecommendationEvent(ctx, recommendationsrepo.RecommendationEventRecord{
+			ID:                    event.id,
+			PlaylistID:            "pl_1",
+			CurrentTrackID:        "trk_current",
+			Target:                "maintain",
+			CandidateCount:        1,
+			RecommendationsStatus: "available",
+			LanesReturnedJSON:     `{"lane_order":["maintain"],"lanes":{"maintain":[{"track_id":"trk_candidate","score":0.9}]}}`,
+			TrackChosen:           stringPtr("trk_candidate"),
+			ChosenWasRecommended:  boolPtr(true),
+			ScoringContractID:     "m3-v1",
+			Timestamp:             "2026-04-10T00:00:00Z",
+			PlayedAt:              event.playedAt,
+		})
+		if err != nil {
+			t.Fatalf("InsertRecommendationEvent(%s) error = %v", event.id, err)
+		}
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/feedback/summary", bytes.NewBufferString(`{"playlist_name":"Test Playlist"}`))
+	srv.handleFeedbackSummary(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if client.lastFeedbackReq == nil {
+		t.Fatalf("expected feedback summary RPC request")
+	}
+	if len(client.lastFeedbackReq.Events) != 1 || client.lastFeedbackReq.Events[0].EventId != "evt_played" {
+		t.Fatalf("feedback request events = %#v", client.lastFeedbackReq.Events)
 	}
 }
 
@@ -995,6 +1085,19 @@ func TestClientAnalysisEnqueueEndpoint(t *testing.T) {
 	}
 	if len(jobs) != 3 {
 		t.Fatalf("jobs = %#v", jobs)
+	}
+}
+
+func TestClientAnalysisEnqueueRejectsInvalidMode(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/playlists/pl_1/analysis/enqueue", bytes.NewBufferString(`{"analysis_mode":"surprise"}`))
+	rec := httptest.NewRecorder()
+	srv.handlePlaylistRoutes(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
 	}
 }
 

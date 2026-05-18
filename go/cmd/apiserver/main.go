@@ -27,8 +27,9 @@ import (
 )
 
 const (
-	defaultAPIAddr = "127.0.0.1:8080"
-	pythonModule   = "cuemate_analysis"
+	defaultAPIAddr                  = "127.0.0.1:8080"
+	pythonModule                    = "cuemate_analysis"
+	maxRecommendationEventsResponse = 200
 )
 
 var liveLaneOrder = []string{"maintain", "build", "reset", "jump", "contrast"}
@@ -454,6 +455,9 @@ func (s *server) handleRecommendationEvents(w http.ResponseWriter, r *http.Reque
 	if limit < 0 {
 		limit = 0
 	}
+	if limit > maxRecommendationEventsResponse {
+		limit = maxRecommendationEventsResponse
+	}
 	if limit > len(events) {
 		limit = len(events)
 	}
@@ -814,6 +818,15 @@ func boundedPositive(value, fallback, max int) int {
 	return value
 }
 
+func validAnalysisMode(mode string) bool {
+	switch strings.TrimSpace(mode) {
+	case "", "fast_pass", "staged", "full":
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *server) handlePlaylistAnalysisEnqueue(w http.ResponseWriter, r *http.Request, playlistID string) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
@@ -822,6 +835,10 @@ func (s *server) handlePlaylistAnalysisEnqueue(w http.ResponseWriter, r *http.Re
 	var req enqueueAnalysisRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON request"})
+		return
+	}
+	if !validAnalysisMode(req.AnalysisMode) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "analysis_mode must be fast_pass, staged, or full"})
 		return
 	}
 	if _, err := s.repo.ResolvePlaylist(r.Context(), playlistID, ""); err != nil {
@@ -1927,8 +1944,13 @@ func (s *server) handleFeedbackSummary(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
+	playedEvents := make([]recommendationsrepo.RecommendationEventRecord, 0, len(events))
 	eventIDs := make([]string, 0, len(events))
 	for _, event := range events {
+		if event.PlayedAt == nil {
+			continue
+		}
+		playedEvents = append(playedEvents, event)
 		eventIDs = append(eventIDs, event.ID)
 	}
 	itemsByEvent, err := s.repo.ListRecommendationEventItemsByEventIDs(r.Context(), eventIDs)
@@ -1941,7 +1963,7 @@ func (s *server) handleFeedbackSummary(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	rpcReq, err := buildFeedbackSummaryRPCRequest(playlist, events, itemsByEvent, stats, since, until)
+	rpcReq, err := buildFeedbackSummaryRPCRequest(playlist, playedEvents, itemsByEvent, stats, since, until)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -1970,18 +1992,18 @@ func validateFeedbackSummaryWindow(rawSince, rawUntil string) (string, string, e
 		if err != nil {
 			return "", "", fmt.Errorf("since must be a valid RFC3339 timestamp")
 		}
-		parsedSince = value
+		parsedSince = value.UTC()
 		hasSince = true
-		since = value.Format(time.RFC3339)
+		since = parsedSince.Format(time.RFC3339)
 	}
 	if until != "" {
 		value, err := time.Parse(time.RFC3339, until)
 		if err != nil {
 			return "", "", fmt.Errorf("until must be a valid RFC3339 timestamp")
 		}
-		parsedUntil = value
+		parsedUntil = value.UTC()
 		hasUntil = true
-		until = value.Format(time.RFC3339)
+		until = parsedUntil.Format(time.RFC3339)
 	}
 	if hasSince && hasUntil && parsedSince.After(parsedUntil) {
 		return "", "", fmt.Errorf("since must be before or equal to until")

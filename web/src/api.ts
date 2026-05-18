@@ -104,6 +104,10 @@ export type RecommendationResponse = {
 export type FeedbackSummary = {
   playlist_id: string;
   playlist_name: string;
+  window: {
+    since: string | null;
+    until: string | null;
+  };
   metrics: {
     total_events: number;
     contributory_events: number;

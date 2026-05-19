@@ -266,6 +266,8 @@ function boundedPercent(value: number) {
   return Math.max(0, Math.min(100, value));
 }
 
+const ANALYSIS_WORKER_BATCH_LIMIT = 15;
+
 export function App() {
   const queryClient = useQueryClient();
   const [selectedPlaylistId, setSelectedPlaylistId] = useState<string>(() => localStorage.getItem("cuemate.playlist") ?? "");
@@ -283,6 +285,7 @@ export function App() {
   const [operationMessage, setOperationMessage] = useState("");
   const [activeRunId, setActiveRunId] = useState("");
   const consumedPairTokenRef = useRef("");
+  const chainedWorkerRunRef = useRef("");
 
   const health = useQuery({ queryKey: ["health"], queryFn: api.health, refetchInterval: 15_000 });
   const readiness = useQuery({ queryKey: ["ready"], queryFn: api.readiness, refetchInterval: 15_000 });
@@ -358,7 +361,7 @@ export function App() {
   const refreshMutation = useMutation({
     mutationFn: async (body?: { force?: boolean; analysis_mode?: "fast_pass" | "staged" | "full" }) => {
       const refresh = await api.refreshPlaylistAnalysis(selectedPlaylistId, body);
-      const worker = await api.toolCommand({ action: "run_analysis_worker", limit: 1000 });
+      const worker = await api.toolCommand({ action: "run_analysis_worker", limit: ANALYSIS_WORKER_BATCH_LIMIT });
       return { refresh, worker };
     },
     onMutate: (body) => setOperationMessage(body?.force ? "Force reanalysis queued. Starting worker..." : "Smart refresh queued. Starting worker..."),
@@ -368,7 +371,7 @@ export function App() {
       const queued = result.refresh.queued_count;
       setOperationMessage(
         queued
-          ? `${queued} analysis job${queued === 1 ? "" : "s"} queued. Worker started in the background.`
+          ? `${queued} analysis job${queued === 1 ? "" : "s"} queued. Processing ${ANALYSIS_WORKER_BATCH_LIMIT} at a time.`
           : "No new jobs were queued. Worker checked for any pending analysis.",
       );
       void queryClient.invalidateQueries({ queryKey: ["jobs"] });
@@ -445,7 +448,29 @@ export function App() {
     void queryClient.invalidateQueries({ queryKey: ["jobs"] });
     void queryClient.invalidateQueries({ queryKey: ["analysisStatus"] });
     void queryClient.invalidateQueries({ queryKey: ["recommendations"] });
-  }, [activeToolRun.data, queryClient]);
+    if (
+      activeToolRun.data.status === "completed" &&
+      selectedPlaylistId &&
+      activeToolRun.data.run_id !== chainedWorkerRunRef.current &&
+      activeToolRun.data.command?.some((part) => part === "run-analysis-worker")
+    ) {
+      chainedWorkerRunRef.current = activeToolRun.data.run_id;
+      void queryClient
+        .fetchQuery({
+          queryKey: ["analysisStatus", selectedPlaylistId],
+          queryFn: () => api.playlistAnalysisStatus(selectedPlaylistId),
+        })
+        .then((status) => {
+          const pending = status.jobs.pending;
+          const running = status.jobs.running;
+          if (pending > 0 && running === 0) {
+            setOperationMessage(`${pending} analysis job${pending === 1 ? "" : "s"} remaining. Starting next ${ANALYSIS_WORKER_BATCH_LIMIT}.`);
+            toolMutation.mutate({ action: "run_analysis_worker", limit: ANALYSIS_WORKER_BATCH_LIMIT });
+          }
+        })
+        .catch(() => undefined);
+    }
+  }, [activeToolRun.data, queryClient, selectedPlaylistId, toolMutation]);
 
   useEffect(() => {
     const token = new URLSearchParams(window.location.search).get("pair_token");
@@ -689,7 +714,7 @@ export function App() {
             queueResult={refreshMutation.data?.refresh.queued_count}
             onRemovePlaylist={(id) => removePlaylistMutation.mutate(id)}
             removeBusy={removePlaylistMutation.isPending}
-            onRunWorker={() => toolMutation.mutate({ action: "run_analysis_worker", limit: 1000 })}
+            onRunWorker={() => toolMutation.mutate({ action: "run_analysis_worker", limit: ANALYSIS_WORKER_BATCH_LIMIT })}
             onTool={(payload) => toolMutation.mutate(payload)}
             toolBusy={toolMutation.isPending}
             toolResult={lastToolResult}

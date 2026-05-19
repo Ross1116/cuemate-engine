@@ -994,7 +994,7 @@ func buildToolCommand(req toolCommandRequest) ([]string, bool, error) {
 		}
 		return args, true, nil
 	case "run_analysis_worker":
-		limit := boundedPositive(req.Limit, 100, 1000)
+		limit := boundedPositive(req.Limit, 15, 15)
 		args = append(args, "run-analysis-worker", "--limit", strconv.Itoa(limit))
 		if req.PrintBackendDiagnostics {
 			args = append(args, "--print-backend-diagnostics")

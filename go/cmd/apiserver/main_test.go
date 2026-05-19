@@ -1588,6 +1588,23 @@ func TestBuildToolCommandRejectsOptionLikeUserValues(t *testing.T) {
 	}
 }
 
+func TestBuildToolCommandCapsAnalysisWorkerBatch(t *testing.T) {
+	args, background, err := buildToolCommand(toolCommandRequest{
+		Action: "run_analysis_worker",
+		Limit:  1000,
+	})
+	if err != nil {
+		t.Fatalf("buildToolCommand() error = %v", err)
+	}
+	if !background {
+		t.Fatalf("background = false")
+	}
+	want := []string{"-m", pythonModule, "run-analysis-worker", "--limit", "15"}
+	if fmt.Sprint(args) != fmt.Sprint(want) {
+		t.Fatalf("args = %#v, want %#v", args, want)
+	}
+}
+
 func TestWebAppFallbackServesIndex(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "index.html"), []byte("<main>CueMate</main>"), 0o644); err != nil {

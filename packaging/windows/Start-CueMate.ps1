@@ -215,7 +215,10 @@ try {
         if (-not (Test-TcpPort -HostName "127.0.0.1" -Port 47834)) {
             Write-Host "Starting CueMate scorer..."
             Start-LoggedProcess -Name "scorer" -FilePath $venvPython -Arguments @("-m", "cuemate_analysis", "serve-scoring", "--host", "127.0.0.1", "--port", "47834")
-            Wait-Until -Predicate { Test-TcpPort -HostName "127.0.0.1" -Port 47834 } -TimeoutSeconds 45 -Description "CueMate scorer" | Out-Null
+            $scorerReady = Wait-Until -Predicate { Test-TcpPort -HostName "127.0.0.1" -Port 47834 } -TimeoutSeconds 45 -Description "CueMate scorer"
+            if (-not $scorerReady) {
+                throw "CueMate scorer did not become ready on 127.0.0.1:47834. Check $logDir\scorer.log and confirm $venvPython can start the scorer."
+            }
         }
 
         if (-not (Test-HttpOk -Url "$apiUrl/healthz")) {
@@ -225,7 +228,10 @@ try {
                 throw "CueMate API executable is missing at $apiExe"
             }
             Start-LoggedProcess -Name "apiserver" -FilePath $apiExe -Arguments @()
-            Wait-Until -Predicate { Test-HttpOk -Url "$apiUrl/healthz" } -TimeoutSeconds 45 -Description "CueMate API" | Out-Null
+            $apiReady = Wait-Until -Predicate { Test-HttpOk -Url "$apiUrl/healthz" } -TimeoutSeconds 45 -Description "CueMate API"
+            if (-not $apiReady) {
+                throw "CueMate API did not become ready at $apiUrl/healthz after starting $apiExe. Check $logDir\apiserver.log."
+            }
         }
 
         if (-not $NoBrowser) {

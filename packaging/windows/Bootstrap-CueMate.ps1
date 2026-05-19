@@ -317,8 +317,13 @@ CUEMATE_INFERENCE_CACHE_PATH=$cachePath
                 Write-Warning "Skipping model setup until Docker Desktop is ready."
                 return
             }
-            Write-SetupState -Step "prepare-models" -Status "running" -Message "Downloading and prewarming analysis models. This needs internet access and can take several minutes."
+            Write-SetupState -Step "prepare-models" -Status "running" -Message "Downloading analysis models. This needs internet access and can take several minutes."
             Invoke-External -FilePath $venvPython -Arguments @("-m", "cuemate_analysis", "download-essentia-semantic-models")
+            if ($SkipDockerSetup) {
+                Write-SetupState -Step "prepare-models" -Status "running" -ModelReady $false -Message "Model downloads finished. Docker prewarm was deferred because Docker setup was skipped."
+                return
+            }
+            Write-SetupState -Step "prepare-models" -Status "running" -Message "Prewarming Docker model services."
             Invoke-External -FilePath $venvPython -Arguments @("-m", "cuemate_analysis", "prewarm-model-services")
             Write-SetupState -Step "prepare-models" -Status "running" -ModelReady $true
         }
@@ -327,7 +332,7 @@ CUEMATE_INFERENCE_CACHE_PATH=$cachePath
     }
     if (Test-SetupBlocked) { exit 0 }
 
-    Write-SetupState -Step "complete" -Status "complete" -CoreReady $true -DockerReady (-not $SkipDockerSetup) -ModelReady (-not $SkipModelSetup) -MobileReady (-not $SkipTailscaleInstall)
+    Write-SetupState -Step "complete" -Status "complete" -CoreReady $true -DockerReady (-not $SkipDockerSetup) -ModelReady (-not $SkipModelSetup -and -not $SkipDockerSetup) -MobileReady (-not $SkipTailscaleInstall)
     Write-Host "CueMate setup complete."
 } catch {
     Write-SetupState -Step "failed" -Status "failed" -Message $_.Exception.Message

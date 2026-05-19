@@ -13,37 +13,13 @@ $logDir = Join-Path $AppDataRoot "logs"
 $venvPython = Join-Path $AppDataRoot ".venv\Scripts\python.exe"
 $databasePath = Join-Path $dataDir "cuemate.db"
 $cachePath = Join-Path $dataDir "inference-cache.db"
+$setupStatePath = Join-Path $AppDataRoot "setup-state.json"
 $remoteConfigPath = Join-Path $AppDataRoot "remote.json"
 $apiUrl = "http://127.0.0.1:8080"
 
 New-Item -ItemType Directory -Force -Path $dataDir, $logDir | Out-Null
+Import-Module (Join-Path $InstallDir "CueMate-Common.psm1") -Force
 Start-Transcript -Path (Join-Path $logDir "launcher.log") -Append | Out-Null
-
-function Get-FixedDriveLetters {
-    $letters = Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" |
-        ForEach-Object { $_.DeviceID.TrimEnd(":").ToLowerInvariant() }
-    if (-not $letters) {
-        return "c"
-    }
-    return ($letters -join ",")
-}
-
-function Set-CueMateEnvironment {
-    $env:DATABASE_URL = "sqlite:$databasePath"
-    $env:CUEMATE_INFERENCE_CACHE_PATH = $cachePath
-    $env:CUEMATE_SETUP_STATE_PATH = Join-Path $AppDataRoot "setup-state.json"
-    $env:CUEMATE_LOG_DIR = $logDir
-    $env:WEB_DIST_DIR = (Join-Path $InstallDir "web\dist")
-    $env:CUEMATE_PYTHON = $venvPython
-    $env:SCORING_GRPC_ADDR = "127.0.0.1:47834"
-    $env:GO_API_ADDR = "127.0.0.1:8080"
-    $env:CUEMATE_MUSICALKEYCNN_DRIVES = Get-FixedDriveLetters
-    $env:CUEMATE_ESSENTIA_SEMANTIC_DRIVES = $env:CUEMATE_MUSICALKEYCNN_DRIVES
-    $remoteUrl = Get-CueMateRemoteUrl
-    if ($remoteUrl) {
-        $env:CUEMATE_REMOTE_URL = $remoteUrl
-    }
-}
 
 function Get-TailscaleCommand {
     $candidates = @(
@@ -126,8 +102,8 @@ function Ensure-TailscaleServe {
         @("serve", "--bg", "http://127.0.0.1:8080"),
         @("serve", "--bg", "8080")
     )
-    foreach ($args in $serveAttempts) {
-        & $tailscale @args *> (Join-Path $logDir "tailscale-serve.log")
+    foreach ($serveArgs in $serveAttempts) {
+        & $tailscale @serveArgs *> (Join-Path $logDir "tailscale-serve.log")
         if ($LASTEXITCODE -eq 0) {
             Save-CueMateRemoteConfig -Enabled $true -RemoteUrl $remoteUrl -Message "Tailscale Serve configured."
             $env:CUEMATE_REMOTE_URL = $remoteUrl
@@ -135,6 +111,10 @@ function Ensure-TailscaleServe {
         }
     }
     Save-CueMateRemoteConfig -Enabled $false -RemoteUrl $remoteUrl -Message "Tailscale is logged in, but Serve could not be configured. See tailscale-serve.log."
+}
+
+function Set-CueMateRuntimeEnvironment {
+    Set-CueMateEnvironment -InstallDir $InstallDir -DatabasePath $databasePath -CachePath $cachePath -VenvPython $venvPython -SetupStatePath $setupStatePath -LogDir $logDir -RemoteUrl (Get-CueMateRemoteUrl)
 }
 
 function Test-HttpOk {
@@ -224,11 +204,11 @@ function Ensure-BootstrapComplete {
 }
 
 try {
-    Set-CueMateEnvironment
+    Set-CueMateRuntimeEnvironment
     Ensure-BootstrapComplete
-    Set-CueMateEnvironment
+    Set-CueMateRuntimeEnvironment
     Ensure-TailscaleServe
-    Set-CueMateEnvironment
+    Set-CueMateRuntimeEnvironment
 
     Push-Location $InstallDir
     try {

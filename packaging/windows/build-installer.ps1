@@ -83,7 +83,7 @@ function Invoke-PackagingSmoke {
     param([switch]$RequireInstaller)
 
     $powershell = Get-RequiredCommand -Name "powershell.exe" -InstallHint "PowerShell is required to run CueMate packaging checks."
-    $args = @(
+    $invokeArgs = @(
         "-NoProfile",
         "-ExecutionPolicy",
         "Bypass",
@@ -91,9 +91,9 @@ function Invoke-PackagingSmoke {
         (Join-Path $packagingRoot "Test-PackagingSmoke.ps1")
     )
     if ($RequireInstaller) {
-        $args += "-RequireInstaller"
+        $invokeArgs += "-RequireInstaller"
     }
-    Invoke-LoggedCommand -FilePath $powershell -Arguments $args -WorkingDirectory $repoRoot
+    Invoke-LoggedCommand -FilePath $powershell -Arguments $invokeArgs -WorkingDirectory $repoRoot
 }
 
 function Get-InnoCompiler {
@@ -146,6 +146,7 @@ function Assert-StagedRuntime {
         @{ Path = (Join-Path $stageRoot "docs\Decision_Engine_Plan.md"); Description = "Python root sentinel" },
         @{ Path = (Join-Path $stageRoot "Bootstrap-CueMate.ps1"); Description = "bootstrap script" },
         @{ Path = (Join-Path $stageRoot "Start-CueMate.ps1"); Description = "launcher script" },
+        @{ Path = (Join-Path $stageRoot "CueMate-Common.psm1"); Description = "shared PowerShell module" },
         @{ Path = (Join-Path $stageRoot "README.md"); Description = "user README" },
         @{ Path = (Join-Path $stageRoot ".env.example"); Description = "environment example" }
     )) {
@@ -191,6 +192,7 @@ Copy-Item (Join-Path $repoRoot ".env.example") (Join-Path $stageRoot ".env.examp
 Copy-Item (Join-Path $repoRoot "README.md") (Join-Path $stageRoot "README.md") -Force
 Copy-Item (Join-Path $packagingRoot "Bootstrap-CueMate.ps1") (Join-Path $stageRoot "Bootstrap-CueMate.ps1") -Force
 Copy-Item (Join-Path $packagingRoot "Start-CueMate.ps1") (Join-Path $stageRoot "Start-CueMate.ps1") -Force
+Copy-Item (Join-Path $packagingRoot "CueMate-Common.psm1") (Join-Path $stageRoot "CueMate-Common.psm1") -Force
 Set-Content -Path (Join-Path $stageRoot "VERSION") -Value $Version -Encoding UTF8
 
 Assert-StagedRuntime

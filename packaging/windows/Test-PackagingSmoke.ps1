@@ -42,12 +42,14 @@ Assert-Path -Path (Join-Path $StageRoot "db\schema.sql") -Description "SQLite sc
 Assert-Path -Path (Join-Path $StageRoot "scripts\docker-compose.ps1") -Description "runtime scripts"
 Assert-Path -Path (Join-Path $StageRoot "Bootstrap-CueMate.ps1") -Description "bootstrap script"
 Assert-Path -Path (Join-Path $StageRoot "Start-CueMate.ps1") -Description "launcher script"
+Assert-Path -Path (Join-Path $StageRoot "CueMate-Common.psm1") -Description "shared PowerShell module"
 Assert-Path -Path (Join-Path $StageRoot ".env.example") -Description "environment example"
 Assert-Path -Path (Join-Path $StageRoot "README.md") -Description "user README"
 Assert-Path -Path (Join-Path $StageRoot "VERSION") -Description "runtime version file"
 
 Assert-PowerShellParses -Path (Join-Path $StageRoot "Bootstrap-CueMate.ps1")
 Assert-PowerShellParses -Path (Join-Path $StageRoot "Start-CueMate.ps1")
+Assert-PowerShellParses -Path (Join-Path $StageRoot "CueMate-Common.psm1")
 Assert-PowerShellParses -Path (Join-Path $PSScriptRoot "build-installer.ps1")
 
 if ($RequireInstaller) {

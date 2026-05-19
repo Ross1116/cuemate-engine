@@ -1041,6 +1041,7 @@ func TestRemotePairingTokenIsSingleUse(t *testing.T) {
 	tokenRec := httptest.NewRecorder()
 	tokenReq := httptest.NewRequest(http.MethodPost, "/remote/pairing-token", bytes.NewBufferString(`{"device_label":"Phone"}`))
 	tokenReq.Host = "127.0.0.1:8080"
+	tokenReq.RemoteAddr = "127.0.0.1:49152"
 	srv.handleRemotePairingToken(tokenRec, tokenReq)
 	if tokenRec.Code != http.StatusOK {
 		t.Fatalf("token status = %d body=%s", tokenRec.Code, tokenRec.Body.String())
@@ -1119,6 +1120,39 @@ func TestRemoteAccessBlocksAdminRoutesEvenWithSession(t *testing.T) {
 	req.AddCookie(&http.Cookie{Name: "cuemate_remote_session", Value: sessionSecret})
 	srv.remoteAccessMiddleware(http.HandlerFunc(srv.handleToolCommand)).ServeHTTP(rec, req)
 	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestRemoteAccessDoesNotTrustSpoofedHostHeader(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/playlists", nil)
+	req.Host = "127.0.0.1:8080"
+	req.RemoteAddr = "203.0.113.10:49152"
+	srv.remoteAccessMiddleware(http.HandlerFunc(srv.handlePlaylists)).ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestSetupStatusIsNotRemotePublic(t *testing.T) {
+	if isRemotePublicRequest(httptest.NewRequest(http.MethodGet, "/setup/status", nil)) {
+		t.Fatalf("/setup/status should not be remote-public")
+	}
+}
+
+func TestRemotePairingTokenRejectsMalformedJSON(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/remote/pairing-token", bytes.NewBufferString(`{"device_label":`))
+	req.RemoteAddr = "127.0.0.1:49152"
+	srv.handleRemotePairingToken(rec, req)
+	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
 	}
 }
@@ -1208,7 +1242,12 @@ func TestToolRunRejectsUnknownAndUnsafeIDs(t *testing.T) {
 	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
 		metadataResp: fakeMetadata("rel_sig_current"),
 	})
-	for _, path := range []string{"/tools/runs/missing", "/tools/runs/..%2Fsecret"} {
+	for _, path := range []string{
+		"/tools/runs/missing",
+		"/tools/runs/..%2Fsecret",
+		"/tools/runs/5512103",
+		"/tools/runs/AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA",
+	} {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		srv.handleToolRun(rec, req)

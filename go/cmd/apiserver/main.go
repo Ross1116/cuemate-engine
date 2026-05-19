@@ -369,17 +369,15 @@ func (s *server) remoteAccessMiddleware(next http.Handler) http.Handler {
 }
 
 func isLocalRequest(r *http.Request) bool {
-	host := r.Host
+	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
+	if err != nil {
+		host = strings.Trim(strings.TrimSpace(r.RemoteAddr), "[]")
+	}
 	if host == "" {
-		host = r.URL.Host
+		return true
 	}
-	if strings.Contains(host, ":") {
-		if parsedHost, _, err := net.SplitHostPort(host); err == nil {
-			host = parsedHost
-		}
-	}
-	host = strings.Trim(strings.ToLower(host), "[]")
-	return host == "" || host == "localhost" || host == "127.0.0.1" || host == "::1"
+	ip := net.ParseIP(host)
+	return ip != nil && (ip.IsLoopback() || ip.IsUnspecified())
 }
 
 func isRemotePublicRequest(r *http.Request) bool {
@@ -409,6 +407,7 @@ func isAPIPath(path string) bool {
 		"/feedback/",
 		"/corrections",
 		"/sync/",
+		"/setup/",
 		"/tools/",
 		"/remote/",
 	} {
@@ -754,11 +753,11 @@ func (s *server) handleToolRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	runID := strings.Trim(strings.TrimPrefix(r.URL.Path, "/tools/runs/"), "/")
-	if !validRunID(runID) {
+	metaPath, err := toolRunMetaPath(runID)
+	if err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "tool run not found"})
 		return
 	}
-	metaPath := toolRunMetaPath(runID)
 	data, err := os.ReadFile(metaPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -783,16 +782,11 @@ func (s *server) handleToolRun(w http.ResponseWriter, r *http.Request) {
 }
 
 func validRunID(runID string) bool {
-	if runID == "" || len(runID) > 80 {
+	if len(runID) != 36 {
 		return false
 	}
-	for _, r := range runID {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' {
-			continue
-		}
-		return false
-	}
-	return true
+	_, err := uuid.Parse(runID)
+	return err == nil
 }
 
 func pickerScript(kind string) (string, error) {
@@ -1011,8 +1005,24 @@ func toolRunDir() string {
 	return filepath.Join("tmp", "tool-runs")
 }
 
-func toolRunMetaPath(runID string) string {
-	return filepath.Join(toolRunDir(), runID+".json")
+func toolRunMetaPath(runID string) (string, error) {
+	parsed, err := uuid.Parse(runID)
+	if err != nil || parsed.String() != runID {
+		return "", errors.New("invalid tool run id")
+	}
+	logDir, err := filepath.Abs(toolRunDir())
+	if err != nil {
+		return "", err
+	}
+	metaPath, err := filepath.Abs(filepath.Join(logDir, parsed.String()+".json"))
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(logDir, metaPath)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", errors.New("invalid tool run path")
+	}
+	return metaPath, nil
 }
 
 func writeToolRunMeta(runID string, payload map[string]any) error {
@@ -1020,7 +1030,11 @@ func writeToolRunMeta(runID string, payload map[string]any) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(toolRunMetaPath(runID), data, 0o644)
+	metaPath, err := toolRunMetaPath(runID)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(metaPath, data, 0o644)
 }
 
 func readToolRunTail(logPath string, maxBytes int64) (string, error) {
@@ -1890,7 +1904,10 @@ func (s *server) handleRemotePairingToken(w http.ResponseWriter, r *http.Request
 	}
 	var req remotePairingTokenRequest
 	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&req)
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON request"})
+			return
+		}
 	}
 	token, err := randomURLToken(32)
 	if err != nil {

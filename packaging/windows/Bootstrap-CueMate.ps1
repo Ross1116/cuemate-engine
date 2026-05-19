@@ -22,6 +22,7 @@ $bootstrapLog = Join-Path $logDir "bootstrap.log"
 $script:SetupBlocked = $false
 
 New-Item -ItemType Directory -Force -Path $AppDataRoot, $dataDir, $logDir | Out-Null
+Import-Module (Join-Path $InstallDir "CueMate-Common.psm1") -Force
 Start-Transcript -Path $bootstrapLog -Append | Out-Null
 
 function Read-SetupState {
@@ -161,7 +162,19 @@ function Get-PythonCommand {
         return $null
     }
     $versionText = & $python.Source -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
-    if ($LASTEXITCODE -ne 0 -or [version]$versionText -lt [version]"3.12") {
+    if ($LASTEXITCODE -ne 0) {
+        return $null
+    }
+    $versionMatch = [regex]::Match([string]$versionText, '^\s*(\d+\.\d+)')
+    if (-not $versionMatch.Success) {
+        return $null
+    }
+    try {
+        $parsedVersion = [version]$versionMatch.Groups[1].Value
+    } catch {
+        return $null
+    }
+    if ($parsedVersion -lt [version]"3.12") {
         return $null
     }
     return $python.Source
@@ -192,28 +205,6 @@ function Start-DockerDesktop {
             return
         }
     }
-}
-
-function Get-FixedDriveLetters {
-    $letters = Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" |
-        ForEach-Object { $_.DeviceID.TrimEnd(":").ToLowerInvariant() }
-    if (-not $letters) {
-        return "c"
-    }
-    return ($letters -join ",")
-}
-
-function Set-CueMateEnvironment {
-    $env:DATABASE_URL = "sqlite:$databasePath"
-    $env:CUEMATE_INFERENCE_CACHE_PATH = $cachePath
-    $env:CUEMATE_SETUP_STATE_PATH = $statePath
-    $env:CUEMATE_LOG_DIR = $logDir
-    $env:WEB_DIST_DIR = (Join-Path $InstallDir "web\dist")
-    $env:CUEMATE_PYTHON = $venvPython
-    $env:SCORING_GRPC_ADDR = "127.0.0.1:47834"
-    $env:GO_API_ADDR = "127.0.0.1:8080"
-    $env:CUEMATE_MUSICALKEYCNN_DRIVES = Get-FixedDriveLetters
-    $env:CUEMATE_ESSENTIA_SEMANTIC_DRIVES = $env:CUEMATE_MUSICALKEYCNN_DRIVES
 }
 
 function Initialize-Database {
@@ -284,7 +275,7 @@ try {
     if (Test-SetupBlocked) { exit 0 }
 
     Invoke-Step "initialize-data" {
-        Set-CueMateEnvironment
+        Set-CueMateEnvironment -InstallDir $InstallDir -DatabasePath $databasePath -CachePath $cachePath -VenvPython $venvPython -SetupStatePath $statePath -LogDir $logDir
         Initialize-Database
         @"
 DATABASE_URL=sqlite:$databasePath
@@ -320,7 +311,7 @@ CUEMATE_INFERENCE_CACHE_PATH=$cachePath
 
     if (-not $SkipModelSetup) {
         Invoke-Step "prepare-models" {
-            Set-CueMateEnvironment
+            Set-CueMateEnvironment -InstallDir $InstallDir -DatabasePath $databasePath -CachePath $cachePath -VenvPython $venvPython -SetupStatePath $statePath -LogDir $logDir
             if (-not $SkipDockerSetup -and -not (Wait-DockerReady -TimeoutSeconds 30)) {
                 Write-SetupState -Step "prepare-models" -Status "blocked" -Message "Docker Desktop is not ready yet. Model setup will resume the next time you launch CueMate."
                 Write-Warning "Skipping model setup until Docker Desktop is ready."

@@ -14,7 +14,7 @@ It runs on your own computer, stores data locally, and opens in your browser. Op
 
 ## One-Click Windows Install
 
-Download `CueMateSetup.exe` from the latest GitHub Release, then double-click it. If you are building from source, use the installer build command below.
+Download `CueMateSetup.exe` from the latest GitHub pre-release, then double-click it. If you are building from source, use the installer build command below.
 
 The installer puts app files here:
 

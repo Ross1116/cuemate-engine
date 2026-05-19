@@ -65,7 +65,7 @@ def _hash_file_identity(path: Path) -> str:
         stat = path.stat()
     except FileNotFoundError:
         return f"missing-{path.name}"
-    payload = f"{path.resolve()}:{stat.st_size}:{int(stat.st_mtime)}".encode("utf-8")
+    payload = f"{path.resolve()}:{stat.st_size}:{int(stat.st_mtime_ns)}".encode("utf-8")
     return hashlib.sha256(payload).hexdigest()[:12]
 
 

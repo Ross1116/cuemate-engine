@@ -544,8 +544,15 @@ func (s *server) handlePlaylistTracks(w http.ResponseWriter, r *http.Request, pl
 	limit := queryInt(r, "limit", 100)
 	offset := queryInt(r, "offset", 0)
 	metadata, metadataErr := s.runtime.RefreshMetadata(r.Context())
+	if metadataErr != nil {
+		metadata = s.runtime.CachedMetadata()
+		if metadata == nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": scoringruntime.DescribeUnavailable(metadataErr)})
+			return
+		}
+	}
 	var analysisSignature, configSignature, scoringContractID string
-	if metadataErr == nil {
+	if metadata != nil {
 		analysisSignature, configSignature, scoringContractID = activeSignatureValues(metadata.GetActiveSignatures())
 	}
 	tracks, err := s.repo.ListPlaylistTracks(r.Context(), playlistID, query, analysisState, limit, offset, analysisSignature, configSignature, scoringContractID)

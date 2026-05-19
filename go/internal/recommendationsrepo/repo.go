@@ -1068,6 +1068,7 @@ func (r *Repository) QueuePlaylistAnalysis(
 		      AND aj.status IN ('pending', 'running')
 		      AND aj.analysis_signature = ?
 		      AND aj.config_signature = ?
+		      AND aj.source_file_hash IS NOT DISTINCT FROM t.file_hash
 		  )
 		FROM playlist_tracks pt
 		JOIN tracks t ON t.id = pt.track_id

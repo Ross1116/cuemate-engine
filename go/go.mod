@@ -2,6 +2,8 @@ module github.com/Ross1116/cuemate-engine/go
 
 go 1.25.0
 
+toolchain go1.25.0
+
 require (
 	google.golang.org/grpc v1.81.1
 	google.golang.org/protobuf v1.36.11

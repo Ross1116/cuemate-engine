@@ -1,6 +1,6 @@
 # CueMate
 
-CueMate is a local DJ recommendation app. It imports your playlists, analyzes your tracks, and helps you pick the next song based on what you are trying to do in the mix: maintain, build, reset, jump, or contrast.
+CueMate is a local, playlist-specific track selection helper for DJs. It imports your playlists, analyzes your tracks, and helps you pick the next song based on what you are trying to do in the mix: maintain, build, reset, jump, or contrast.
 
 It is a passion-built product for the practical, messy, fun part of DJing: deciding what belongs next.
 
@@ -8,7 +8,7 @@ It runs on your own computer, stores data locally, and opens in your browser. Op
 
 ## Who It Is For
 
-- DJs who want better next-track suggestions without uploading their library.
+- DJs who want playlist-aware help choosing the next track.
 - Bedroom, club, and radio workflows where playlist context matters.
 - Curious music people who want a private, local tool built around real mixing habits.
 

@@ -5,6 +5,11 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release tag to publish, for example v0.1.0-beta.1'
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -12,15 +17,73 @@ permissions:
 jobs:
   release:
     name: release
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
 
-      - name: Create GitHub release
+      - name: Resolve release metadata
+        id: meta
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $tag = "${{ inputs.version }}"
+          } else {
+            $tag = "${{ github.ref_name }}"
+          }
+
+          if ($tag -notmatch '^v\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$') {
+            throw "Release tag must look like v0.1.0-beta.1 while CueMate is in beta. Got '$tag'."
+          }
+
+          $version = $tag -replace '^v', ''
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '20.19'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install web dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go/go.mod
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy Bypass -File .\packaging\windows\build-installer.ps1 `
+            -Version "${{ steps.meta.outputs.version }}" `
+            -SkipPrerequisiteInstall
+
+      - name: Publish GitHub release
+        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" \
-            --title "${GITHUB_REF_NAME}" \
-            --generate-notes
+          $tag = "${{ steps.meta.outputs.tag }}"
+          $asset = "dist\windows-installer\output\CueMateSetup.exe"
+          if (-not (Test-Path $asset)) {
+            throw "Installer asset is missing at $asset"
+          }
+
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $asset --clobber
+          } else {
+            gh release create $tag $asset `
+              --title $tag `
+              --generate-notes `
+              --target "${{ github.sha }}"
+          }

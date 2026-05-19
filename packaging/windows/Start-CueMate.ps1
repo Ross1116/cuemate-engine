@@ -17,15 +17,14 @@ $setupStatePath = Join-Path $AppDataRoot "setup-state.json"
 $remoteConfigPath = Join-Path $AppDataRoot "remote.json"
 $bootstrapLogPath = Join-Path $logDir "bootstrap.log"
 $launcherLogPath = Join-Path $logDir "launcher.log"
+$launcherErrorLogPath = Join-Path $logDir "launcher-error.log"
 $scorerOutLogPath = Join-Path $logDir "scorer.out.log"
 $scorerErrLogPath = Join-Path $logDir "scorer.err.log"
 $apiOutLogPath = Join-Path $logDir "apiserver.out.log"
 $apiErrLogPath = Join-Path $logDir "apiserver.err.log"
 $apiUrl = "http://127.0.0.1:8080"
 
-New-Item -ItemType Directory -Force -Path $dataDir, $logDir | Out-Null
-Import-Module (Join-Path $InstallDir "CueMate-Common.psm1") -Force
-Start-Transcript -Path $launcherLogPath -Append | Out-Null
+$script:TranscriptStarted = $false
 
 function Get-TailscaleCommand {
     $candidates = @(
@@ -255,7 +254,61 @@ function Ensure-BootstrapComplete {
     }
 }
 
+function Write-LaunchFailure {
+    param([object]$ErrorRecord)
+
+    $errorMessage = if ($ErrorRecord -and $ErrorRecord.Exception) { [string]$ErrorRecord.Exception.Message } else { [string]$ErrorRecord }
+    $details = @"
+CueMate failed to launch.
+
+Error:
+$errorMessage
+
+Logs:
+Launcher: $launcherLogPath
+Last launch error: $launcherErrorLogPath
+Bootstrap/setup: $bootstrapLogPath
+API stdout: $apiOutLogPath
+API stderr: $apiErrLogPath
+Scorer stdout: $scorerOutLogPath
+Scorer stderr: $scorerErrLogPath
+
+Install directory:
+$InstallDir
+
+App data directory:
+$AppDataRoot
+"@
+
+    New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+    $details | Set-Content -Path $launcherErrorLogPath -Encoding UTF8
+    Write-Host $details -ForegroundColor Red
+
+    try {
+        Add-Type -AssemblyName System.Windows.Forms
+        [System.Windows.Forms.MessageBox]::Show(
+            $details,
+            "CueMate launch failed",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error
+        ) | Out-Null
+    } catch {
+        # The console output and launcher-error.log still contain the same details.
+    }
+
+    try {
+        Start-Process -FilePath "notepad.exe" -ArgumentList @($launcherErrorLogPath) | Out-Null
+    } catch {
+        # Best effort only.
+    }
+}
+
 try {
+    New-Item -ItemType Directory -Force -Path $dataDir, $logDir | Out-Null
+    Start-Transcript -Path $launcherLogPath -Append | Out-Null
+    $script:TranscriptStarted = $true
+    Import-Module (Join-Path $InstallDir "CueMate-Common.psm1") -Force
+
     Set-CueMateRuntimeEnvironment
     Ensure-BootstrapComplete
     Set-CueMateRuntimeEnvironment
@@ -293,6 +346,11 @@ try {
     } finally {
         Pop-Location
     }
+} catch {
+    Write-LaunchFailure -ErrorRecord $_
+    exit 1
 } finally {
-    Stop-Transcript | Out-Null
+    if ($script:TranscriptStarted) {
+        Stop-Transcript | Out-Null
+    }
 }

@@ -143,7 +143,6 @@ function Assert-StagedRuntime {
         @{ Path = (Join-Path $stageRoot "config"); Description = "runtime config" },
         @{ Path = (Join-Path $stageRoot "db\schema.sql"); Description = "SQLite schema" },
         @{ Path = (Join-Path $stageRoot "scripts\docker-compose.ps1"); Description = "runtime scripts" },
-        @{ Path = (Join-Path $stageRoot "docs\Decision_Engine_Plan.md"); Description = "Python root sentinel" },
         @{ Path = (Join-Path $stageRoot "Bootstrap-CueMate.ps1"); Description = "bootstrap script" },
         @{ Path = (Join-Path $stageRoot "Start-CueMate.ps1"); Description = "launcher script" },
         @{ Path = (Join-Path $stageRoot "CueMate-Common.psm1"); Description = "shared PowerShell module" },
@@ -156,7 +155,7 @@ function Assert-StagedRuntime {
 
 Write-Host "Preparing CueMate installer build $Version"
 Get-RequiredCommand -Name "npm.cmd" -InstallHint "Install Node.js LTS, then rerun this script." | Out-Null
-Get-RequiredCommand -Name "go.exe" -InstallHint "Install Go 1.24 or newer, then rerun this script." | Out-Null
+Get-RequiredCommand -Name "go.exe" -InstallHint "Install Go 1.25 or newer, then rerun this script." | Out-Null
 Get-RequiredCommand -Name "powershell.exe" -InstallHint "PowerShell is required to build CueMate." | Out-Null
 
 foreach ($source in @(
@@ -164,8 +163,7 @@ foreach ($source in @(
     @{ Path = (Join-Path $repoRoot "go\go.mod"); Description = "Go module" },
     @{ Path = (Join-Path $repoRoot "python\pyproject.toml"); Description = "Python package" },
     @{ Path = (Join-Path $repoRoot "docker"); Description = "Docker assets" },
-    @{ Path = (Join-Path $repoRoot "db\schema.sql"); Description = "database schema" },
-    @{ Path = (Join-Path $repoRoot "docs\Decision_Engine_Plan.md"); Description = "Python root sentinel" }
+    @{ Path = (Join-Path $repoRoot "db\schema.sql"); Description = "database schema" }
 )) {
     Assert-SourcePath -Path $source.Path -Description $source.Description
 }
@@ -174,7 +172,7 @@ Remove-Item $distRoot -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $stageRoot, $outputRoot | Out-Null
 
 Invoke-LoggedCommand -FilePath (Get-RequiredCommand -Name "npm.cmd" -InstallHint "Install Node.js LTS, then rerun this script.") -Arguments @("run", "build") -WorkingDirectory (Join-Path $repoRoot "web")
-Invoke-LoggedCommand -FilePath (Get-RequiredCommand -Name "go.exe" -InstallHint "Install Go 1.24 or newer, then rerun this script.") -Arguments @("build", "-o", $goExe, "./cmd/apiserver") -WorkingDirectory (Join-Path $repoRoot "go")
+Invoke-LoggedCommand -FilePath (Get-RequiredCommand -Name "go.exe" -InstallHint "Install Go 1.25 or newer, then rerun this script.") -Arguments @("build", "-o", $goExe, "./cmd/apiserver") -WorkingDirectory (Join-Path $repoRoot "go")
 
 Invoke-RobocopyChecked -Source (Join-Path $repoRoot "python") -Destination (Join-Path $stageRoot "python") -ExtraArgs @(
     "/XD", ".venv", "__pycache__", ".pytest_cache", ".ruff_cache", "*.egg-info",
@@ -186,8 +184,6 @@ Invoke-RobocopyChecked -Source (Join-Path $repoRoot "db") -Destination (Join-Pat
 Invoke-RobocopyChecked -Source (Join-Path $repoRoot "scripts") -Destination (Join-Path $stageRoot "scripts")
 Invoke-RobocopyChecked -Source (Join-Path $repoRoot "web\dist") -Destination (Join-Path $stageRoot "web\dist")
 
-New-Item -ItemType Directory -Force -Path (Join-Path $stageRoot "docs") | Out-Null
-Copy-Item (Join-Path $repoRoot "docs\Decision_Engine_Plan.md") (Join-Path $stageRoot "docs\Decision_Engine_Plan.md") -Force
 Copy-Item (Join-Path $repoRoot ".env.example") (Join-Path $stageRoot ".env.example") -Force
 Copy-Item (Join-Path $repoRoot "README.md") (Join-Path $stageRoot "README.md") -Force
 Copy-Item (Join-Path $packagingRoot "Bootstrap-CueMate.ps1") (Join-Path $stageRoot "Bootstrap-CueMate.ps1") -Force

@@ -1157,6 +1157,24 @@ func TestRemotePairingTokenRejectsMalformedJSON(t *testing.T) {
 	}
 }
 
+func TestParsePickerPathsAcceptsArrayAndSingleString(t *testing.T) {
+	paths, err := parsePickerPaths([]byte(`["C:\\Music","D:\\Tracks"]`))
+	if err != nil {
+		t.Fatalf("parse array: %v", err)
+	}
+	if len(paths) != 2 || paths[0] != `C:\Music` || paths[1] != `D:\Tracks` {
+		t.Fatalf("array paths = %#v", paths)
+	}
+
+	paths, err = parsePickerPaths([]byte(`"C:\\Music"`))
+	if err != nil {
+		t.Fatalf("parse string: %v", err)
+	}
+	if len(paths) != 1 || paths[0] != `C:\Music` {
+		t.Fatalf("single path = %#v", paths)
+	}
+}
+
 func TestPlaylistAnalysisStatusSummarizesJobs(t *testing.T) {
 	srv := newTestServer(t, true, "rel_sig_current", &fakeRuntimeClient{
 		metadataResp: fakeMetadata("rel_sig_current"),

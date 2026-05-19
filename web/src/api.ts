@@ -156,6 +156,7 @@ export type PlaylistAnalysisStatus = {
   playlist_name: string;
   total_tracks: number;
   ready_tracks: number;
+  outdated_tracks: number;
   percent_complete: number;
   is_stale: boolean;
   stale_reason: string | null;

@@ -1,18 +1,20 @@
 # CueMate
 
-CueMate is a local DJ recommendation app. It imports your playlists, analyzes your tracks, and helps you pick the next song based on what you are trying to do in the mix: maintain, build, reset, jump, or contrast.
+CueMate is a local, playlist-specific track selection helper for DJs. It imports your playlists, analyzes your tracks, and helps you pick the next song based on what you are trying to do in the mix: maintain, build, reset, jump, or contrast.
+
+It is a passion-built product for the practical, messy, fun part of DJing: deciding what belongs next.
 
 It runs on your own computer, stores data locally, and opens in your browser. Optional phone access is available through Tailscale, so you can scan a QR code and use the same CueMate session from your mobile device.
 
 ## Who It Is For
 
-- DJs who want better next-track suggestions without uploading their library.
+- DJs who want playlist-aware help choosing the next track.
 - Bedroom, club, and radio workflows where playlist context matters.
-- Technical reviewers who want to see a local-first product with Go, React, Python, SQLite, gRPC, Docker model services, and Windows packaging.
+- Curious music people who want a private, local tool built around real mixing habits.
 
 ## One-Click Windows Install
 
-Download or build `CueMateSetup.exe`, then double-click it.
+Download `CueMateSetup.exe` from the latest GitHub pre-release, then double-click it. If you are building from source, use the installer build command below.
 
 The installer puts app files here:
 
@@ -91,7 +93,7 @@ CueMate still works locally. For mobile access, make sure Tailscale is installed
 Prerequisites:
 
 - Windows 10/11 recommended
-- Go 1.24+
+- Go 1.25+
 - Python 3.12+
 - Node.js/npm
 - Docker Desktop
@@ -148,6 +150,17 @@ Output:
 ```text
 dist\windows-installer\output\CueMateSetup.exe
 ```
+
+`dist/` is ignored by git on purpose. The installer is a generated release artifact, so it should be uploaded to a GitHub Release instead of committed to the repository.
+
+Publish a release installer:
+
+```powershell
+git tag v0.1.0-beta.1
+git push origin v0.1.0-beta.1
+```
+
+Pushing a `v*` tag runs the Release workflow. For beta builds, use prerelease-style tags such as `v0.1.0-beta.1`, `v0.1.0-beta.2`, and so on. The workflow builds `CueMateSetup.exe` on Windows and attaches it to the matching GitHub Release. You can also run the Release workflow manually from GitHub Actions and provide a beta version such as `v0.1.0-beta.1`.
 
 Fast staging-only check:
 

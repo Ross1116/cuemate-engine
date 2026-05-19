@@ -210,12 +210,14 @@ function pillClass(value?: string | null) {
   if (key.includes("peak") || key.includes("high") || key.includes("risk")) return "pill hot";
   if (key.includes("drive") || key.includes("build")) return "pill lime";
   if (key.includes("ready") || key.includes("available")) return "pill cyan";
-  if (key.includes("stale") || key.includes("unanalysed")) return "pill amber";
+  if (key.includes("stale") || key.includes("unanalysed") || key.includes("outdated")) return "pill amber";
   return "pill";
 }
 
 function operationStartedMessage(action: string) {
   switch (action) {
+    case "list_dj_playlists":
+      return "Reading DJ playlists...";
     case "import_playlist":
     case "import_dj_playlist":
       return "Import started...";
@@ -230,6 +232,37 @@ function operationStartedMessage(action: string) {
     default:
       return "Working...";
   }
+}
+
+function parseDJPlaylistNames(output?: string) {
+  if (!output) return [];
+  const seen = new Set<string>();
+  const ansiEscapePattern = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, "g");
+  const names = output
+    .split(/\r?\n/)
+    .map((line) => line.replace(ansiEscapePattern, "").trim())
+    .map((line) => {
+      const bulletMatch = line.match(/^[-*]\s+(.+?)\s*$/);
+      if (bulletMatch) return bulletMatch[1].trim();
+      const numberedMatch = line.match(/^\d+[.)]\s+(.+?)\s*$/);
+      if (numberedMatch) return numberedMatch[1].trim();
+      return "";
+    })
+    .filter(Boolean)
+    .filter((name) => {
+      if (seen.has(name)) return false;
+      seen.add(name);
+      return true;
+    });
+  return names;
+}
+
+function isListDJPlaylistsResult(result: ToolCommandResult | null) {
+  return result?.command?.some((part) => part === "list-dj-playlists") ?? false;
+}
+
+function boundedPercent(value: number) {
+  return Math.max(0, Math.min(100, value));
 }
 
 export function App() {
@@ -322,13 +355,24 @@ export function App() {
   });
 
   const refreshMutation = useMutation({
-    mutationFn: (body?: { force?: boolean; analysis_mode?: "fast_pass" | "staged" | "full" }) =>
-      api.refreshPlaylistAnalysis(selectedPlaylistId, body),
-    onMutate: (body) => setOperationMessage(body?.force ? "Force reanalysis queued..." : "Smart refresh queued..."),
+    mutationFn: async (body?: { force?: boolean; analysis_mode?: "fast_pass" | "staged" | "full" }) => {
+      const refresh = await api.refreshPlaylistAnalysis(selectedPlaylistId, body);
+      const worker = await api.toolCommand({ action: "run_analysis_worker", limit: 1000 });
+      return { refresh, worker };
+    },
+    onMutate: (body) => setOperationMessage(body?.force ? "Force reanalysis queued. Starting worker..." : "Smart refresh queued. Starting worker..."),
     onSuccess: (result) => {
-      setOperationMessage(result.queued_count ? `${result.queued_count} analysis job${result.queued_count === 1 ? "" : "s"} queued.` : "Playlist is already up to date.");
+      setLastToolResult(result.worker);
+      if (result.worker.run_id) setActiveRunId(result.worker.run_id);
+      const queued = result.refresh.queued_count;
+      setOperationMessage(
+        queued
+          ? `${queued} analysis job${queued === 1 ? "" : "s"} queued. Worker started in the background.`
+          : "No new jobs were queued. Worker checked for any pending analysis.",
+      );
       void queryClient.invalidateQueries({ queryKey: ["jobs"] });
       void queryClient.invalidateQueries({ queryKey: ["analysisStatus"] });
+      void queryClient.invalidateQueries({ queryKey: ["playlistTracks"] });
       void queryClient.invalidateQueries({ queryKey: ["playlists"] });
     },
     onError: (error) => setOperationMessage(`Failed: ${error instanceof Error ? error.message : "analysis refresh failed"}`),
@@ -394,6 +438,15 @@ export function App() {
   });
 
   useEffect(() => {
+    if (!activeToolRun.data || activeToolRun.data.status === "running") return;
+    void queryClient.invalidateQueries({ queryKey: ["playlists"] });
+    void queryClient.invalidateQueries({ queryKey: ["playlistTracks"] });
+    void queryClient.invalidateQueries({ queryKey: ["jobs"] });
+    void queryClient.invalidateQueries({ queryKey: ["analysisStatus"] });
+    void queryClient.invalidateQueries({ queryKey: ["recommendations"] });
+  }, [activeToolRun.data, queryClient]);
+
+  useEffect(() => {
     const token = new URLSearchParams(window.location.search).get("pair_token");
     if (token && consumedPairTokenRef.current !== token) {
       consumedPairTokenRef.current = token;
@@ -451,15 +504,17 @@ export function App() {
           </span>
         </div>
       </header>
-      {remoteConsumePairMutation.isPending || remoteConsumePairMutation.isSuccess || remoteConsumePairMutation.error ? (
-        <div className="remote-pair-banner">
-          {remoteConsumePairMutation.isPending ? "Pairing this phone..." : null}
-          {remoteConsumePairMutation.isSuccess ? "Phone paired. CueMate is ready here." : null}
-          {remoteConsumePairMutation.error ? `Pairing failed: ${remoteConsumePairMutation.error.message}` : null}
-        </div>
-      ) : null}
-      <SetupStatusBanner status={setupStatus.data} />
-      <OperationBanner message={operationMessage} run={activeToolRun.data} />
+      <div className="global-status-stack">
+        {remoteConsumePairMutation.isPending || remoteConsumePairMutation.isSuccess || remoteConsumePairMutation.error ? (
+          <div className="remote-pair-banner">
+            {remoteConsumePairMutation.isPending ? "Pairing this phone..." : null}
+            {remoteConsumePairMutation.isSuccess ? "Phone paired. CueMate is ready here." : null}
+            {remoteConsumePairMutation.error ? `Pairing failed: ${remoteConsumePairMutation.error.message}` : null}
+          </div>
+        ) : null}
+        <SetupStatusBanner status={setupStatus.data} />
+        <OperationBanner message={operationMessage} run={activeToolRun.data} status={analysisStatus.data} />
+      </div>
 
       <aside className="library-pane panel mobile-library">
         <PaneTitle icon={<Library />} title="Library" action={`${playlists.data?.items.length ?? 0} playlists`} />
@@ -594,10 +649,10 @@ export function App() {
             onSmartRefresh={() => refreshMutation.mutate({ analysis_mode: "staged" })}
             onForceRefresh={() => refreshMutation.mutate({ analysis_mode: "staged", force: true })}
             queueBusy={refreshMutation.isPending}
-            queueResult={refreshMutation.data?.queued_count}
+            queueResult={refreshMutation.data?.refresh.queued_count}
             onRemovePlaylist={(id) => removePlaylistMutation.mutate(id)}
             removeBusy={removePlaylistMutation.isPending}
-            onRunWorker={() => toolMutation.mutate({ action: "run_analysis_worker", limit: 25 })}
+            onRunWorker={() => toolMutation.mutate({ action: "run_analysis_worker", limit: 1000 })}
             onTool={(payload) => toolMutation.mutate(payload)}
             toolBusy={toolMutation.isPending}
             toolResult={lastToolResult}
@@ -660,19 +715,36 @@ function SetupStatusBanner({ status }: { status?: SetupStatus }) {
   );
 }
 
-function OperationBanner({ message, run }: { message: string; run?: ToolRunStatus }) {
+function OperationBanner({ message, run, status }: { message: string; run?: ToolRunStatus; status?: PlaylistAnalysisStatus }) {
+  const activeJobs = (status?.jobs.pending ?? 0) + (status?.jobs.running ?? 0);
+  const total = status?.total_tracks ?? 0;
+  const ready = status?.ready_tracks ?? 0;
+  const percent = total ? Math.round((ready / total) * 100) : 0;
   const runMessage =
     run?.status === "running"
-      ? "Background tool is running."
+      ? "Analysis worker is running in the background."
       : run?.status === "completed"
-        ? "Background tool finished."
+        ? "Analysis worker finished."
         : run?.status === "failed"
           ? `Background tool failed${run.error ? `: ${run.error}` : "."}`
           : "";
-  if (!message && !runMessage) return null;
+  if (!message && !runMessage && !activeJobs) return null;
   return (
-    <div className={run?.status === "failed" ? "operation-banner danger" : "operation-banner"}>
-      <span>{runMessage || message}</span>
+    <div className={run?.status === "failed" ? "operation-banner danger" : activeJobs ? "operation-banner active" : "operation-banner"}>
+      <span>{runMessage || message || "Analysis work is in progress."}</span>
+      {activeJobs ? (
+        <div className="operation-progress" aria-label={`Analysis progress ${ready} of ${total} ready`}>
+          <div className="operation-progress-head">
+            <strong>{percent}% current</strong>
+            <small>
+              {ready}/{total} ready · {status?.jobs.running ?? 0} running · {status?.jobs.pending ?? 0} queued
+            </small>
+          </div>
+          <div className="progress-track animated">
+            <span style={{ width: `${boundedPercent(percent)}%` }} />
+          </div>
+        </div>
+      ) : null}
       {run?.log_path ? <small>Log: {run.log_path}</small> : null}
     </div>
   );
@@ -1706,7 +1778,10 @@ function FullToolsPanel({
   const [djSource, setDjSource] = useState<"rekordbox" | "traktor" | "serato">("rekordbox");
   const [djLibrary, setDjLibrary] = useState("");
   const [djPlaylist, setDjPlaylist] = useState("");
+  const [djPlaylistOptions, setDjPlaylistOptions] = useState<string[]>([]);
+  const [djPlaylistLoad, setDjPlaylistLoad] = useState<{ status: "idle" | "loading" | "loaded" | "error"; error?: string }>({ status: "idle" });
   const [djName, setDjName] = useState("");
+  const djPlaylistLoadRequestRef = useRef(0);
   const pickPathMutation = useMutation({ mutationFn: api.pickPath });
 
   const localPathList = localPaths
@@ -1715,6 +1790,63 @@ function FullToolsPanel({
     .filter(Boolean);
   const pickerBusy = pickPathMutation.isPending;
   const pickerError = pickPathMutation.error instanceof Error ? pickPathMutation.error.message : null;
+
+  const applyDJPlaylistOptions = useCallback((names: string[]) => {
+    setDjPlaylistOptions(names);
+    if (names.length > 0) {
+      setDjPlaylist((current) => (names.includes(current) ? current : names[0]));
+    }
+  }, []);
+
+  const loadDJPlaylistOptions = useCallback(
+    async (source: "rekordbox" | "traktor" | "serato", libraryPath: string) => {
+      const library = libraryPath.trim();
+      const requestId = ++djPlaylistLoadRequestRef.current;
+      if (!library) {
+        setDjPlaylistOptions([]);
+        setDjPlaylistLoad({ status: "idle" });
+        return;
+      }
+
+      setDjPlaylistOptions([]);
+      setDjPlaylist("");
+      setDjPlaylistLoad({ status: "loading" });
+      try {
+        const result = await api.toolCommand({ action: "list_dj_playlists", source, library });
+        if (requestId !== djPlaylistLoadRequestRef.current) return;
+        const names = parseDJPlaylistNames(result.output);
+        applyDJPlaylistOptions(names);
+        setDjPlaylistLoad({ status: "loaded" });
+      } catch (error) {
+        if (requestId !== djPlaylistLoadRequestRef.current) return;
+        setDjPlaylistOptions([]);
+        setDjPlaylistLoad({ status: "error", error: error instanceof Error ? error.message : "Could not load playlists." });
+      }
+    },
+    [applyDJPlaylistOptions],
+  );
+
+  useEffect(() => {
+    if (!isListDJPlaylistsResult(toolResult)) return;
+    const names = parseDJPlaylistNames(toolResult?.output);
+    applyDJPlaylistOptions(names);
+    setDjPlaylistLoad({ status: "loaded" });
+  }, [applyDJPlaylistOptions, toolResult]);
+
+  useEffect(() => {
+    const library = djLibrary.trim();
+    if (!library) {
+      setDjPlaylistOptions([]);
+      setDjPlaylist("");
+      setDjPlaylistLoad({ status: "idle" });
+      return;
+    }
+
+    const timeout = window.setTimeout(() => {
+      void loadDJPlaylistOptions(djSource, library);
+    }, 350);
+    return () => window.clearTimeout(timeout);
+  }, [djLibrary, djSource, loadDJPlaylistOptions]);
 
   const appendLocalPaths = (paths: string[]) => {
     setLocalPaths((current) => {
@@ -1747,7 +1879,11 @@ function FullToolsPanel({
   const chooseDJLibrary = async () => {
     const kind: PickPathRequest["kind"] = djSource === "serato" ? "folder" : "dj_library_file";
     const paths = await pickPaths(kind);
-    if (paths[0]) setDjLibrary(paths[0]);
+    if (paths[0]) {
+      setDjLibrary(paths[0]);
+      setDjPlaylist("");
+      setDjPlaylistOptions([]);
+    }
   };
 
   return (
@@ -1804,7 +1940,14 @@ function FullToolsPanel({
       <ToolSection icon={<ListMusic />} title="Import DJ library" description="Pull an existing Rekordbox, Traktor, or Serato playlist into CueMate.">
         <div className="field-group">
           <label className="field-label">DJ source</label>
-          <select value={djSource} onChange={(event) => setDjSource(event.target.value as "rekordbox" | "traktor" | "serato")}>
+          <select
+            value={djSource}
+            onChange={(event) => {
+              setDjSource(event.target.value as "rekordbox" | "traktor" | "serato");
+              setDjPlaylist("");
+              setDjPlaylistOptions([]);
+            }}
+          >
             <option value="rekordbox">Rekordbox XML</option>
             <option value="traktor">Traktor NML</option>
             <option value="serato">Serato crate</option>
@@ -1813,25 +1956,63 @@ function FullToolsPanel({
         <div className="field-group">
           <label className="field-label">{djSource === "serato" ? "Serato crate folder" : "Library export file"}</label>
           <div className="pick-row">
-            <input value={djLibrary} onChange={(event) => setDjLibrary(event.target.value)} placeholder={djSource === "serato" ? "Choose a Serato crate folder" : "Choose a Rekordbox XML or Traktor NML export"} />
+            <input
+              value={djLibrary}
+              onChange={(event) => {
+                setDjLibrary(event.target.value);
+                setDjPlaylist("");
+                setDjPlaylistOptions([]);
+              }}
+              placeholder={djSource === "serato" ? "Choose a Serato crate folder" : "Choose a Rekordbox XML or Traktor NML export"}
+            />
             <button className="path-pick" disabled={pickerBusy} onClick={chooseDJLibrary}>
               <FolderOpen size={16} /> Browse
             </button>
           </div>
         </div>
-        <div className="field-grid">
-          <div className="field-group">
-            <label className="field-label">Source playlist or crate</label>
-            <input value={djPlaylist} onChange={(event) => setDjPlaylist(event.target.value)} placeholder="Source name" />
-          </div>
-          <div className="field-group">
-            <label className="field-label">CueMate playlist name</label>
-            <input value={djName} onChange={(event) => setDjName(event.target.value)} placeholder="Optional name" />
-          </div>
+        <div className="field-group">
+          <label className="field-label">Source playlist or crate</label>
+          <select
+            value={djPlaylistOptions.includes(djPlaylist) ? djPlaylist : ""}
+            disabled={djPlaylistLoad.status === "loading" || djPlaylistOptions.length === 0}
+            onChange={(event) => setDjPlaylist(event.target.value)}
+          >
+            <option value="">
+              {djPlaylistLoad.status === "loading"
+                ? "Loading playlists..."
+                : djPlaylistOptions.length > 0
+                  ? "Select a source playlist or crate"
+                  : "Choose a library file to load playlists"}
+            </option>
+            {djPlaylistOptions.map((name) => (
+              <option key={name} value={name}>
+                {name}
+              </option>
+            ))}
+          </select>
+          {djPlaylistOptions.length > 0 ? (
+            <p className="selection-summary">{djPlaylistOptions.length} playlist{djPlaylistOptions.length === 1 ? "" : "s"} found. Choose one, then import.</p>
+          ) : djPlaylistLoad.status === "loading" ? (
+            <p className="selection-summary">Reading playlists from the selected library...</p>
+          ) : djPlaylistLoad.status === "error" ? (
+            <>
+              <input value={djPlaylist} onChange={(event) => setDjPlaylist(event.target.value)} placeholder="Paste a source name manually" />
+              <p className="selection-summary danger">Could not load playlists: {djPlaylistLoad.error}</p>
+            </>
+          ) : (
+            <>
+              <input value={djPlaylist} onChange={(event) => setDjPlaylist(event.target.value)} placeholder="Or paste a source name manually" />
+              <p className="selection-summary">Choose a library file to load playlists automatically.</p>
+            </>
+          )}
+        </div>
+        <div className="field-group">
+          <label className="field-label">CueMate playlist name</label>
+          <input value={djName} onChange={(event) => setDjName(event.target.value)} placeholder={djPlaylist || "Optional name"} />
         </div>
         <div className="split-actions">
-          <button className="wide-action secondary" disabled={toolBusy || !djLibrary.trim()} onClick={() => onTool({ action: "list_dj_playlists", source: djSource, library: djLibrary })}>
-            List
+          <button className="wide-action secondary" disabled={toolBusy || djPlaylistLoad.status === "loading" || !djLibrary.trim()} onClick={() => void loadDJPlaylistOptions(djSource, djLibrary)}>
+            {djPlaylistLoad.status === "loading" ? "Loading..." : "Refresh list"}
           </button>
           <button
             className="wide-action"
@@ -1910,6 +2091,12 @@ function PlaylistSetupPanel({
 }) {
   const total = status?.total_tracks ?? playlist?.track_count ?? 0;
   const ready = status?.ready_tracks ?? playlist?.track_count_analyzed ?? 0;
+  const outdated = status?.outdated_tracks ?? 0;
+  const queued = status?.jobs.pending ?? 0;
+  const running = status?.jobs.running ?? 0;
+  const failed = status?.jobs.failed ?? 0;
+  const missing = Math.max(0, total - ready - outdated);
+  const activeJobs = queued + running;
   const percent = status?.percent_complete ?? (total ? Math.round((ready / total) * 100) : 0);
   const stateLabel = setupStateLabel(status, playlist);
   const latestFailed = jobs.find((job) => job.status === "failed");
@@ -1937,23 +2124,38 @@ function PlaylistSetupPanel({
           </div>
           <div className="progress-row">
             <div className="progress-track">
-              <span style={{ width: `${Math.max(0, Math.min(100, percent))}%` }} />
+              <span style={{ width: `${boundedPercent(percent)}%` }} />
             </div>
-            <strong>{ready}/{total} ready</strong>
+            <strong>{ready}/{total} current</strong>
+          </div>
+          <div className={activeJobs ? "analysis-progress active" : "analysis-progress"}>
+            <div className="analysis-progress-bar" aria-label="Playlist analysis breakdown">
+              <span className="ready" style={{ width: `${total ? boundedPercent((ready / total) * 100) : 0}%` }} />
+              <span className="outdated" style={{ width: `${total ? boundedPercent((outdated / total) * 100) : 0}%` }} />
+              <span className="missing" style={{ width: `${total ? boundedPercent((missing / total) * 100) : 0}%` }} />
+            </div>
+            <div className="analysis-legend">
+              <span><i className="ready" /> Current {ready}</span>
+              {outdated ? <span><i className="outdated" /> Outdated {outdated}</span> : null}
+              {missing ? <span><i className="missing" /> Missing {missing}</span> : null}
+              {running ? <span><i className="running" /> Running {running}</span> : null}
+              {queued ? <span><i className="queued" /> Queued {queued}</span> : null}
+            </div>
           </div>
           <div className="metric-grid">
-            <Metric label="Queued" value={(status?.jobs.pending ?? 0).toString()} />
-            <Metric label="Running" value={(status?.jobs.running ?? 0).toString()} />
-            <Metric label="Failed" value={(status?.jobs.failed ?? 0).toString()} />
+            <Metric label="Queued" value={queued.toString()} />
+            <Metric label="Running" value={running.toString()} />
+            <Metric label="Failed" value={failed.toString()} />
+            {outdated > 0 ? <Metric label="Outdated" value={outdated.toString()} /> : null}
           </div>
           <p className="setup-guidance">{setupGuidance(status, total, ready)}</p>
           {latestFailed?.error_message || status?.latest_error ? <p className="action-note danger">Latest failure: {latestFailed?.error_message ?? status?.latest_error}</p> : null}
           <div className="split-actions">
             <button className="wide-action" disabled={queueBusy} onClick={onSmartRefresh}>
-              <RefreshCw size={16} /> {queueBusy ? "Queueing..." : "Smart refresh playlist"}
+              <RefreshCw size={16} /> {queueBusy ? "Starting analysis..." : "Refresh and analyse playlist"}
             </button>
             <button className="wide-action secondary" disabled={queueBusy} onClick={onForceRefresh}>
-              Force reanalyse all tracks
+              Force reanalyse and run worker
             </button>
           </div>
           <button className="wide-action secondary" disabled={workerBusy} onClick={onRunWorker}>
@@ -1974,6 +2176,7 @@ function setupStateLabel(status?: PlaylistAnalysisStatus, playlist?: Playlist) {
   if (status?.jobs.running) return "Running";
   if (status?.jobs.pending) return "Queued";
   if (status?.is_stale || playlist?.is_stale) return "Out of date";
+  if (status?.outdated_tracks) return "Outdated";
   const total = status?.total_tracks ?? playlist?.track_count ?? 0;
   const ready = status?.ready_tracks ?? playlist?.track_count_analyzed ?? 0;
   if (total > 0 && ready >= total) return "Ready";
@@ -1983,9 +2186,10 @@ function setupStateLabel(status?: PlaylistAnalysisStatus, playlist?: Playlist) {
 function setupGuidance(status: PlaylistAnalysisStatus | undefined, total: number, ready: number) {
   if (!total) return "Import tracks first. CueMate will analyse them before recommendations become useful.";
   if (status?.jobs.failed) return "Some analysis jobs failed. Check the tool output below, then try Smart refresh again.";
-  if (status?.jobs.running) return "Analysis is running. This page will update as tracks become ready.";
-  if (status?.jobs.pending) return "Analysis is queued. Run the analysis worker if nothing is moving.";
+  if (status?.jobs.running) return status.outdated_tracks ? "Reanalysis is running. Existing rows are old and recommendations unlock as current jobs finish." : "Analysis is running. This page will update as tracks become ready.";
+  if (status?.jobs.pending) return status.outdated_tracks ? "Reanalysis is queued. Run the analysis worker if nothing is moving." : "Analysis is queued. Run the analysis worker if nothing is moving.";
   if (status?.is_stale) return `Out of date: ${status.stale_reason || "playlist analysis needs refresh"}. Smart refresh will queue only what changed.`;
+  if (status?.outdated_tracks) return `${status.outdated_tracks} track${status.outdated_tracks === 1 ? "" : "s"} need reanalysis for the current scoring engine.`;
   if (ready < total) return "Some tracks still need analysis. Smart refresh queues only missing or outdated work.";
   return "Ready. Recommendations can use this playlist now.";
 }

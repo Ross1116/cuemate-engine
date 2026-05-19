@@ -52,6 +52,7 @@ type PlaylistAnalysisStatus struct {
 	PlaylistName    string
 	TotalTracks     int
 	ReadyTracks     int
+	OutdatedTracks  int
 	Counts          AnalysisJobCounts
 	IsStale         bool
 	StaleReason     string
@@ -162,15 +163,18 @@ type HydratedRecommendations struct {
 }
 
 type PlaylistTrackSnapshot struct {
-	TrackID       string
-	Title         string
-	Artist        string
-	Position      int
-	BPM           *float64
-	Key           *string
-	IntensityBand *string
-	RoleHints     []string
-	AnalysisState string
+	TrackID                   string
+	Title                     string
+	Artist                    string
+	Position                  int
+	BPM                       *float64
+	Key                       *string
+	IntensityBand             *string
+	RoleHints                 []string
+	AnalysisState             string
+	AnalysisSignature         *string
+	ConfigSignature           *string
+	ScoringContractAtAnalysis *string
 }
 
 type TrackFeatureDetail struct {
@@ -414,12 +418,12 @@ func (r *Repository) ListPlaylists(ctx context.Context) ([]PlaylistSummary, erro
 	return out, rows.Err()
 }
 
-func (r *Repository) GetPlaylistAnalysisStatus(ctx context.Context, playlistID string) (PlaylistAnalysisStatus, error) {
+func (r *Repository) GetPlaylistAnalysisStatus(ctx context.Context, playlistID string, analysisSignature string, configSignature string, scoringContractID string) (PlaylistAnalysisStatus, error) {
 	playlist, err := r.ResolvePlaylist(ctx, playlistID, "")
 	if err != nil {
 		return PlaylistAnalysisStatus{}, err
 	}
-	tracks, err := r.GetPlaylistSnapshotTracks(ctx, playlist.ID)
+	tracks, err := r.GetPlaylistSnapshotTracks(ctx, playlist.ID, analysisSignature, configSignature, scoringContractID)
 	if err != nil {
 		return PlaylistAnalysisStatus{}, err
 	}
@@ -432,6 +436,8 @@ func (r *Repository) GetPlaylistAnalysisStatus(ctx context.Context, playlistID s
 	for _, track := range tracks {
 		if track.AnalysisState == "ready" {
 			status.ReadyTracks++
+		} else if track.AnalysisState == "outdated" {
+			status.OutdatedTracks++
 		}
 	}
 	stats, err := r.GetPlaylistStats(ctx, playlist.ID)
@@ -585,7 +591,7 @@ func (r *Repository) HydrateRecommendations(
 	}, nil
 }
 
-func (r *Repository) GetPlaylistSnapshotTracks(ctx context.Context, playlistID string) ([]PlaylistTrackSnapshot, error) {
+func (r *Repository) GetPlaylistSnapshotTracks(ctx context.Context, playlistID string, analysisSignature string, configSignature string, scoringContractID string) ([]PlaylistTrackSnapshot, error) {
 	rows, err := r.db.QueryContext(
 		ctx,
 		`
@@ -657,9 +663,24 @@ func (r *Repository) GetPlaylistSnapshotTracks(ctx context.Context, playlistID s
 				log.Printf("warning: failed to decode playlist snapshot role_hints %q: %v", roleHints.String, err)
 			}
 		}
+		if analysisSig.Valid {
+			track.AnalysisSignature = &analysisSig.String
+		}
+		if configSig.Valid {
+			track.ConfigSignature = &configSig.String
+		}
+		if scoringContract.Valid {
+			track.ScoringContractAtAnalysis = &scoringContract.String
+		}
 		switch {
 		case !analysisSig.Valid || !configSig.Valid || !scoringContract.Valid || !relTrackID.Valid:
 			track.AnalysisState = "unanalysed"
+		case strings.TrimSpace(analysisSignature) != "" && analysisSig.String != analysisSignature:
+			track.AnalysisState = "outdated"
+		case strings.TrimSpace(configSignature) != "" && configSig.String != configSignature:
+			track.AnalysisState = "outdated"
+		case strings.TrimSpace(scoringContractID) != "" && scoringContract.String != scoringContractID:
+			track.AnalysisState = "outdated"
 		default:
 			track.AnalysisState = "ready"
 		}
@@ -668,14 +689,14 @@ func (r *Repository) GetPlaylistSnapshotTracks(ctx context.Context, playlistID s
 	return out, rows.Err()
 }
 
-func (r *Repository) ListPlaylistTracks(ctx context.Context, playlistID, query, analysisState string, limit, offset int) ([]PlaylistTrackSnapshot, error) {
+func (r *Repository) ListPlaylistTracks(ctx context.Context, playlistID, query, analysisState string, limit, offset int, analysisSignature string, configSignature string, scoringContractID string) ([]PlaylistTrackSnapshot, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
 	if offset < 0 {
 		offset = 0
 	}
-	tracks, err := r.GetPlaylistSnapshotTracks(ctx, playlistID)
+	tracks, err := r.GetPlaylistSnapshotTracks(ctx, playlistID, analysisSignature, configSignature, scoringContractID)
 	if err != nil {
 		return nil, err
 	}
@@ -901,7 +922,7 @@ func nullableStringPtr(value sql.NullString) *string {
 
 func (r *Repository) SearchTracks(ctx context.Context, playlistID, query string, limit int) ([]PlaylistTrackSnapshot, error) {
 	if strings.TrimSpace(playlistID) != "" {
-		return r.ListPlaylistTracks(ctx, playlistID, query, "", limit, 0)
+		return r.ListPlaylistTracks(ctx, playlistID, query, "", limit, 0, "", "", "")
 	}
 	if limit <= 0 || limit > 100 {
 		limit = 25
@@ -1037,13 +1058,24 @@ func (r *Repository) QueuePlaylistAnalysis(
 		  t.file_hash,
 		  f.track_id,
 		  f.analysis_signature,
-		  f.config_signature
+		  f.config_signature,
+		  EXISTS (
+		    SELECT 1
+		    FROM analysis_jobs aj
+		    WHERE aj.playlist_id IS pt.playlist_id
+		      AND aj.track_id = t.id
+		      AND aj.job_kind = 'enrichment'
+		      AND aj.status IN ('pending', 'running')
+		      AND aj.analysis_signature = ?
+		      AND aj.config_signature = ?
+		      AND aj.source_file_hash IS NOT DISTINCT FROM t.file_hash
+		  )
 		FROM playlist_tracks pt
 		JOIN tracks t ON t.id = pt.track_id
 		LEFT JOIN track_features_abs f ON f.track_id = t.id
 		WHERE pt.playlist_id = ?
 		ORDER BY pt.position ASC
-	`, playlistID)
+	`, analysisSignature, configSignature, playlistID)
 	if err != nil {
 		return 0, err
 	}
@@ -1054,6 +1086,7 @@ func (r *Repository) QueuePlaylistAnalysis(
 		path              string
 		fileHash          *string
 		analyzed          bool
+		activeJob         bool
 		storedAnalysisSig *string
 		storedConfigSig   *string
 	}
@@ -1064,7 +1097,8 @@ func (r *Repository) QueuePlaylistAnalysis(
 		var analyzedID sql.NullString
 		var storedAnalysisSig sql.NullString
 		var storedConfigSig sql.NullString
-		if err := rows.Scan(&item.id, &item.path, &fileHash, &analyzedID, &storedAnalysisSig, &storedConfigSig); err != nil {
+		var activeJobInt int
+		if err := rows.Scan(&item.id, &item.path, &fileHash, &analyzedID, &storedAnalysisSig, &storedConfigSig, &activeJobInt); err != nil {
 			return 0, err
 		}
 		if fileHash.Valid {
@@ -1077,6 +1111,7 @@ func (r *Repository) QueuePlaylistAnalysis(
 			item.storedConfigSig = &storedConfigSig.String
 		}
 		item.analyzed = analyzedID.Valid
+		item.activeJob = activeJobInt != 0
 		tracks = append(tracks, item)
 	}
 	if err := rows.Err(); err != nil {
@@ -1085,6 +1120,9 @@ func (r *Repository) QueuePlaylistAnalysis(
 
 	count := 0
 	for _, track := range tracks {
+		if track.activeJob {
+			continue
+		}
 		if track.analyzed && !force && stringPtrEqual(track.storedAnalysisSig, analysisSignature) && stringPtrEqual(track.storedConfigSig, configSignature) {
 			continue
 		}
@@ -1412,14 +1450,10 @@ func (r *Repository) createAnalysisJobWithKindTx(
 		WHERE track_id = ?
 		  AND job_kind = ?
 		  AND status = 'pending'
-		  AND analysis_signature = ?
-		  AND config_signature = ?
 		  AND playlist_id IS ?
 		`,
 		trackID,
 		jobKind,
-		analysisSignature,
-		configSignature,
 		nullString(playlistID),
 	)
 	if err != nil {

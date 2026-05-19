@@ -185,9 +185,14 @@ function Wait-DockerReady {
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     while ((Get-Date) -lt $deadline) {
-        & docker info *> $null
-        if ($LASTEXITCODE -eq 0) {
-            return $true
+        try {
+            & docker info *> $null
+            if ($LASTEXITCODE -eq 0) {
+                return $true
+            }
+        } catch {
+            # Docker Desktop can be installed but still starting, logged out, or waiting
+            # for WSL/reboot. Treat that as "not ready" so setup can resume later.
         }
         Start-Sleep -Seconds 5
     }

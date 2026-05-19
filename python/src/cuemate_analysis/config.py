@@ -201,7 +201,7 @@ def find_repo_root(start: Path | None = None) -> Path:
             continue
         seen.add(candidate)
         if (candidate / "python" / "pyproject.toml").is_file() and (
-            candidate / "docs" / "Decision_Engine_Plan.md"
+            candidate / "db" / "schema.sql"
         ).is_file():
             return candidate
 

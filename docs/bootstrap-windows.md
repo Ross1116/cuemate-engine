@@ -28,7 +28,7 @@ Install these before doing anything else.
 ### Required
 
 - Git
-- Go 1.24+
+- Go 1.25+
 - Python 3.12+
 - Protocol Buffers compiler (`protoc`)
 - Buf CLI

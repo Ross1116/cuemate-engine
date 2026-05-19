@@ -9,7 +9,7 @@ The installer is per-user and unsigned by default. It installs immutable app fil
 - Windows 10/11
 - PowerShell
 - Node.js/npm
-- Go 1.24+
+- Go 1.25+
 - Inno Setup 6, unless building with `-SkipInstaller`
 - Internet access for dependency restore and optional prerequisite installation
 
@@ -62,10 +62,7 @@ It includes:
 - `README.md`
 - `Bootstrap-CueMate.ps1`
 - `Start-CueMate.ps1`
-- `docs/Decision_Engine_Plan.md`
 - `VERSION`
-
-The docs sentinel is intentionally included because the Python runtime uses the repo-like layout for path discovery.
 
 ## Smoke Checks
 

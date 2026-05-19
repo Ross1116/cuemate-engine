@@ -543,7 +543,19 @@ func (s *server) handlePlaylistTracks(w http.ResponseWriter, r *http.Request, pl
 	analysisState := r.URL.Query().Get("analysis_state")
 	limit := queryInt(r, "limit", 100)
 	offset := queryInt(r, "offset", 0)
-	tracks, err := s.repo.ListPlaylistTracks(r.Context(), playlistID, query, analysisState, limit, offset)
+	metadata, metadataErr := s.runtime.RefreshMetadata(r.Context())
+	if metadataErr != nil {
+		metadata = s.runtime.CachedMetadata()
+		if metadata == nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": scoringruntime.DescribeUnavailable(metadataErr)})
+			return
+		}
+	}
+	var analysisSignature, configSignature, scoringContractID string
+	if metadata != nil {
+		analysisSignature, configSignature, scoringContractID = activeSignatureValues(metadata.GetActiveSignatures())
+	}
+	tracks, err := s.repo.ListPlaylistTracks(r.Context(), playlistID, query, analysisState, limit, offset, analysisSignature, configSignature, scoringContractID)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -739,12 +751,28 @@ func (s *server) handlePickPath(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": strings.TrimSpace(string(output))})
 		return
 	}
-	var paths []string
-	if err := json.Unmarshal(bytes.TrimSpace(output), &paths); err != nil {
+	paths, err := parsePickerPaths(output)
+	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("parse picker output: %v", err)})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"paths": paths})
+}
+
+func parsePickerPaths(output []byte) ([]string, error) {
+	payload := bytes.TrimSpace(output)
+	var paths []string
+	if err := json.Unmarshal(payload, &paths); err == nil {
+		return paths, nil
+	}
+	var singlePath string
+	if err := json.Unmarshal(payload, &singlePath); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(singlePath) == "" {
+		return []string{}, nil
+	}
+	return []string{singlePath}, nil
 }
 
 func (s *server) handleToolRun(w http.ResponseWriter, r *http.Request) {
@@ -797,9 +825,9 @@ Add-Type -AssemblyName System.Windows.Forms
 $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
 $dialog.Description = 'Choose a folder to import into CueMate'
 if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-  @($dialog.SelectedPath) | ConvertTo-Json -Compress
+  ConvertTo-Json -InputObject @($dialog.SelectedPath) -Compress
 } else {
-  @() | ConvertTo-Json -Compress
+  ConvertTo-Json -InputObject @() -Compress
 }
 `, nil
 	case "audio_files":
@@ -810,9 +838,9 @@ $dialog.Title = 'Choose audio files to import into CueMate'
 $dialog.Filter = 'Audio files|*.mp3;*.wav;*.aiff;*.aif;*.flac;*.m4a;*.ogg|All files|*.*'
 $dialog.Multiselect = $true
 if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-  @($dialog.FileNames) | ConvertTo-Json -Compress
+  ConvertTo-Json -InputObject @($dialog.FileNames) -Compress
 } else {
-  @() | ConvertTo-Json -Compress
+  ConvertTo-Json -InputObject @() -Compress
 }
 `, nil
 	case "dj_library_file":
@@ -823,9 +851,9 @@ $dialog.Title = 'Choose Rekordbox XML or Traktor NML export'
 $dialog.Filter = 'DJ library exports|*.xml;*.nml|Rekordbox XML|*.xml|Traktor NML|*.nml|All files|*.*'
 $dialog.Multiselect = $false
 if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-  @($dialog.FileName) | ConvertTo-Json -Compress
+  ConvertTo-Json -InputObject @($dialog.FileName) -Compress
 } else {
-  @() | ConvertTo-Json -Compress
+  ConvertTo-Json -InputObject @() -Compress
 }
 `, nil
 	default:
@@ -1203,7 +1231,12 @@ func (s *server) handlePlaylistAnalysisStatus(w http.ResponseWriter, r *http.Req
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
 	}
-	status, err := s.repo.GetPlaylistAnalysisStatus(r.Context(), playlistID)
+	metadata, metadataErr := s.runtime.RefreshMetadata(r.Context())
+	var analysisSignature, configSignature, scoringContractID string
+	if metadataErr == nil {
+		analysisSignature, configSignature, scoringContractID = activeSignatureValues(metadata.GetActiveSignatures())
+	}
+	status, err := s.repo.GetPlaylistAnalysisStatus(r.Context(), playlistID, analysisSignature, configSignature, scoringContractID)
 	if err != nil {
 		httpStatus := http.StatusInternalServerError
 		if errors.Is(err, recommendationsrepo.ErrPlaylistNotFound) {
@@ -1257,7 +1290,13 @@ func (s *server) handlePlaylistAnalysisRefresh(w http.ResponseWriter, r *http.Re
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	status, err := s.repo.GetPlaylistAnalysisStatus(r.Context(), playlistID)
+	status, err := s.repo.GetPlaylistAnalysisStatus(
+		r.Context(),
+		playlistID,
+		active.GetAnalysisSignature(),
+		active.GetConfigSignature(),
+		active.GetScoringContractId(),
+	)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -1664,7 +1703,13 @@ func (s *server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": scoringruntime.DescribeUnavailable(err)})
 		return
 	}
-	tracks, err := s.repo.GetPlaylistSnapshotTracks(r.Context(), playlist.ID)
+	tracks, err := s.repo.GetPlaylistSnapshotTracks(
+		r.Context(),
+		playlist.ID,
+		metadata.GetActiveSignatures().GetAnalysisSignature(),
+		metadata.GetActiveSignatures().GetConfigSignature(),
+		metadata.GetActiveSignatures().GetScoringContractId(),
+	)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -2873,6 +2918,13 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
+func activeSignatureValues(signatures *scoringv1.SignatureMetadata) (string, string, string) {
+	if signatures == nil {
+		return "", "", ""
+	}
+	return signatures.GetAnalysisSignature(), signatures.GetConfigSignature(), signatures.GetScoringContractId()
+}
+
 func currentTrackPayload(record recommendationsrepo.TrackContextRecord) map[string]any {
 	return map[string]any{
 		"track_id":       record.TrackID,
@@ -2943,6 +2995,7 @@ func playlistAnalysisStatusPayload(status recommendationsrepo.PlaylistAnalysisSt
 		"playlist_name":    status.PlaylistName,
 		"total_tracks":     status.TotalTracks,
 		"ready_tracks":     status.ReadyTracks,
+		"outdated_tracks":  status.OutdatedTracks,
 		"percent_complete": status.PercentComplete,
 		"is_stale":         status.IsStale,
 		"stale_reason":     nullIfEmpty(status.StaleReason),

@@ -177,12 +177,17 @@ function Start-LoggedProcess {
     if (-not (Test-Path $FilePath -PathType Leaf)) {
         throw "Cannot start $Name because $FilePath is missing. Reinstall CueMate or rerun setup."
     }
-    Start-Process -FilePath $FilePath `
-        -ArgumentList $Arguments `
-        -WorkingDirectory $WorkingDirectory `
-        -WindowStyle Hidden `
-        -RedirectStandardOutput $stdout `
-        -RedirectStandardError $stderr | Out-Null
+    $startParams = @{
+        FilePath = $FilePath
+        WorkingDirectory = $WorkingDirectory
+        WindowStyle = "Hidden"
+        RedirectStandardOutput = $stdout
+        RedirectStandardError = $stderr
+    }
+    if ($Arguments.Count -gt 0) {
+        $startParams.ArgumentList = $Arguments
+    }
+    Start-Process @startParams | Out-Null
 }
 
 function Ensure-BootstrapComplete {

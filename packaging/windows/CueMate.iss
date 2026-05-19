@@ -32,6 +32,7 @@ Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs 
 
 [Icons]
 Name: "{autoprograms}\CueMate"; Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\Start-CueMate.ps1"""; WorkingDir: "{app}"
+Name: "{autoprograms}\Quit CueMate"; Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\Stop-CueMate.ps1"""; WorkingDir: "{app}"
 Name: "{autodesktop}\CueMate"; Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\Start-CueMate.ps1"""; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Tasks]

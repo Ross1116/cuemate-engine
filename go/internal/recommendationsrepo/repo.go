@@ -507,6 +507,30 @@ func (r *Repository) GetPlaylistAnalysisStatus(ctx context.Context, playlistID s
 	return status, nil
 }
 
+func (r *Repository) RequeueRunningAnalysisJobs(ctx context.Context, playlistID string) (int64, error) {
+	query := `
+		UPDATE analysis_jobs
+		SET status = 'pending',
+		    started_at = NULL,
+		    error_message = NULL
+		WHERE status = 'running'
+	`
+	args := []any{}
+	if strings.TrimSpace(playlistID) != "" {
+		playlist, err := r.ResolvePlaylist(ctx, playlistID, "")
+		if err != nil {
+			return 0, err
+		}
+		query += " AND playlist_id = ?"
+		args = append(args, playlist.ID)
+	}
+	result, err := r.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 func (r *Repository) DeletePlaylist(ctx context.Context, playlistID string) error {
 	playlist, err := r.ResolvePlaylist(ctx, playlistID, "")
 	if err != nil {

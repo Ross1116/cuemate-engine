@@ -36,6 +36,8 @@ http://127.0.0.1:8080
 
 The first launch can take a while because CueMate may install Python, install Docker Desktop, create its private Python environment, build model-service images, and download model assets. If Docker asks you to sign in, update WSL, or restart Windows, finish that prompt and launch CueMate again. Setup resumes from its saved state.
 
+Use **Quit** in the top bar when you are done. It stops CueMate's local API, scorer, analysis workers, and model-service containers so they do not keep memory reserved in the background. The Start Menu also includes **Quit CueMate** for the same cleanup.
+
 ## First Use
 
 1. Open CueMate.

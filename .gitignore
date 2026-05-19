@@ -33,7 +33,9 @@ go/bin/
 go/coverage.out
 
 # Build artifacts
-dist/
+dist/*
+!dist/showcase/
+!dist/showcase/cuemate-showcase.db
 build/
 tmp/
 data/*.db

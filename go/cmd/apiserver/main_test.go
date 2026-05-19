@@ -1172,6 +1172,15 @@ func TestRemoteAccessBlocksAdminRoutesEvenWithSession(t *testing.T) {
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
 	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/app/shutdown", bytes.NewBufferString(`{}`))
+	req.Host = "cue.example"
+	req.AddCookie(&http.Cookie{Name: "cuemate_remote_session", Value: sessionSecret})
+	srv.remoteAccessMiddleware(http.HandlerFunc(srv.handleAppShutdown)).ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("shutdown status = %d body=%s", rec.Code, rec.Body.String())
+	}
 }
 
 func TestRemoteAccessDoesNotTrustSpoofedHostHeader(t *testing.T) {
@@ -1599,7 +1608,7 @@ func TestBuildToolCommandCapsAnalysisWorkerBatch(t *testing.T) {
 	if !background {
 		t.Fatalf("background = false")
 	}
-	want := []string{"-m", pythonModule, "run-analysis-worker", "--limit", "15"}
+	want := []string{"-m", pythonModule, "run-analysis-worker", "--limit", "5"}
 	if fmt.Sprint(args) != fmt.Sprint(want) {
 		t.Fatalf("args = %#v, want %#v", args, want)
 	}

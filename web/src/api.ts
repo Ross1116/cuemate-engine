@@ -289,6 +289,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   health: () => request<{ status: string }>("/healthz"),
   readiness: () => request<{ status: string; error?: string }>("/readyz"),
+  shutdown: () => request<{ status: string; pid: number }>("/app/shutdown", { method: "POST" }),
   setupStatus: () => request<SetupStatus>("/setup/status"),
   metadata: () =>
     request<{
@@ -345,6 +346,11 @@ export const api = {
   jobs: (playlistId?: string) =>
     request<{ items: AnalysisJob[] }>(
       `/analysis/jobs?limit=25${playlistId ? `&playlist_id=${encodeURIComponent(playlistId)}` : ""}`,
+    ),
+  stopAnalysisWorkers: (playlistId?: string) =>
+    request<{ status: string; stopped_processes: number; requeued_jobs: number; warning?: string }>(
+      `/analysis/workers/stop${playlistId ? `?playlist_id=${encodeURIComponent(playlistId)}` : ""}`,
+      { method: "POST" },
     ),
   correction: (body: { track_id: string; field: "bpm" | "key"; new_value: number | string }) =>
     request<{

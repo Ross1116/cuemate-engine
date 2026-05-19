@@ -16,6 +16,7 @@ import {
   Library,
   ListMusic,
   PlayCircle,
+  Power,
   Radar,
   RefreshCw,
   Search,
@@ -266,7 +267,7 @@ function boundedPercent(value: number) {
   return Math.max(0, Math.min(100, value));
 }
 
-const ANALYSIS_WORKER_BATCH_LIMIT = 15;
+const ANALYSIS_WORKER_BATCH_LIMIT = 5;
 
 export function App() {
   const queryClient = useQueryClient();
@@ -286,6 +287,7 @@ export function App() {
   const [activeRunId, setActiveRunId] = useState("");
   const consumedPairTokenRef = useRef("");
   const chainedWorkerRunRef = useRef("");
+  const stopWorkerRequestedRef = useRef(false);
 
   const health = useQuery({ queryKey: ["health"], queryFn: api.health, refetchInterval: 15_000 });
   const readiness = useQuery({ queryKey: ["ready"], queryFn: api.readiness, refetchInterval: 15_000 });
@@ -339,6 +341,13 @@ export function App() {
     enabled: !!selectedPlaylistId && !!currentTrackId,
   });
 
+  const shutdownMutation = useMutation({
+    mutationFn: api.shutdown,
+    onMutate: () => setOperationMessage("Closing CueMate and stopping local services..."),
+    onSuccess: () => setOperationMessage("CueMate is shutting down. You can close this browser tab."),
+    onError: (error) => setOperationMessage(`Shutdown failed: ${error instanceof Error ? error.message : "could not stop CueMate"}`),
+  });
+
   const playMutation = useMutation({
     mutationFn: (trackId: string) => {
       const eventId = recommendations.data?.meta.recommendation_event_id;
@@ -360,6 +369,7 @@ export function App() {
 
   const refreshMutation = useMutation({
     mutationFn: async (body?: { force?: boolean; analysis_mode?: "fast_pass" | "staged" | "full" }) => {
+      stopWorkerRequestedRef.current = false;
       const refresh = await api.refreshPlaylistAnalysis(selectedPlaylistId, body);
       const worker = await api.toolCommand({ action: "run_analysis_worker", limit: ANALYSIS_WORKER_BATCH_LIMIT });
       return { refresh, worker };
@@ -429,7 +439,10 @@ export function App() {
 
   const toolMutation = useMutation({
     mutationFn: (payload: ToolCommandRequest) => api.toolCommand(payload),
-    onMutate: (payload) => setOperationMessage(operationStartedMessage(payload.action)),
+    onMutate: (payload) => {
+      if (payload.action === "run_analysis_worker") stopWorkerRequestedRef.current = false;
+      setOperationMessage(operationStartedMessage(payload.action));
+    },
     onSuccess: (result) => {
       setLastToolResult(result);
       if (result.run_id) setActiveRunId(result.run_id);
@@ -439,6 +452,23 @@ export function App() {
       void queryClient.invalidateQueries({ queryKey: ["analysisStatus"] });
     },
     onError: (error) => setOperationMessage(`Failed: ${error instanceof Error ? error.message : "tool command failed"}`),
+  });
+
+  const stopWorkersMutation = useMutation({
+    mutationFn: () => api.stopAnalysisWorkers(selectedPlaylistId || undefined),
+    onMutate: () => {
+      stopWorkerRequestedRef.current = true;
+      setOperationMessage("Stopping analysis workers and keeping remaining jobs queued...");
+    },
+    onSuccess: (result) => {
+      setActiveRunId("");
+      const warning = result.warning ? ` Warning: ${result.warning}` : "";
+      setOperationMessage(`Stopped ${result.stopped_processes} worker process${result.stopped_processes === 1 ? "" : "es"} and returned ${result.requeued_jobs} job${result.requeued_jobs === 1 ? "" : "s"} to the queue.${warning}`);
+      void queryClient.invalidateQueries({ queryKey: ["jobs"] });
+      void queryClient.invalidateQueries({ queryKey: ["analysisStatus"] });
+      void queryClient.invalidateQueries({ queryKey: ["playlists"] });
+    },
+    onError: (error) => setOperationMessage(`Stop failed: ${error instanceof Error ? error.message : "could not stop workers"}`),
   });
 
   useEffect(() => {
@@ -455,12 +485,10 @@ export function App() {
       activeToolRun.data.command?.some((part) => part === "run-analysis-worker")
     ) {
       chainedWorkerRunRef.current = activeToolRun.data.run_id;
-      void queryClient
-        .fetchQuery({
-          queryKey: ["analysisStatus", selectedPlaylistId],
-          queryFn: () => api.playlistAnalysisStatus(selectedPlaylistId),
-        })
+      void new Promise((resolve) => window.setTimeout(resolve, 500))
+        .then(() => api.playlistAnalysisStatus(selectedPlaylistId))
         .then((status) => {
+          if (stopWorkerRequestedRef.current) return;
           const pending = status.jobs.pending;
           const running = status.jobs.running;
           if (pending > 0 && running === 0) {
@@ -560,6 +588,21 @@ export function App() {
           <span className={metadata.data?.breaker_open ? "pill hot" : "pill cyan"}>
             {metadata.data?.breaker_open ? "breaker open" : "breaker calm"}
           </span>
+          {!isShowcase ? (
+            <button
+              className="shutdown-button"
+              type="button"
+              disabled={shutdownMutation.isPending}
+              onClick={() => {
+                if (window.confirm("Quit CueMate and stop the local API, scorer, workers, and model containers?")) {
+                  shutdownMutation.mutate();
+                }
+              }}
+              title="Quit CueMate"
+            >
+              <Power size={15} /> {shutdownMutation.isPending ? "Closing" : "Quit"}
+            </button>
+          ) : null}
         </div>
       </header>
       <div className="global-status-stack">
@@ -715,8 +758,10 @@ export function App() {
             onRemovePlaylist={(id) => removePlaylistMutation.mutate(id)}
             removeBusy={removePlaylistMutation.isPending}
             onRunWorker={() => toolMutation.mutate({ action: "run_analysis_worker", limit: ANALYSIS_WORKER_BATCH_LIMIT })}
+            onStopWorkers={() => stopWorkersMutation.mutate()}
             onTool={(payload) => toolMutation.mutate(payload)}
             toolBusy={toolMutation.isPending}
+            stopWorkersBusy={stopWorkersMutation.isPending}
             toolResult={lastToolResult}
             toolError={toolMutation.error}
             toolRun={activeToolRun.data}
@@ -891,11 +936,12 @@ function RecommendationBoard({
   if (error) return <div className="empty-state danger">{error.message}</div>;
   if (!response) return <div className="empty-state">Choose a ready track to open the lanes.</div>;
   if (response.recommendations_status !== "available") {
+    const statusNote = recommendationUnavailableMessage(response);
     return (
       <div className="empty-state danger">
         <AlertTriangle />
-        <strong>{response.recommendations_status}</strong>
-        <span>{response.meta.status_note ?? response.meta.fallback_note ?? "Recommendations are unavailable."}</span>
+        <strong>{response.recommendations_status === "requires_reanalysis" ? "Analysis incomplete" : response.recommendations_status}</strong>
+        <span>{statusNote}</span>
       </div>
     );
   }
@@ -960,6 +1006,13 @@ function RecommendationBoard({
       })}
     </section>
   );
+}
+
+function recommendationUnavailableMessage(response: RecommendationResponse) {
+  if (response.recommendations_status === "requires_reanalysis") {
+    return "Playlist analysis needs to finish before CueMate can show recommendation data for this track.";
+  }
+  return response.meta.status_note ?? response.meta.fallback_note ?? "Recommendations are unavailable.";
 }
 
 function CandidateDetail({
@@ -1808,8 +1861,10 @@ function FullToolsPanel({
   onRemovePlaylist,
   removeBusy,
   onRunWorker,
+  onStopWorkers,
   onTool,
   toolBusy,
+  stopWorkersBusy,
   toolResult,
   toolError,
   toolRun,
@@ -1836,8 +1891,10 @@ function FullToolsPanel({
   onRemovePlaylist: (playlistId: string) => void;
   removeBusy: boolean;
   onRunWorker: () => void;
+  onStopWorkers: () => void;
   onTool: (payload: ToolCommandRequest) => void;
   toolBusy: boolean;
+  stopWorkersBusy: boolean;
   toolResult: ToolCommandResult | null;
   toolError: Error | null;
   toolRun?: ToolRunStatus;
@@ -1993,9 +2050,11 @@ function FullToolsPanel({
           queueBusy={queueBusy}
           queueResult={queueResult}
           workerBusy={toolBusy}
+          stopWorkersBusy={stopWorkersBusy}
           onSmartRefresh={onSmartRefresh}
           onForceRefresh={onForceRefresh}
           onRunWorker={onRunWorker}
+          onStopWorkers={onStopWorkers}
           onRemovePlaylist={onRemovePlaylist}
           removeBusy={removeBusy}
         />
@@ -2162,9 +2221,11 @@ function PlaylistSetupPanel({
   queueBusy,
   queueResult,
   workerBusy,
+  stopWorkersBusy,
   onSmartRefresh,
   onForceRefresh,
   onRunWorker,
+  onStopWorkers,
   onRemovePlaylist,
   removeBusy,
 }: {
@@ -2175,9 +2236,11 @@ function PlaylistSetupPanel({
   queueBusy: boolean;
   queueResult?: number;
   workerBusy: boolean;
+  stopWorkersBusy: boolean;
   onSmartRefresh: () => void;
   onForceRefresh: () => void;
   onRunWorker: () => void;
+  onStopWorkers: () => void;
   onRemovePlaylist: (playlistId: string) => void;
   removeBusy: boolean;
 }) {
@@ -2253,6 +2316,9 @@ function PlaylistSetupPanel({
           <button className="wide-action secondary" disabled={workerBusy} onClick={onRunWorker}>
             <PlayCircle size={16} /> {workerBusy ? "Worker running..." : "Run analysis worker"}
           </button>
+          <button className="wide-action secondary danger-soft" disabled={stopWorkersBusy || running === 0} onClick={onStopWorkers}>
+            {stopWorkersBusy ? "Stopping workers..." : "Stop analysis workers"}
+          </button>
           {queueResult != null ? <p className="muted">{queueResult} analysis jobs queued.</p> : null}
           <button className="wide-action danger" disabled={removeBusy} onClick={confirmRemove}>
             {removeBusy ? "Removing..." : "Remove playlist from CueMate"}
@@ -2278,10 +2344,10 @@ function setupStateLabel(status?: PlaylistAnalysisStatus, playlist?: Playlist) {
 function setupGuidance(status: PlaylistAnalysisStatus | undefined, total: number, ready: number) {
   if (!total) return "Import tracks first. CueMate will analyse them before recommendations become useful.";
   if (status?.jobs.failed) return "Some analysis jobs failed. Check the tool output below, then try Smart refresh again.";
-  if (status?.jobs.running) return status.outdated_tracks ? "Reanalysis is running. Existing rows are old and recommendations unlock as current jobs finish." : "Analysis is running. This page will update as tracks become ready.";
-  if (status?.jobs.pending) return status.outdated_tracks ? "Reanalysis is queued. Run the analysis worker if nothing is moving." : "Analysis is queued. Run the analysis worker if nothing is moving.";
-  if (status?.is_stale) return `Out of date: ${status.stale_reason || "playlist analysis needs refresh"}. Smart refresh will queue only what changed.`;
-  if (status?.outdated_tracks) return `${status.outdated_tracks} track${status.outdated_tracks === 1 ? "" : "s"} need reanalysis for the current scoring engine.`;
+  if (status?.jobs.running) return "Playlist analysis needs to finish before CueMate can show the full recommendation data. This page will update as each batch completes.";
+  if (status?.jobs.pending) return "Playlist analysis is not fully done yet. Keep the worker running to unlock recommendation data for every track.";
+  if (status?.is_stale) return "Playlist analysis needs to be fully refreshed before CueMate can show current recommendation data. Smart refresh will queue only what changed.";
+  if (status?.outdated_tracks) return "Playlist analysis needs to be fully refreshed before CueMate can show current recommendation data.";
   if (ready < total) return "Some tracks still need analysis. Smart refresh queues only missing or outdated work.";
   return "Ready. Recommendations can use this playlist now.";
 }

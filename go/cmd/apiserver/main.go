@@ -163,6 +163,7 @@ func run() int {
 	mux.HandleFunc("/playlists/", srv.handlePlaylistRoutes)
 	mux.HandleFunc("/tracks/search", srv.handleTrackSearch)
 	mux.HandleFunc("/analysis/jobs", srv.handleAnalysisJobs)
+	mux.HandleFunc("/analysis/workers/stop", srv.handleStopAnalysisWorkers)
 	mux.HandleFunc("/recommendation-events", srv.handleRecommendationEvents)
 	mux.HandleFunc("/recommendations", srv.handleRecommendations)
 	mux.HandleFunc("/events/played", srv.handlePlayedEvent)
@@ -176,6 +177,7 @@ func run() int {
 	mux.HandleFunc("/remote/pairing-token", srv.handleRemotePairingToken)
 	mux.HandleFunc("/remote/pair", srv.handleRemotePair)
 	mux.HandleFunc("/remote/logout", srv.handleRemoteLogout)
+	mux.HandleFunc("/app/shutdown", srv.handleAppShutdown)
 	mux.HandleFunc("/tools/cli", srv.handleToolCommand)
 	mux.HandleFunc("/tools/runs/", srv.handleToolRun)
 	mux.HandleFunc("/tools/pick-path", srv.handlePickPath)
@@ -447,6 +449,7 @@ func isAPIPath(path string) bool {
 		"/corrections",
 		"/sync/",
 		"/setup/",
+		"/app/",
 		"/tools/",
 		"/remote/",
 	} {
@@ -458,12 +461,91 @@ func isAPIPath(path string) bool {
 }
 
 func isRemoteBlockedPath(path string) bool {
-	for _, prefix := range []string{"/tools/", "/analysis/", "/corrections", "/sync/outbox", "/remote/pairing-token"} {
+	for _, prefix := range []string{"/app/", "/tools/", "/analysis/", "/corrections", "/sync/outbox", "/remote/pairing-token"} {
 		if path == strings.TrimSuffix(prefix, "/") || strings.HasPrefix(path, prefix) {
 			return true
 		}
 	}
 	return false
+}
+
+func (s *server) handleAppShutdown(w http.ResponseWriter, r *http.Request) {
+	if s.rejectShowcaseWrite(w) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	if !isLoopbackRemoteAddr(r.RemoteAddr) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "shutdown is only available from this computer"})
+		return
+	}
+	scriptPath, err := cueMateShutdownScriptPath()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	cmd := exec.Command(
+		"powershell.exe",
+		"-NoProfile",
+		"-ExecutionPolicy",
+		"Bypass",
+		"-File",
+		scriptPath,
+		"-ApiPid",
+		strconv.Itoa(os.Getpid()),
+		"-DelaySeconds",
+		"1",
+	)
+	if err := cmd.Start(); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"status": "shutting_down",
+		"pid":    cmd.Process.Pid,
+	})
+}
+
+func isLoopbackRemoteAddr(remoteAddr string) bool {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
+}
+
+func cueMateShutdownScriptPath() (string, error) {
+	candidates := []string{}
+	if installDir := strings.TrimSpace(os.Getenv("CUEMATE_INSTALL_DIR")); installDir != "" {
+		candidates = append(candidates, filepath.Join(installDir, "Stop-CueMate.ps1"))
+	}
+	if exe, err := os.Executable(); err == nil {
+		candidates = append(candidates, filepath.Join(filepath.Dir(exe), "Stop-CueMate.ps1"))
+	}
+	if cwd, err := os.Getwd(); err == nil {
+		candidates = append(
+			candidates,
+			filepath.Join(cwd, "Stop-CueMate.ps1"),
+			filepath.Join(cwd, "packaging", "windows", "Stop-CueMate.ps1"),
+			filepath.Join(cwd, "..", "packaging", "windows", "Stop-CueMate.ps1"),
+		)
+	}
+	for _, candidate := range candidates {
+		if candidate == "" {
+			continue
+		}
+		abs, err := filepath.Abs(candidate)
+		if err != nil {
+			continue
+		}
+		if info, err := os.Stat(abs); err == nil && !info.IsDir() {
+			return abs, nil
+		}
+	}
+	return "", errors.New("Stop-CueMate.ps1 was not found")
 }
 
 func (s *server) remoteSession(r *http.Request) (*recommendationsrepo.RemoteSession, bool) {
@@ -667,6 +749,65 @@ func (s *server) handleAnalysisJobs(w http.ResponseWriter, r *http.Request) {
 		items = append(items, analysisJobPayload(job))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (s *server) handleStopAnalysisWorkers(w http.ResponseWriter, r *http.Request) {
+	if s.rejectShowcaseWrite(w) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	if !isLoopbackRemoteAddr(r.RemoteAddr) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "analysis workers can only be stopped from this computer"})
+		return
+	}
+	playlistID := strings.TrimSpace(r.URL.Query().Get("playlist_id"))
+	stoppedProcesses, stopErr := stopCueMateAnalysisWorkerProcesses(r.Context())
+	requeuedJobs, requeueErr := s.repo.RequeueRunningAnalysisJobs(r.Context(), playlistID)
+	if requeueErr != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": requeueErr.Error()})
+		return
+	}
+	payload := map[string]any{
+		"status":            "stopped",
+		"stopped_processes": stoppedProcesses,
+		"requeued_jobs":     requeuedJobs,
+	}
+	if stopErr != nil {
+		payload["warning"] = stopErr.Error()
+	}
+	writeJSON(w, http.StatusOK, payload)
+}
+
+func stopCueMateAnalysisWorkerProcesses(ctx context.Context) (int, error) {
+	script := `
+$targets = Get-CimInstance Win32_Process |
+  Where-Object {
+    $_.CommandLine -and $_.CommandLine -match 'cuemate_analysis\s+run-analysis-worker'
+  }
+$count = 0
+foreach ($target in $targets) {
+  try {
+    Stop-Process -Id $target.ProcessId -Force -ErrorAction Stop
+    $count += 1
+  } catch {
+  }
+}
+Write-Output $count
+`
+	cmdCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(cmdCtx, "powershell.exe", "-NoProfile", "-Command", script).CombinedOutput()
+	if err != nil {
+		return 0, fmt.Errorf("stop worker processes: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	count, err := strconv.Atoi(strings.TrimSpace(string(output)))
+	if err != nil {
+		return 0, fmt.Errorf("parse stopped worker count %q: %w", strings.TrimSpace(string(output)), err)
+	}
+	return count, nil
 }
 
 func (s *server) handleRecommendationEvents(w http.ResponseWriter, r *http.Request) {
@@ -994,7 +1135,7 @@ func buildToolCommand(req toolCommandRequest) ([]string, bool, error) {
 		}
 		return args, true, nil
 	case "run_analysis_worker":
-		limit := boundedPositive(req.Limit, 15, 15)
+		limit := boundedPositive(req.Limit, 5, 5)
 		args = append(args, "run-analysis-worker", "--limit", strconv.Itoa(limit))
 		if req.PrintBackendDiagnostics {
 			args = append(args, "--print-backend-diagnostics")

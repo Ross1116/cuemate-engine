@@ -9,7 +9,7 @@ from cuemate_analysis.cli import build_effective_analysis_signature
 from cuemate_analysis.analysis import parse_key_label
 from cuemate_analysis.ingest import discover_audio_files, make_playlist_id, make_track_id
 from cuemate_analysis.models import ImportedTrack
-from cuemate_analysis.scoring import SCORING_CONTRACT_ID
+from cuemate_analysis.scoring import SCORING_CONTRACT_ID, _effective_analysis_signature
 from cuemate_analysis.tempo_backend import TempoEstimate
 from cuemate_analysis.key_backend import KeyEstimate
 
@@ -66,6 +66,41 @@ def test_effective_analysis_signature_includes_production_models(tmp_path: Path)
     assert signature.startswith("m1-stable-tempo-tempocnn-")
     assert "-auto-key-musicalkeycnn-" in signature
     assert "-auto-full_track-essentia-" in signature
+
+
+def test_scoring_signature_matches_analysis_signature_hashing(monkeypatch, tmp_path: Path) -> None:
+    tempo_model = tmp_path / "deepsquare-k16-3.pb"
+    key_model = tmp_path / "keynet.pt"
+    tempo_model.write_bytes(b"tempo")
+    key_model.write_bytes(b"key")
+
+    monkeypatch.setattr("cuemate_analysis.tempo_backend.resolve_tempocnn_model_path", lambda _model=None: tempo_model)
+    monkeypatch.setattr("cuemate_analysis.key_backend.resolve_musicalkeycnn_model_path", lambda _model=None: key_model)
+
+    settings = SimpleNamespace(
+        analysis_signature="m1-stable",
+        analysis=SimpleNamespace(
+            essentia_semantics_enabled=False,
+            essentia_semantic_model_root="unused",
+            essentia_semantic_model_family_policy="best_per_task",
+            essentia_semantic_device="auto",
+            key_model_path=str(key_model),
+            key_device="auto",
+            key_policy="full_track",
+        ),
+    )
+
+    expected = build_effective_analysis_signature(
+        "m1-stable",
+        tempocnn_model=str(tempo_model),
+        tempocnn_accelerator="auto",
+        musicalkeycnn_model=str(key_model),
+        musicalkeycnn_device="auto",
+        musicalkeycnn_policy="full_track",
+        essentia_semantic_signature="disabled",
+    )
+
+    assert _effective_analysis_signature(settings) == expected
 
 
 def test_build_analysis_result_tags_scoring_contract(monkeypatch, tmp_path: Path) -> None:

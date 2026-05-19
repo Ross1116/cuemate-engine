@@ -61,12 +61,13 @@ SCORING_CONTRACT_ID: str = "m3-v1"
 
 
 def _hash_file_identity(path: Path) -> str:
-    try:
-        stat = path.stat()
-    except FileNotFoundError:
+    if not path.is_file():
         return f"missing-{path.name}"
-    payload = f"{path.resolve()}:{stat.st_size}:{int(stat.st_mtime_ns)}".encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()[:12]
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()[:12]
 
 
 def _effective_analysis_signature(settings: Any) -> str:

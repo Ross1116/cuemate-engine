@@ -1026,6 +1026,10 @@ func startBackgroundToolCommand(pythonExe string, cliArgs []string) (map[string]
 	if err := os.MkdirAll(logDir, 0o755); err != nil {
 		return nil, err
 	}
+	logDir, err := filepath.Abs(logDir)
+	if err != nil {
+		return nil, err
+	}
 	startedAt := time.Now().UTC().Format(time.RFC3339Nano)
 	logPath := filepath.Join(logDir, runID+".log")
 	logFile, err := os.Create(logPath)
@@ -1079,7 +1083,13 @@ func startBackgroundToolCommand(pythonExe string, cliArgs []string) (map[string]
 
 func toolRunDir() string {
 	if logDir := strings.TrimSpace(os.Getenv("CUEMATE_LOG_DIR")); logDir != "" {
+		if abs, err := filepath.Abs(filepath.Join(logDir, "tool-runs")); err == nil {
+			return abs
+		}
 		return filepath.Join(logDir, "tool-runs")
+	}
+	if abs, err := filepath.Abs(filepath.Join("tmp", "tool-runs")); err == nil {
+		return abs
 	}
 	return filepath.Join("tmp", "tool-runs")
 }

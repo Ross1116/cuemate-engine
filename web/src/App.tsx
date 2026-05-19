@@ -1843,6 +1843,13 @@ function FullToolsPanel({
     .filter(Boolean);
   const pickerBusy = pickPathMutation.isPending;
   const pickerError = pickPathMutation.error instanceof Error ? pickPathMutation.error.message : null;
+  const localImportDisabledReason = toolBusy
+    ? "Import is already running."
+    : !localPathList.length
+      ? "Choose files/folders or paste at least one path."
+      : !localName.trim()
+        ? "Add a CueMate playlist name."
+        : "";
 
   const applyDJPlaylistOptions = useCallback((names: string[]) => {
     setDjPlaylistOptions(names);
@@ -1902,12 +1909,18 @@ function FullToolsPanel({
   }, [djLibrary, djSource, loadDJPlaylistOptions]);
 
   const appendLocalPaths = (paths: string[]) => {
+    const cleanPaths = paths.map((item) => item.trim()).filter(Boolean);
+    if (!cleanPaths.length) return;
+    if (!localName.trim()) {
+      const first = cleanPaths[0].split(/[\\/]/).filter(Boolean).pop();
+      if (first) setLocalName(first.replace(/\.[^.]+$/, ""));
+    }
     setLocalPaths((current) => {
       const existing = current
         .split(/\r?\n/)
         .map((item) => item.trim())
         .filter(Boolean);
-      const next = Array.from(new Set([...existing, ...paths.map((item) => item.trim()).filter(Boolean)]));
+      const next = Array.from(new Set([...existing, ...cleanPaths]));
       return next.join("\n");
     });
   };
@@ -1983,11 +1996,12 @@ function FullToolsPanel({
         </div>
         <button
           className="wide-action"
-          disabled={toolBusy || !localName.trim() || localPathList.length === 0}
+          disabled={Boolean(localImportDisabledReason)}
           onClick={() => onTool({ action: "import_playlist", name: localName, paths: localPathList })}
         >
           <FolderPlus size={16} /> Import local playlist
         </button>
+        {localImportDisabledReason ? <p className="selection-summary">{localImportDisabledReason}</p> : null}
       </ToolSection>
 
       <ToolSection icon={<ListMusic />} title="Import DJ library" description="Pull an existing Rekordbox, Traktor, or Serato playlist into CueMate.">

@@ -143,7 +143,6 @@ function Assert-StagedRuntime {
         @{ Path = (Join-Path $stageRoot "config"); Description = "runtime config" },
         @{ Path = (Join-Path $stageRoot "db\schema.sql"); Description = "SQLite schema" },
         @{ Path = (Join-Path $stageRoot "scripts\docker-compose.ps1"); Description = "runtime scripts" },
-        @{ Path = (Join-Path $stageRoot "docs\Decision_Engine_Plan.md"); Description = "Python root sentinel" },
         @{ Path = (Join-Path $stageRoot "Bootstrap-CueMate.ps1"); Description = "bootstrap script" },
         @{ Path = (Join-Path $stageRoot "Start-CueMate.ps1"); Description = "launcher script" },
         @{ Path = (Join-Path $stageRoot "CueMate-Common.psm1"); Description = "shared PowerShell module" },
@@ -164,8 +163,7 @@ foreach ($source in @(
     @{ Path = (Join-Path $repoRoot "go\go.mod"); Description = "Go module" },
     @{ Path = (Join-Path $repoRoot "python\pyproject.toml"); Description = "Python package" },
     @{ Path = (Join-Path $repoRoot "docker"); Description = "Docker assets" },
-    @{ Path = (Join-Path $repoRoot "db\schema.sql"); Description = "database schema" },
-    @{ Path = (Join-Path $repoRoot "docs\Decision_Engine_Plan.md"); Description = "Python root sentinel" }
+    @{ Path = (Join-Path $repoRoot "db\schema.sql"); Description = "database schema" }
 )) {
     Assert-SourcePath -Path $source.Path -Description $source.Description
 }
@@ -186,8 +184,6 @@ Invoke-RobocopyChecked -Source (Join-Path $repoRoot "db") -Destination (Join-Pat
 Invoke-RobocopyChecked -Source (Join-Path $repoRoot "scripts") -Destination (Join-Path $stageRoot "scripts")
 Invoke-RobocopyChecked -Source (Join-Path $repoRoot "web\dist") -Destination (Join-Path $stageRoot "web\dist")
 
-New-Item -ItemType Directory -Force -Path (Join-Path $stageRoot "docs") | Out-Null
-Copy-Item (Join-Path $repoRoot "docs\Decision_Engine_Plan.md") (Join-Path $stageRoot "docs\Decision_Engine_Plan.md") -Force
 Copy-Item (Join-Path $repoRoot ".env.example") (Join-Path $stageRoot ".env.example") -Force
 Copy-Item (Join-Path $repoRoot "README.md") (Join-Path $stageRoot "README.md") -Force
 Copy-Item (Join-Path $packagingRoot "Bootstrap-CueMate.ps1") (Join-Path $stageRoot "Bootstrap-CueMate.ps1") -Force

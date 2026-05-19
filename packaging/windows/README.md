@@ -62,10 +62,7 @@ It includes:
 - `README.md`
 - `Bootstrap-CueMate.ps1`
 - `Start-CueMate.ps1`
-- `docs/Decision_Engine_Plan.md`
 - `VERSION`
-
-The docs sentinel is intentionally included because the Python runtime uses the repo-like layout for path discovery.
 
 ## Smoke Checks
 

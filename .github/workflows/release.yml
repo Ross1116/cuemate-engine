@@ -55,6 +55,29 @@ jobs:
         uses: actions/setup-go@v6
         with:
           go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Set up Buf
+        uses: bufbuild/buf-setup-action@v1
+
+      - name: Set up protoc
+        uses: arduino/setup-protoc@v3
+
+      - name: Install protobuf generators
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip grpcio-tools
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1
+
+      - name: Generate protobuf stubs
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File .\scripts\compile-proto.ps1
 
       - name: Install Inno Setup
         shell: pwsh
@@ -84,6 +107,7 @@ jobs:
           } else {
             gh release create $tag $asset `
               --title $tag `
+              --prerelease `
               --generate-notes `
               --target "${{ github.sha }}"
           }

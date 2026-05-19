@@ -135,6 +135,17 @@ def test_build_tempocnn_service_run_command_includes_drive_mounts() -> None:
     assert "cuemate-tempocnn:test" in command
     assert "--gpus" in command
     assert "127.0.0.1:49000:49000" in command_text
+    assert "ESSENTIA_SEMANTIC_SERVICE_PORT=49000" in command
     assert "target=/host/d" in command_text
     assert "target=/host/e" in command_text
     assert "/workspace/docker/essentia_semantics/service.py" in command
+
+
+def test_runtime_root_can_come_from_installed_env(monkeypatch, tmp_path: Path) -> None:
+    install_root = tmp_path / "CueMate"
+    install_root.mkdir()
+    monkeypatch.setenv("CUEMATE_REPO_ROOT", os.fspath(install_root))
+
+    from cuemate_analysis import tempo_backend
+
+    assert tempo_backend.resolve_runtime_root() == install_root.resolve()

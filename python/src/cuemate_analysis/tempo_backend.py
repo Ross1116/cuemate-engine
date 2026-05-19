@@ -22,7 +22,14 @@ from cuemate_analysis.persistent_inference_cache import (
 )
 
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+def resolve_runtime_root() -> Path:
+    configured = os.getenv("CUEMATE_REPO_ROOT")
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return Path(__file__).resolve().parents[3]
+
+
+REPO_ROOT = resolve_runtime_root()
 DEFAULT_TEMPOCNN_MODEL = REPO_ROOT / "python" / "models" / "essentia" / "deepsquare-k16-3.pb"
 DEFAULT_TEMPOCNN_IMAGE = "cuemate-essentia-semantics:local"
 DEFAULT_TEMPOCNN_SERVICE_NAME = "cuemate-essentia-semantics-service"
@@ -295,6 +302,8 @@ def build_tempocnn_service_run_command(
         resolved_service_name,
         "--publish",
         f"127.0.0.1:{resolved_service_port}:{resolved_service_port}",
+        "--env",
+        f"ESSENTIA_SEMANTIC_SERVICE_PORT={resolved_service_port}",
         "--env",
         f"TEMPOCNN_SERVICE_PORT={resolved_service_port}",
         "--env",

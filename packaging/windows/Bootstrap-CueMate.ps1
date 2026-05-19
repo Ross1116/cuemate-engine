@@ -474,7 +474,13 @@ CUEMATE_INFERENCE_CACHE_PATH=$cachePath
                 return
             }
             Write-SetupState -Step "prepare-models" -Status "running" -Message "Prewarming Docker model services."
-            Invoke-External -FilePath $venvPython -Arguments @("-m", "cuemate_analysis", "prewarm-model-services")
+            try {
+                Invoke-External -FilePath $venvPython -Arguments @("-m", "cuemate_analysis", "prewarm-model-services")
+            } catch {
+                Write-SetupState -Step "prepare-models" -Status "blocked" -ModelReady $false -Message "Docker model-service prewarm failed: $($_.Exception.Message). CueMate can still open; setup will retry on the next launch. See $bootstrapLog."
+                Write-Warning "Docker model-service prewarm failed. CueMate can still open; setup will retry on the next launch. See $bootstrapLog."
+                return
+            }
             Write-SetupState -Step "prepare-models" -Status "running" -ModelReady $true
         }
     } else {

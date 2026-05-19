@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import json
 import math
+import hashlib
 from dataclasses import asdict, dataclass, field, is_dataclass
+from pathlib import Path
 from typing import Any
 
 from cuemate_analysis import __version__
@@ -56,6 +58,49 @@ KEY_CONFIDENCE_THRESHOLD: float = 0.5
 
 # Phase 6 metadata/versioning contract for the Python scoring core.
 SCORING_CONTRACT_ID: str = "m3-v1"
+
+
+def _hash_file_identity(path: Path) -> str:
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return f"missing-{path.name}"
+    payload = f"{path.resolve()}:{stat.st_size}:{int(stat.st_mtime)}".encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:12]
+
+
+def _effective_analysis_signature(settings: Any) -> str:
+    from cuemate_analysis.essentia_semantic_backend import (
+        build_essentia_semantic_manifest_signature,
+        build_essentia_semantic_model_manifest,
+    )
+    from cuemate_analysis.key_backend import resolve_musicalkeycnn_model_path
+    from cuemate_analysis.tempo_backend import resolve_tempocnn_model_path
+
+    if not settings.analysis.essentia_semantics_enabled:
+        essentia_signature = "disabled"
+    else:
+        try:
+            manifest = build_essentia_semantic_model_manifest(
+                settings.analysis.essentia_semantic_model_root,
+                family_policy=settings.analysis.essentia_semantic_model_family_policy,
+            )
+            essentia_signature = build_essentia_semantic_manifest_signature(
+                manifest,
+                device=settings.analysis.essentia_semantic_device,
+            )
+        except (OSError, ValueError, KeyError):
+            essentia_signature = "missing"
+
+    tempo_model_hash = _hash_file_identity(resolve_tempocnn_model_path(None))
+    key_model_hash = _hash_file_identity(resolve_musicalkeycnn_model_path(settings.analysis.key_model_path))
+    return (
+        f"{settings.analysis_signature}"
+        f"-tempo-tempocnn-{tempo_model_hash}-auto"
+        f"-key-musicalkeycnn-{key_model_hash}-{settings.analysis.key_device}-{settings.analysis.key_policy}"
+        f"-essentia-{essentia_signature}"
+    )
+
 
 # Applied to absolute features only.
 LABEL_CONFIG: dict[str, dict[str, list[float] | list[str]]] = {
@@ -364,7 +409,8 @@ def get_scoring_metadata(
         settings = load_runtime_settings()
     from cuemate_analysis.config import build_relative_experiment_signature
 
-    active_analysis_signature = str(getattr(settings, "analysis_signature"))
+    base_analysis_signature = str(getattr(settings, "analysis_signature"))
+    active_analysis_signature = _effective_analysis_signature(settings)
     active_config_signature = str(getattr(settings, "config_signature"))
     expected_relative_signature = build_relative_experiment_signature(
         settings,
@@ -382,7 +428,7 @@ def get_scoring_metadata(
             "scoring_contract_id": SCORING_CONTRACT_ID,
             "config_signature": active_config_signature,
         },
-        "compatible_analysis_signatures": compatible_analysis_signatures or [active_analysis_signature],
+        "compatible_analysis_signatures": compatible_analysis_signatures or [active_analysis_signature, base_analysis_signature],
         "compatible_config_signatures": compatible_config_signatures or [active_config_signature],
         "components": [
             {

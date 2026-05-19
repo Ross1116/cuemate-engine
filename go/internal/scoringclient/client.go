@@ -18,7 +18,7 @@ import (
 
 const (
 	DefaultScoringGRPCAddr   = "127.0.0.1:47834"
-	DefaultScoringRPCTimeout = 250 * time.Millisecond
+	DefaultScoringRPCTimeout = 5 * time.Second
 	defaultDialTimeout       = 2 * time.Second
 )
 

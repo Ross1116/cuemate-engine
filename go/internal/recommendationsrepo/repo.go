@@ -40,6 +40,26 @@ type PlaylistSummary struct {
 	FeedbackLastTunedAt *string
 }
 
+type AnalysisJobCounts struct {
+	Pending   int
+	Running   int
+	Completed int
+	Failed    int
+}
+
+type PlaylistAnalysisStatus struct {
+	PlaylistID      string
+	PlaylistName    string
+	TotalTracks     int
+	ReadyTracks     int
+	Counts          AnalysisJobCounts
+	IsStale         bool
+	StaleReason     string
+	LatestError     *string
+	PercentComplete int
+	NextAction      string
+}
+
 type TrackContextRecord struct {
 	TrackID                   string
 	FilePath                  string
@@ -233,6 +253,23 @@ type SyncOutboxItem struct {
 	SyncedAt    *string
 }
 
+type RemotePairingToken struct {
+	TokenHash   string
+	CreatedAt   string
+	ExpiresAt   string
+	UsedAt      *string
+	DeviceLabel *string
+}
+
+type RemoteSession struct {
+	SessionHash string
+	DeviceLabel *string
+	CreatedAt   string
+	LastSeenAt  string
+	ExpiresAt   string
+	RevokedAt   *string
+}
+
 type FeedbackTuningJobRecord struct {
 	ID             int64
 	PlaylistID     string
@@ -280,6 +317,10 @@ func Open(path string) (*Repository, error) {
 
 func (r *Repository) Close() error {
 	return r.db.Close()
+}
+
+func (r *Repository) DB() *sql.DB {
+	return r.db
 }
 
 func (r *Repository) RunInTx(ctx context.Context, fn func(*sql.Tx) error) error {
@@ -371,6 +412,129 @@ func (r *Repository) ListPlaylists(ctx context.Context) ([]PlaylistSummary, erro
 		out = append(out, item)
 	}
 	return out, rows.Err()
+}
+
+func (r *Repository) GetPlaylistAnalysisStatus(ctx context.Context, playlistID string) (PlaylistAnalysisStatus, error) {
+	playlist, err := r.ResolvePlaylist(ctx, playlistID, "")
+	if err != nil {
+		return PlaylistAnalysisStatus{}, err
+	}
+	tracks, err := r.GetPlaylistSnapshotTracks(ctx, playlist.ID)
+	if err != nil {
+		return PlaylistAnalysisStatus{}, err
+	}
+	status := PlaylistAnalysisStatus{
+		PlaylistID:   playlist.ID,
+		PlaylistName: playlist.Name,
+		TotalTracks:  len(tracks),
+		NextAction:   "none",
+	}
+	for _, track := range tracks {
+		if track.AnalysisState == "ready" {
+			status.ReadyTracks++
+		}
+	}
+	stats, err := r.GetPlaylistStats(ctx, playlist.ID)
+	if err != nil {
+		return PlaylistAnalysisStatus{}, err
+	}
+	if stats != nil {
+		status.IsStale = stats.IsStale
+		status.StaleReason = stats.StaleReason
+	}
+	var latestError sql.NullString
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT status, COUNT(*)
+		FROM analysis_jobs
+		WHERE playlist_id = ?
+		GROUP BY status
+	`, playlist.ID)
+	if err != nil {
+		return PlaylistAnalysisStatus{}, err
+	}
+	for rows.Next() {
+		var jobStatus string
+		var count int
+		if err := rows.Scan(&jobStatus, &count); err != nil {
+			_ = rows.Close()
+			return PlaylistAnalysisStatus{}, err
+		}
+		switch jobStatus {
+		case "pending":
+			status.Counts.Pending = count
+		case "running":
+			status.Counts.Running = count
+		case "completed":
+			status.Counts.Completed = count
+		case "failed":
+			status.Counts.Failed = count
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return PlaylistAnalysisStatus{}, err
+	}
+	if err := r.db.QueryRowContext(ctx, `
+		SELECT error_message
+		FROM analysis_jobs
+		WHERE playlist_id = ? AND status = 'failed' AND error_message IS NOT NULL
+		ORDER BY completed_at DESC, started_at DESC, created_at DESC, id DESC
+		LIMIT 1
+	`, playlist.ID).Scan(&latestError); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return PlaylistAnalysisStatus{}, err
+	}
+	if latestError.Valid {
+		status.LatestError = &latestError.String
+	}
+	if status.TotalTracks > 0 {
+		status.PercentComplete = int(float64(status.ReadyTracks) / float64(status.TotalTracks) * 100)
+	}
+	switch {
+	case status.Counts.Failed > 0:
+		status.NextAction = "inspect_failures"
+	case status.Counts.Running > 0 || status.Counts.Pending > 0:
+		status.NextAction = "run_worker"
+	case status.IsStale || status.ReadyTracks < status.TotalTracks:
+		status.NextAction = "smart_refresh"
+	default:
+		status.NextAction = "none"
+	}
+	return status, nil
+}
+
+func (r *Repository) DeletePlaylist(ctx context.Context, playlistID string) error {
+	playlist, err := r.ResolvePlaylist(ctx, playlistID, "")
+	if err != nil {
+		return err
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if tx != nil {
+			_ = tx.Rollback()
+		}
+	}()
+	for _, statement := range []string{
+		`DELETE FROM recommendation_event_items WHERE event_id IN (SELECT id FROM recommendation_events WHERE playlist_id = ?)`,
+		`DELETE FROM feedback_tuning_jobs WHERE playlist_id = ?`,
+		`DELETE FROM recommendation_events WHERE playlist_id = ?`,
+		`DELETE FROM playlist_sync_state WHERE playlist_id = ?`,
+		`DELETE FROM track_features_rel WHERE playlist_id = ?`,
+		`DELETE FROM playlist_stats WHERE playlist_id = ?`,
+		`DELETE FROM analysis_jobs WHERE playlist_id = ?`,
+		`DELETE FROM playlist_tracks WHERE playlist_id = ?`,
+		`DELETE FROM playlists WHERE id = ?`,
+	} {
+		if _, err := tx.ExecContext(ctx, statement, playlist.ID); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	tx = nil
+	return nil
 }
 
 func (r *Repository) HydrateRecommendations(
@@ -1988,6 +2152,147 @@ func (r *Repository) AckOutboxThroughID(ctx context.Context, ackThroughID int64,
 		return 0, err
 	}
 	return result.RowsAffected()
+}
+
+func (r *Repository) CreateRemotePairingToken(ctx context.Context, tokenHash string, deviceLabel *string, createdAt string, expiresAt string) error {
+	_, err := r.db.ExecContext(
+		ctx,
+		`
+		INSERT INTO remote_pairing_tokens (token_hash, created_at, expires_at, device_label)
+		VALUES (?, ?, ?, ?)
+		`,
+		tokenHash,
+		createdAt,
+		expiresAt,
+		nullString(deviceLabel),
+	)
+	return err
+}
+
+func (r *Repository) ConsumeRemotePairingToken(ctx context.Context, tokenHash string, usedAt string) (*RemotePairingToken, error) {
+	var token *RemotePairingToken
+	err := r.RunInTx(ctx, func(tx *sql.Tx) error {
+		row := tx.QueryRowContext(
+			ctx,
+			`
+			SELECT token_hash, created_at, expires_at, used_at, device_label
+			FROM remote_pairing_tokens
+			WHERE token_hash = ?
+			`,
+			tokenHash,
+		)
+		record, err := scanRemotePairingToken(row)
+		if err != nil {
+			return err
+		}
+		if record == nil || record.UsedAt != nil || record.ExpiresAt < usedAt {
+			token = nil
+			return nil
+		}
+		_, err = tx.ExecContext(ctx, "UPDATE remote_pairing_tokens SET used_at = ? WHERE token_hash = ?", usedAt, tokenHash)
+		if err != nil {
+			return err
+		}
+		record.UsedAt = &usedAt
+		token = record
+		return nil
+	})
+	return token, err
+}
+
+func (r *Repository) CreateRemoteSession(ctx context.Context, sessionHash string, deviceLabel *string, createdAt string, expiresAt string) error {
+	_, err := r.db.ExecContext(
+		ctx,
+		`
+		INSERT INTO remote_sessions (session_hash, device_label, created_at, last_seen_at, expires_at)
+		VALUES (?, ?, ?, ?, ?)
+		`,
+		sessionHash,
+		nullString(deviceLabel),
+		createdAt,
+		createdAt,
+		expiresAt,
+	)
+	return err
+}
+
+func (r *Repository) GetValidRemoteSession(ctx context.Context, sessionHash string, now string) (*RemoteSession, error) {
+	row := r.db.QueryRowContext(
+		ctx,
+		`
+		SELECT session_hash, device_label, created_at, last_seen_at, expires_at, revoked_at
+		FROM remote_sessions
+		WHERE session_hash = ?
+		  AND revoked_at IS NULL
+		  AND expires_at >= ?
+		`,
+		sessionHash,
+		now,
+	)
+	session, err := scanRemoteSession(row)
+	if err != nil {
+		return nil, err
+	}
+	if session != nil {
+		_, err = r.db.ExecContext(ctx, "UPDATE remote_sessions SET last_seen_at = ? WHERE session_hash = ?", now, sessionHash)
+		if err != nil {
+			return nil, err
+		}
+		session.LastSeenAt = now
+	}
+	return session, nil
+}
+
+func (r *Repository) RevokeRemoteSession(ctx context.Context, sessionHash string, revokedAt string) error {
+	_, err := r.db.ExecContext(
+		ctx,
+		`
+		UPDATE remote_sessions
+		SET revoked_at = ?
+		WHERE session_hash = ?
+		`,
+		revokedAt,
+		sessionHash,
+	)
+	return err
+}
+
+func scanRemotePairingToken(row *sql.Row) (*RemotePairingToken, error) {
+	var token RemotePairingToken
+	var usedAt sql.NullString
+	var deviceLabel sql.NullString
+	if err := row.Scan(&token.TokenHash, &token.CreatedAt, &token.ExpiresAt, &usedAt, &deviceLabel); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if usedAt.Valid {
+		token.UsedAt = &usedAt.String
+	}
+	if deviceLabel.Valid {
+		token.DeviceLabel = &deviceLabel.String
+	}
+	return &token, nil
+}
+
+func scanRemoteSession(row *sql.Row) (*RemoteSession, error) {
+	var session RemoteSession
+	var deviceLabel sql.NullString
+	var revokedAt sql.NullString
+	if err := row.Scan(&session.SessionHash, &deviceLabel, &session.CreatedAt, &session.LastSeenAt, &session.ExpiresAt, &revokedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if deviceLabel.Valid {
+		session.DeviceLabel = &deviceLabel.String
+	}
+	if revokedAt.Valid {
+		session.RevokedAt = &revokedAt.String
+	}
+	return &session, nil
 }
 
 func NowUTC() string {

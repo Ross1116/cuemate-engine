@@ -247,6 +247,21 @@ CREATE TABLE playlist_sync_state (
   last_snapshot_acked_at TEXT,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE remote_pairing_tokens (
+  token_hash TEXT PRIMARY KEY,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  used_at TEXT,
+  device_label TEXT
+);
+CREATE TABLE remote_sessions (
+  session_hash TEXT PRIMARY KEY,
+  device_label TEXT,
+  created_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  revoked_at TEXT
+);
 CREATE INDEX idx_manual_corrections_track_id ON manual_corrections (track_id);
 CREATE INDEX idx_recommendation_events_playlist_id ON recommendation_events (playlist_id);
 CREATE INDEX idx_recommendation_events_timestamp ON recommendation_events (timestamp);
@@ -259,6 +274,8 @@ CREATE UNIQUE INDEX idx_feedback_tuning_jobs_playlist_pending
   ON feedback_tuning_jobs (playlist_id)
   WHERE status = 'pending';
 CREATE INDEX idx_sync_outbox_unsynced ON sync_outbox (synced_at, id);
+CREATE INDEX idx_remote_pairing_tokens_expires ON remote_pairing_tokens (expires_at);
+CREATE INDEX idx_remote_sessions_expires ON remote_sessions (expires_at);
 -- Dbmate schema migrations
 INSERT INTO "schema_migrations" (version) VALUES
   ('20260403112734'),
@@ -273,4 +290,5 @@ INSERT INTO "schema_migrations" (version) VALUES
   ('20260409183000'),
   ('20260410030000'),
   ('20260410060000'),
-  ('20260412101500');
+  ('20260412101500'),
+  ('20260518120000');

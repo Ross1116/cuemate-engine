@@ -3,11 +3,17 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -88,6 +94,15 @@ type outboxAckRequest struct {
 	AckedAt      string `json:"acked_at"`
 }
 
+type remotePairingTokenRequest struct {
+	DeviceLabel string `json:"device_label"`
+}
+
+type remotePairRequest struct {
+	Token       string `json:"token"`
+	DeviceLabel string `json:"device_label"`
+}
+
 type enqueueAnalysisRequest struct {
 	AnalysisMode string `json:"analysis_mode"`
 	Force        bool   `json:"force"`
@@ -140,6 +155,7 @@ func run() int {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", srv.handleHealthz)
 	mux.HandleFunc("/readyz", srv.handleReadyz)
+	mux.HandleFunc("/setup/status", srv.handleSetupStatus)
 	mux.HandleFunc("/scoring/metadata", srv.handleMetadata)
 	mux.HandleFunc("/playlists", srv.handlePlaylists)
 	mux.HandleFunc("/playlists/", srv.handlePlaylistRoutes)
@@ -154,13 +170,18 @@ func run() int {
 	mux.HandleFunc("/sync/playlists/snapshot/ack", srv.handleSnapshotAck)
 	mux.HandleFunc("/sync/outbox/pull", srv.handleOutboxPull)
 	mux.HandleFunc("/sync/outbox/ack", srv.handleOutboxAck)
+	mux.HandleFunc("/remote/status", srv.handleRemoteStatus)
+	mux.HandleFunc("/remote/pairing-token", srv.handleRemotePairingToken)
+	mux.HandleFunc("/remote/pair", srv.handleRemotePair)
+	mux.HandleFunc("/remote/logout", srv.handleRemoteLogout)
 	mux.HandleFunc("/tools/cli", srv.handleToolCommand)
+	mux.HandleFunc("/tools/runs/", srv.handleToolRun)
 	mux.HandleFunc("/tools/pick-path", srv.handlePickPath)
 	mux.HandleFunc("/", handleWebApp(cfg.WebDist))
 
 	httpServer := &http.Server{
 		Addr:         cfg.Addr,
-		Handler:      mux,
+		Handler:      srv.remoteAccessMiddleware(mux),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,
@@ -227,6 +248,52 @@ func (s *server) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ready"})
 }
 
+func (s *server) handleSetupStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	statePath := strings.TrimSpace(os.Getenv("CUEMATE_SETUP_STATE_PATH"))
+	logDir := strings.TrimSpace(os.Getenv("CUEMATE_LOG_DIR"))
+	payload := map[string]any{
+		"available":    false,
+		"status":       "unknown",
+		"step":         "",
+		"message":      "",
+		"core_ready":   true,
+		"docker_ready": false,
+		"model_ready":  false,
+		"mobile_ready": remoteBaseURL() != "",
+		"log_dir":      nullIfEmpty(logDir),
+	}
+	if statePath == "" {
+		writeJSON(w, http.StatusOK, payload)
+		return
+	}
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			payload["message"] = err.Error()
+		}
+		writeJSON(w, http.StatusOK, payload)
+		return
+	}
+	var state map[string]any
+	if err := json.Unmarshal(data, &state); err != nil {
+		payload["message"] = "setup state could not be read"
+		writeJSON(w, http.StatusOK, payload)
+		return
+	}
+	for key, value := range state {
+		payload[key] = value
+	}
+	payload["available"] = true
+	if _, ok := payload["log_dir"]; !ok || payload["log_dir"] == "" {
+		payload["log_dir"] = nullIfEmpty(logDir)
+	}
+	writeJSON(w, http.StatusOK, payload)
+}
+
 func (s *server) handleMetadata(w http.ResponseWriter, r *http.Request) {
 	metadata, err := s.runtime.RefreshMetadata(r.Context())
 	if err != nil {
@@ -281,6 +348,98 @@ func handleWebApp(webDist string) http.HandlerFunc {
 	}
 }
 
+func (s *server) remoteAccessMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isLocalRequest(r) || isRemotePublicRequest(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if isRemoteBlockedPath(r.URL.Path) {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "remote sessions cannot access this endpoint"})
+			return
+		}
+		session, ok := s.remoteSession(r)
+		if !ok {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "remote pairing required"})
+			return
+		}
+		_ = session
+		next.ServeHTTP(w, r)
+	})
+}
+
+func isLocalRequest(r *http.Request) bool {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
+	if err != nil {
+		host = strings.Trim(strings.TrimSpace(r.RemoteAddr), "[]")
+	}
+	if host == "" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && (ip.IsLoopback() || ip.IsUnspecified())
+}
+
+func isRemotePublicRequest(r *http.Request) bool {
+	switch {
+	case r.URL.Path == "/remote/status":
+		return true
+	case r.URL.Path == "/remote/pair" && r.Method == http.MethodPost:
+		return true
+	case r.Method == http.MethodGet || r.Method == http.MethodHead:
+		return !isAPIPath(r.URL.Path)
+	default:
+		return false
+	}
+}
+
+func isAPIPath(path string) bool {
+	for _, prefix := range []string{
+		"/healthz",
+		"/readyz",
+		"/scoring/",
+		"/playlists",
+		"/tracks/",
+		"/analysis/",
+		"/recommendation-events",
+		"/recommendations",
+		"/events/",
+		"/feedback/",
+		"/corrections",
+		"/sync/",
+		"/setup/",
+		"/tools/",
+		"/remote/",
+	} {
+		if path == strings.TrimSuffix(prefix, "/") || strings.HasPrefix(path, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func isRemoteBlockedPath(path string) bool {
+	for _, prefix := range []string{"/tools/", "/analysis/", "/corrections", "/sync/outbox", "/remote/pairing-token"} {
+		if path == strings.TrimSuffix(prefix, "/") || strings.HasPrefix(path, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *server) remoteSession(r *http.Request) (*recommendationsrepo.RemoteSession, bool) {
+	cookie, err := r.Cookie("cuemate_remote_session")
+	if err != nil || strings.TrimSpace(cookie.Value) == "" {
+		return nil, false
+	}
+	session, err := s.repo.GetValidRemoteSession(r.Context(), hashSecret(cookie.Value), recommendationsrepo.NowUTC())
+	if err != nil {
+		log.Printf("remote session lookup failed: %v", err)
+		return nil, false
+	}
+	return session, session != nil
+}
+
 func (s *server) handlePlaylists(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
@@ -307,7 +466,7 @@ func (s *server) handlePlaylistRoutes(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(rest, "/")
 	playlistID := parts[0]
 	switch {
-	case len(parts) == 1 && r.Method == http.MethodGet:
+	case len(parts) == 1 && (r.Method == http.MethodGet || r.Method == http.MethodDelete):
 		s.handlePlaylistDetail(w, r, playlistID)
 	case len(parts) == 2 && parts[1] == "tracks":
 		s.handlePlaylistTracks(w, r, playlistID)
@@ -320,12 +479,32 @@ func (s *server) handlePlaylistRoutes(w http.ResponseWriter, r *http.Request) {
 		s.handleTrackFeatureDetail(w, r, playlistID, trackID)
 	case len(parts) == 3 && parts[1] == "analysis" && parts[2] == "enqueue":
 		s.handlePlaylistAnalysisEnqueue(w, r, playlistID)
+	case len(parts) == 3 && parts[1] == "analysis" && parts[2] == "refresh":
+		s.handlePlaylistAnalysisRefresh(w, r, playlistID)
+	case len(parts) == 3 && parts[1] == "analysis" && parts[2] == "status":
+		s.handlePlaylistAnalysisStatus(w, r, playlistID)
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "playlist route not found"})
 	}
 }
 
 func (s *server) handlePlaylistDetail(w http.ResponseWriter, r *http.Request, playlistID string) {
+	if r.Method == http.MethodDelete {
+		if err := s.repo.DeletePlaylist(r.Context(), playlistID); err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, recommendationsrepo.ErrPlaylistNotFound) {
+				status = http.StatusNotFound
+			}
+			writeJSON(w, status, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"removed": true, "playlist_id": playlistID})
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
 	playlist, err := s.repo.ResolvePlaylist(r.Context(), playlistID, "")
 	if err != nil {
 		status := http.StatusBadRequest
@@ -568,6 +747,48 @@ func (s *server) handlePickPath(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"paths": paths})
 }
 
+func (s *server) handleToolRun(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	runID := strings.Trim(strings.TrimPrefix(r.URL.Path, "/tools/runs/"), "/")
+	metaPath, err := toolRunMetaPath(runID)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "tool run not found"})
+		return
+	}
+	data, err := os.ReadFile(metaPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "tool run not found"})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(data, &payload); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "tool run metadata is invalid"})
+		return
+	}
+	logPath, _ := payload["log_path"].(string)
+	tail, err := readToolRunTail(logPath, 16*1024)
+	if err != nil {
+		tail = ""
+	}
+	payload["output_tail"] = tail
+	writeJSON(w, http.StatusOK, payload)
+}
+
+func validRunID(runID string) bool {
+	if len(runID) != 36 {
+		return false
+	}
+	_, err := uuid.Parse(runID)
+	return err == nil
+}
+
 func pickerScript(kind string) (string, error) {
 	switch strings.TrimSpace(kind) {
 	case "folder":
@@ -721,11 +942,13 @@ func buildToolCommand(req toolCommandRequest) ([]string, bool, error) {
 }
 
 func startBackgroundToolCommand(pythonExe string, cliArgs []string) (map[string]any, error) {
-	logDir := filepath.Join("tmp", "tool-runs")
+	runID := uuid.NewString()
+	logDir := toolRunDir()
 	if err := os.MkdirAll(logDir, 0o755); err != nil {
 		return nil, err
 	}
-	logPath := filepath.Join(logDir, fmt.Sprintf("%s.log", time.Now().UTC().Format("20060102T150405.000000000Z")))
+	startedAt := time.Now().UTC().Format(time.RFC3339Nano)
+	logPath := filepath.Join(logDir, runID+".log")
 	logFile, err := os.Create(logPath)
 	if err != nil {
 		return nil, err
@@ -737,19 +960,120 @@ func startBackgroundToolCommand(pythonExe string, cliArgs []string) (map[string]
 		_ = logFile.Close()
 		return nil, err
 	}
+	meta := map[string]any{
+		"run_id":     runID,
+		"status":     "running",
+		"mode":       "background",
+		"pid":        cmd.Process.Pid,
+		"command":    append([]string{pythonExe}, cliArgs...),
+		"log_path":   logPath,
+		"started_at": startedAt,
+	}
+	if err := writeToolRunMeta(runID, meta); err != nil {
+		_ = logFile.Close()
+		return nil, err
+	}
 	go func() {
 		err := cmd.Wait()
+		finishedAt := time.Now().UTC().Format(time.RFC3339Nano)
+		status := "completed"
 		if err != nil {
+			status = "failed"
 			_, _ = fmt.Fprintf(logFile, "\n[cuemate] command failed: %v\n", err)
 		}
 		_ = logFile.Close()
+		meta["status"] = status
+		meta["finished_at"] = finishedAt
+		if err != nil {
+			meta["error"] = err.Error()
+		}
+		_ = writeToolRunMeta(runID, meta)
 	}()
 	return map[string]any{
+		"run_id":   runID,
 		"status":   "started",
 		"mode":     "background",
 		"pid":      cmd.Process.Pid,
 		"log_path": logPath,
 	}, nil
+}
+
+func toolRunDir() string {
+	if logDir := strings.TrimSpace(os.Getenv("CUEMATE_LOG_DIR")); logDir != "" {
+		return filepath.Join(logDir, "tool-runs")
+	}
+	return filepath.Join("tmp", "tool-runs")
+}
+
+func toolRunMetaPath(runID string) (string, error) {
+	parsed, err := uuid.Parse(runID)
+	if err != nil || parsed.String() != runID {
+		return "", errors.New("invalid tool run id")
+	}
+	logDir, err := filepath.Abs(toolRunDir())
+	if err != nil {
+		return "", err
+	}
+	metaPath, err := filepath.Abs(filepath.Join(logDir, parsed.String()+".json"))
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(logDir, metaPath)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", errors.New("invalid tool run path")
+	}
+	return metaPath, nil
+}
+
+func writeToolRunMeta(runID string, payload map[string]any) error {
+	data, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return err
+	}
+	metaPath, err := toolRunMetaPath(runID)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(metaPath, data, 0o644)
+}
+
+func readToolRunTail(logPath string, maxBytes int64) (string, error) {
+	if strings.TrimSpace(logPath) == "" {
+		return "", nil
+	}
+	logDir, err := filepath.Abs(toolRunDir())
+	if err != nil {
+		return "", err
+	}
+	cleanLogPath, err := filepath.Abs(filepath.Clean(logPath))
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(logDir, cleanLogPath)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", errors.New("invalid tool log path")
+	}
+	file, err := os.Open(cleanLogPath)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return "", err
+	}
+	offset := int64(0)
+	if info.Size() > maxBytes {
+		offset = info.Size() - maxBytes
+	}
+	if _, err := file.Seek(offset, 0); err != nil {
+		return "", err
+	}
+	data, err := io.ReadAll(file)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
 }
 
 func pythonExecutable() (string, error) {
@@ -872,6 +1196,77 @@ func (s *server) handlePlaylistAnalysisEnqueue(w http.ResponseWriter, r *http.Re
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"playlist_id": playlistID, "queued_count": queued})
+}
+
+func (s *server) handlePlaylistAnalysisStatus(w http.ResponseWriter, r *http.Request, playlistID string) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	status, err := s.repo.GetPlaylistAnalysisStatus(r.Context(), playlistID)
+	if err != nil {
+		httpStatus := http.StatusInternalServerError
+		if errors.Is(err, recommendationsrepo.ErrPlaylistNotFound) {
+			httpStatus = http.StatusNotFound
+		}
+		writeJSON(w, httpStatus, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, playlistAnalysisStatusPayload(status))
+}
+
+func (s *server) handlePlaylistAnalysisRefresh(w http.ResponseWriter, r *http.Request, playlistID string) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	var req enqueueAnalysisRequest
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON request"})
+			return
+		}
+	}
+	if !validAnalysisMode(req.AnalysisMode) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "analysis_mode must be fast_pass, staged, or full"})
+		return
+	}
+	if _, err := s.repo.ResolvePlaylist(r.Context(), playlistID, ""); err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, recommendationsrepo.ErrPlaylistNotFound) {
+			status = http.StatusNotFound
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	metadata, err := s.runtime.RefreshMetadata(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": scoringruntime.DescribeUnavailable(err)})
+		return
+	}
+	active := metadata.GetActiveSignatures()
+	queued, err := s.repo.QueuePlaylistAnalysis(
+		r.Context(),
+		playlistID,
+		req.AnalysisMode,
+		req.Force,
+		active.GetAnalysisSignature(),
+		active.GetConfigSignature(),
+	)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	status, err := s.repo.GetPlaylistAnalysisStatus(r.Context(), playlistID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"playlist_id":  playlistID,
+		"queued_count": queued,
+		"status":       playlistAnalysisStatusPayload(status),
+	})
 }
 
 func (s *server) handleRecommendations(w http.ResponseWriter, r *http.Request) {
@@ -1481,6 +1876,151 @@ func (s *server) handleOutboxAck(w http.ResponseWriter, r *http.Request) {
 		"acked_count":    ackedCount,
 		"acked_at":       ackedAt,
 	})
+}
+
+func (s *server) handleRemoteStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	_, paired := s.remoteSession(r)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"enabled":       remoteBaseURL() != "",
+		"mode":          "tailscale",
+		"remote_url":    nullIfEmpty(remoteBaseURL()),
+		"request_local": isLocalRequest(r),
+		"paired":        paired,
+	})
+}
+
+func (s *server) handleRemotePairingToken(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	if !isLocalRequest(r) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "pairing tokens can only be created locally"})
+		return
+	}
+	var req remotePairingTokenRequest
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON request"})
+			return
+		}
+	}
+	token, err := randomURLToken(32)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	now := time.Now().UTC()
+	expiresAt := now.Add(5 * time.Minute)
+	if err := s.repo.CreateRemotePairingToken(r.Context(), hashSecret(token), optionalString(req.DeviceLabel), now.Format(time.RFC3339), expiresAt.Format(time.RFC3339)); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	baseURL := remoteBaseURL()
+	if baseURL == "" {
+		baseURL = "http://" + r.Host
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"token":      token,
+		"expires_at": expiresAt.Format(time.RFC3339),
+		"pair_url":   strings.TrimRight(baseURL, "/") + "/?pair_token=" + url.QueryEscape(token),
+	})
+}
+
+func (s *server) handleRemotePair(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	var req remotePairRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON request"})
+		return
+	}
+	if strings.TrimSpace(req.Token) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "token is required"})
+		return
+	}
+	now := time.Now().UTC()
+	token, err := s.repo.ConsumeRemotePairingToken(r.Context(), hashSecret(req.Token), now.Format(time.RFC3339))
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if token == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "pairing token is invalid or expired"})
+		return
+	}
+	sessionSecret, err := randomURLToken(32)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	expiresAt := now.Add(30 * 24 * time.Hour)
+	deviceLabel := optionalString(firstNonEmpty(req.DeviceLabel, stringValue(token.DeviceLabel), "Mobile device"))
+	if err := s.repo.CreateRemoteSession(r.Context(), hashSecret(sessionSecret), deviceLabel, now.Format(time.RFC3339), expiresAt.Format(time.RFC3339)); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     "cuemate_remote_session",
+		Value:    sessionSecret,
+		Path:     "/",
+		Expires:  expiresAt,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   !isLocalRequest(r),
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"status": "paired", "expires_at": expiresAt.Format(time.RFC3339)})
+}
+
+func (s *server) handleRemoteLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	if cookie, err := r.Cookie("cuemate_remote_session"); err == nil {
+		_ = s.repo.RevokeRemoteSession(r.Context(), hashSecret(cookie.Value), recommendationsrepo.NowUTC())
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     "cuemate_remote_session",
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		Secure:   !isLocalRequest(r),
+	})
+	writeJSON(w, http.StatusOK, map[string]string{"status": "logged_out"})
+}
+
+func remoteBaseURL() string {
+	return strings.TrimRight(strings.TrimSpace(os.Getenv("CUEMATE_REMOTE_URL")), "/")
+}
+
+func randomURLToken(size int) (string, error) {
+	buf := make([]byte, size)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(buf), nil
+}
+
+func hashSecret(secret string) string {
+	sum := sha256.Sum256([]byte(secret))
+	return hex.EncodeToString(sum[:])
+}
+
+func optionalString(value string) *string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return nil
+	}
+	return &trimmed
 }
 
 func relativeRefreshReason(stats *recommendationsrepo.PlaylistStats, expectedRelativeSignature string) string {
@@ -2394,6 +2934,26 @@ func playlistTrackPayload(track recommendationsrepo.PlaylistTrackSnapshot) map[s
 		"intensity_band": stringOrNil(track.IntensityBand),
 		"role_hints":     append([]string{}, track.RoleHints...),
 		"analysis_state": track.AnalysisState,
+	}
+}
+
+func playlistAnalysisStatusPayload(status recommendationsrepo.PlaylistAnalysisStatus) map[string]any {
+	return map[string]any{
+		"playlist_id":      status.PlaylistID,
+		"playlist_name":    status.PlaylistName,
+		"total_tracks":     status.TotalTracks,
+		"ready_tracks":     status.ReadyTracks,
+		"percent_complete": status.PercentComplete,
+		"is_stale":         status.IsStale,
+		"stale_reason":     nullIfEmpty(status.StaleReason),
+		"latest_error":     stringOrNil(status.LatestError),
+		"next_action":      status.NextAction,
+		"jobs": map[string]any{
+			"pending":   status.Counts.Pending,
+			"running":   status.Counts.Running,
+			"completed": status.Counts.Completed,
+			"failed":    status.Counts.Failed,
+		},
 	}
 }
 

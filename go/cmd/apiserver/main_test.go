@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	scoringv1 "github.com/Ross1116/cuemate-engine/go/gen/djengine/scoring/v1"
 	"github.com/Ross1116/cuemate-engine/go/internal/recommendationsrepo"
@@ -1030,6 +1031,253 @@ func TestOutboxPullAndAckLifecycle(t *testing.T) {
 	}
 	if secondItems[0].(map[string]any)["entity_id"] != "corr_1" {
 		t.Fatalf("remaining item = %#v", secondItems[0])
+	}
+}
+
+func TestRemotePairingTokenIsSingleUse(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+	tokenRec := httptest.NewRecorder()
+	tokenReq := httptest.NewRequest(http.MethodPost, "/remote/pairing-token", bytes.NewBufferString(`{"device_label":"Phone"}`))
+	tokenReq.Host = "127.0.0.1:8080"
+	tokenReq.RemoteAddr = "127.0.0.1:49152"
+	srv.handleRemotePairingToken(tokenRec, tokenReq)
+	if tokenRec.Code != http.StatusOK {
+		t.Fatalf("token status = %d body=%s", tokenRec.Code, tokenRec.Body.String())
+	}
+	var tokenPayload map[string]any
+	if err := json.Unmarshal(tokenRec.Body.Bytes(), &tokenPayload); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	token := tokenPayload["token"].(string)
+
+	pairBody := `{"token":"` + token + `","device_label":"Phone"}`
+	pairRec := httptest.NewRecorder()
+	pairReq := httptest.NewRequest(http.MethodPost, "/remote/pair", bytes.NewBufferString(pairBody))
+	pairReq.Host = "cue.example"
+	srv.handleRemotePair(pairRec, pairReq)
+	if pairRec.Code != http.StatusOK {
+		t.Fatalf("pair status = %d body=%s", pairRec.Code, pairRec.Body.String())
+	}
+	if len(pairRec.Result().Cookies()) == 0 {
+		t.Fatalf("expected session cookie")
+	}
+
+	secondPairRec := httptest.NewRecorder()
+	secondPairReq := httptest.NewRequest(http.MethodPost, "/remote/pair", bytes.NewBufferString(pairBody))
+	secondPairReq.Host = "cue.example"
+	srv.handleRemotePair(secondPairRec, secondPairReq)
+	if secondPairRec.Code != http.StatusUnauthorized {
+		t.Fatalf("second pair status = %d body=%s", secondPairRec.Code, secondPairRec.Body.String())
+	}
+}
+
+func TestRemoteAccessRequiresSessionForAPI(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/playlists", nil)
+	req.Host = "cue.example"
+	srv.remoteAccessMiddleware(http.HandlerFunc(srv.handlePlaylists)).ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestRemoteAccessAllowsSessionForSafeAPI(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+	sessionSecret := "session-secret"
+	now := time.Now().UTC()
+	if err := srv.repo.CreateRemoteSession(context.Background(), hashSecret(sessionSecret), stringPtr("Phone"), now.Format(time.RFC3339), now.Add(time.Hour).Format(time.RFC3339)); err != nil {
+		t.Fatalf("CreateRemoteSession() error = %v", err)
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/playlists", nil)
+	req.Host = "cue.example"
+	req.AddCookie(&http.Cookie{Name: "cuemate_remote_session", Value: sessionSecret})
+	srv.remoteAccessMiddleware(http.HandlerFunc(srv.handlePlaylists)).ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestRemoteAccessBlocksAdminRoutesEvenWithSession(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+	sessionSecret := "session-secret"
+	now := time.Now().UTC()
+	if err := srv.repo.CreateRemoteSession(context.Background(), hashSecret(sessionSecret), stringPtr("Phone"), now.Format(time.RFC3339), now.Add(time.Hour).Format(time.RFC3339)); err != nil {
+		t.Fatalf("CreateRemoteSession() error = %v", err)
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/tools/cli", bytes.NewBufferString(`{}`))
+	req.Host = "cue.example"
+	req.AddCookie(&http.Cookie{Name: "cuemate_remote_session", Value: sessionSecret})
+	srv.remoteAccessMiddleware(http.HandlerFunc(srv.handleToolCommand)).ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestRemoteAccessDoesNotTrustSpoofedHostHeader(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/playlists", nil)
+	req.Host = "127.0.0.1:8080"
+	req.RemoteAddr = "203.0.113.10:49152"
+	srv.remoteAccessMiddleware(http.HandlerFunc(srv.handlePlaylists)).ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestSetupStatusIsNotRemotePublic(t *testing.T) {
+	if isRemotePublicRequest(httptest.NewRequest(http.MethodGet, "/setup/status", nil)) {
+		t.Fatalf("/setup/status should not be remote-public")
+	}
+}
+
+func TestRemotePairingTokenRejectsMalformedJSON(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/remote/pairing-token", bytes.NewBufferString(`{"device_label":`))
+	req.RemoteAddr = "127.0.0.1:49152"
+	srv.handleRemotePairingToken(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPlaylistAnalysisStatusSummarizesJobs(t *testing.T) {
+	srv := newTestServer(t, true, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+	if _, err := srv.repo.DB().Exec(`INSERT INTO analysis_jobs (playlist_id, track_id, track_path, status, priority, analysis_mode, analysis_signature, config_signature, created_at, error_message, job_kind) VALUES
+		('pl_1', 'trk_current', '/music/current.flac', 'pending', 1, 'staged', 'm1-ebd25381ebad', 'default', '2026-04-09T00:00:00Z', NULL, 'full'),
+		('pl_1', 'trk_candidate', '/music/candidate.flac', 'running', 1, 'staged', 'm1-ebd25381ebad', 'default', '2026-04-09T00:00:01Z', NULL, 'full'),
+		('pl_1', 'trk_history', '/music/history.flac', 'failed', 1, 'staged', 'm1-ebd25381ebad', 'default', '2026-04-09T00:00:02Z', 'model unavailable', 'full')`); err != nil {
+		t.Fatalf("insert jobs: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/playlists/pl_1/analysis/status", nil)
+	srv.handlePlaylistAnalysisStatus(rec, req, "pl_1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	jobs := payload["jobs"].(map[string]any)
+	if payload["next_action"] != "inspect_failures" || jobs["pending"].(float64) != 1 || jobs["running"].(float64) != 1 || jobs["failed"].(float64) != 1 {
+		t.Fatalf("payload = %#v", payload)
+	}
+}
+
+func TestPlaylistAnalysisRefreshQueuesSmartAndForce(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/playlists/pl_1/analysis/refresh", bytes.NewBufferString(`{"analysis_mode":"staged"}`))
+	srv.handlePlaylistAnalysisRefresh(rec, req, "pl_1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("smart status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var smart map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &smart); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	if smart["queued_count"].(float64) != 0 {
+		t.Fatalf("smart queued = %#v", smart)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/playlists/pl_1/analysis/refresh", bytes.NewBufferString(`{"analysis_mode":"staged","force":true}`))
+	srv.handlePlaylistAnalysisRefresh(rec, req, "pl_1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("force status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var force map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &force); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	if force["queued_count"].(float64) != 3 {
+		t.Fatalf("force queued = %#v", force)
+	}
+}
+
+func TestDeletePlaylistRemovesAppStateButKeepsTracks(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, "/playlists/pl_1", nil)
+	srv.handlePlaylistRoutes(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("delete status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var playlistCount, trackCount int
+	if err := srv.repo.DB().QueryRow(`SELECT COUNT(*) FROM playlists WHERE id = 'pl_1'`).Scan(&playlistCount); err != nil {
+		t.Fatalf("playlist count: %v", err)
+	}
+	if err := srv.repo.DB().QueryRow(`SELECT COUNT(*) FROM tracks`).Scan(&trackCount); err != nil {
+		t.Fatalf("track count: %v", err)
+	}
+	if playlistCount != 0 || trackCount != 3 {
+		t.Fatalf("playlistCount=%d trackCount=%d", playlistCount, trackCount)
+	}
+}
+
+func TestToolRunRejectsUnknownAndUnsafeIDs(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+	for _, path := range []string{
+		"/tools/runs/missing",
+		"/tools/runs/..%2Fsecret",
+		"/tools/runs/5512103",
+		"/tools/runs/AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA",
+	} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		srv.handleToolRun(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("%s status = %d body=%s", path, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestSetupStatusReadsInstallerState(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+	statePath := filepath.Join(t.TempDir(), "setup-state.json")
+	if err := os.WriteFile(statePath, []byte(`{"step":"prepare-docker","status":"blocked","message":"Docker login required","core_ready":true,"docker_ready":false,"model_ready":false,"mobile_ready":false,"log_dir":"C:\\CueMate\\logs"}`), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	t.Setenv("CUEMATE_SETUP_STATE_PATH", statePath)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/setup/status", nil)
+	srv.handleSetupStatus(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	if payload["status"] != "blocked" || payload["core_ready"] != true || payload["docker_ready"] != false {
+		t.Fatalf("setup payload = %#v", payload)
 	}
 }
 

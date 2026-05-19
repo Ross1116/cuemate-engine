@@ -135,6 +135,10 @@ function Invoke-External {
                 }
                 throw "$FilePath timed out after $TimeoutSeconds seconds"
             }
+            if ($null -eq $process.ExitCode) {
+                Write-Warning "$FilePath finished without reporting an exit code."
+                return
+            }
             if ($process.ExitCode -ne 0) {
                 throw "$FilePath exited with code $($process.ExitCode)"
             }
@@ -195,6 +199,20 @@ function Invoke-WingetInstall {
     Update-ProcessPath
 }
 
+function Test-WingetPackageInstalled {
+    param([string]$PackageId)
+
+    $winget = Get-Command "winget.exe" -ErrorAction SilentlyContinue
+    if (-not $winget) {
+        return $false
+    }
+    $output = & $winget.Source list --id $PackageId --exact --accept-source-agreements 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $output) {
+        return $false
+    }
+    return (([string]$output) -match [regex]::Escape($PackageId))
+}
+
 function Ensure-WingetPackage {
     param(
         [string]$CommandName,
@@ -206,6 +224,10 @@ function Ensure-WingetPackage {
     if (Get-InstalledCommand -CommandName $CommandName -CandidatePaths $CandidatePaths) {
         return $true
     }
+    if (Test-WingetPackageInstalled -PackageId $PackageId) {
+        Update-ProcessPath
+        return [bool](Get-InstalledCommand -CommandName $CommandName -CandidatePaths $CandidatePaths)
+    }
     if ($SkipWingetInstall) {
         if ($Optional) {
             Write-Warning "$CommandName was not found. Skipping automatic $PackageId install because -SkipWingetInstall was supplied."
@@ -216,6 +238,10 @@ function Ensure-WingetPackage {
     try {
         Invoke-WingetInstall -PackageId $PackageId
     } catch {
+        if (Test-WingetPackageInstalled -PackageId $PackageId) {
+            Update-ProcessPath
+            return [bool](Get-InstalledCommand -CommandName $CommandName -CandidatePaths $CandidatePaths)
+        }
         if ($Optional) {
             Write-Warning "Could not install $PackageId automatically: $($_.Exception.Message)"
             return $false
@@ -233,27 +259,49 @@ function Get-DockerCommand {
 }
 
 function Get-PythonCommand {
+    $candidates = @(
+        "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe",
+        "$env:ProgramFiles\Python312\python.exe",
+        "${env:ProgramFiles(x86)}\Python312\python.exe"
+    )
     $python = Get-Command "python.exe" -ErrorAction SilentlyContinue
-    if (-not $python) {
-        return $null
+    if ($python) {
+        $candidates = @($python.Source) + $candidates
     }
-    $versionText = & $python.Source -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
-    if ($LASTEXITCODE -ne 0) {
-        return $null
+    $python312 = Get-Command "python3.12.exe" -ErrorAction SilentlyContinue
+    if ($python312) {
+        $candidates = @($python312.Source) + $candidates
     }
-    $versionMatch = [regex]::Match([string]$versionText, '^\s*(\d+\.\d+)')
-    if (-not $versionMatch.Success) {
-        return $null
+    $pyLauncher = Get-Command "py.exe" -ErrorAction SilentlyContinue
+    if ($pyLauncher) {
+        $launcherPython = & $pyLauncher.Source -3.12 -c "import sys; print(sys.executable)" 2>$null
+        if ($LASTEXITCODE -eq 0 -and $launcherPython) {
+            $candidates = @([string]$launcherPython) + $candidates
+        }
     }
-    try {
-        $parsedVersion = [version]$versionMatch.Groups[1].Value
-    } catch {
-        return $null
+
+    foreach ($candidate in ($candidates | Select-Object -Unique)) {
+        if (-not $candidate -or -not (Test-Path $candidate -PathType Leaf)) {
+            continue
+        }
+        $versionText = & $candidate -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
+        if ($LASTEXITCODE -ne 0) {
+            continue
+        }
+        $versionMatch = [regex]::Match([string]$versionText, '^\s*(\d+\.\d+)')
+        if (-not $versionMatch.Success) {
+            continue
+        }
+        try {
+            $parsedVersion = [version]$versionMatch.Groups[1].Value
+        } catch {
+            continue
+        }
+        if ($parsedVersion -ge [version]"3.12") {
+            return $candidate
+        }
     }
-    if ($parsedVersion -lt [version]"3.12") {
-        return $null
-    }
-    return $python.Source
+    return $null
 }
 
 function Wait-DockerReady {
@@ -326,7 +374,11 @@ try {
                 throw "CueMate could not find winget, so it cannot install Python 3.12 automatically. Install Python 3.12 manually, then launch CueMate again."
             }
             Write-SetupState -Step "install-prerequisites" -Status "running" -Message "Installing Python 3.12. If Windows updates PATH, launch CueMate again after this step finishes."
-            Invoke-WingetInstall -PackageId "Python.Python.3.12"
+            if (Test-WingetPackageInstalled -PackageId "Python.Python.3.12") {
+                Update-ProcessPath
+            } else {
+                Invoke-WingetInstall -PackageId "Python.Python.3.12"
+            }
         }
         $dockerReady = Ensure-WingetPackage -CommandName "docker.exe" -PackageId "Docker.DockerDesktop" -CandidatePaths @(
             "$env:ProgramFiles\Docker\Docker\resources\bin\docker.exe",

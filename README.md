@@ -205,7 +205,3 @@ python/              analysis engine, scorer, CLI, and Python tests
 scripts/             developer and model-service helpers
 web/                 React/Vite app
 ```
-
-## Status
-
-CueMate is a Windows-first private beta. The installer is unsigned. The next production-readiness steps are clean-VM acceptance testing, code signing, and broader hardening for locked-down enterprise Windows environments.

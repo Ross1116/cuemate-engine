@@ -309,6 +309,8 @@ def build_tempocnn_service_run_command(
         "--env",
         "TF_CPP_MIN_LOG_LEVEL=3",
         "--env",
+        "PYTHONPATH=/workspace/python/src",
+        "--env",
         "CUEMATE_TEMPOCNN_DEFAULT_MODEL=/workspace/python/models/essentia/deepsquare-k16-3.pb",
         "--volume",
         f"{os.fspath(REPO_ROOT.resolve())}:/workspace:ro",

@@ -136,6 +136,7 @@ def test_build_tempocnn_service_run_command_includes_drive_mounts() -> None:
     assert "--gpus" in command
     assert "127.0.0.1:49000:49000" in command_text
     assert "ESSENTIA_SEMANTIC_SERVICE_PORT=49000" in command
+    assert "PYTHONPATH=/workspace/python/src" in command
     assert "target=/host/d" in command_text
     assert "target=/host/e" in command_text
     assert "/workspace/docker/essentia_semantics/service.py" in command

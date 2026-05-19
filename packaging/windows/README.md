@@ -9,7 +9,7 @@ The installer is per-user and unsigned by default. It installs immutable app fil
 - Windows 10/11
 - PowerShell
 - Node.js/npm
-- Go 1.24+
+- Go 1.25+
 - Inno Setup 6, unless building with `-SkipInstaller`
 - Internet access for dependency restore and optional prerequisite installation
 

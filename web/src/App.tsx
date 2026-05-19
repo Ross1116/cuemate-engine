@@ -237,9 +237,10 @@ function operationStartedMessage(action: string) {
 function parseDJPlaylistNames(output?: string) {
   if (!output) return [];
   const seen = new Set<string>();
+  const ansiEscapePattern = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, "g");
   const names = output
     .split(/\r?\n/)
-    .map((line) => line.replace(/\x1b\[[0-9;]*m/g, "").trim())
+    .map((line) => line.replace(ansiEscapePattern, "").trim())
     .map((line) => {
       const bulletMatch = line.match(/^[-*]\s+(.+?)\s*$/);
       if (bulletMatch) return bulletMatch[1].trim();

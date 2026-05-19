@@ -155,7 +155,7 @@ function Assert-StagedRuntime {
 
 Write-Host "Preparing CueMate installer build $Version"
 Get-RequiredCommand -Name "npm.cmd" -InstallHint "Install Node.js LTS, then rerun this script." | Out-Null
-Get-RequiredCommand -Name "go.exe" -InstallHint "Install Go 1.24 or newer, then rerun this script." | Out-Null
+Get-RequiredCommand -Name "go.exe" -InstallHint "Install Go 1.25 or newer, then rerun this script." | Out-Null
 Get-RequiredCommand -Name "powershell.exe" -InstallHint "PowerShell is required to build CueMate." | Out-Null
 
 foreach ($source in @(
@@ -172,7 +172,7 @@ Remove-Item $distRoot -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $stageRoot, $outputRoot | Out-Null
 
 Invoke-LoggedCommand -FilePath (Get-RequiredCommand -Name "npm.cmd" -InstallHint "Install Node.js LTS, then rerun this script.") -Arguments @("run", "build") -WorkingDirectory (Join-Path $repoRoot "web")
-Invoke-LoggedCommand -FilePath (Get-RequiredCommand -Name "go.exe" -InstallHint "Install Go 1.24 or newer, then rerun this script.") -Arguments @("build", "-o", $goExe, "./cmd/apiserver") -WorkingDirectory (Join-Path $repoRoot "go")
+Invoke-LoggedCommand -FilePath (Get-RequiredCommand -Name "go.exe" -InstallHint "Install Go 1.25 or newer, then rerun this script.") -Arguments @("build", "-o", $goExe, "./cmd/apiserver") -WorkingDirectory (Join-Path $repoRoot "go")
 
 Invoke-RobocopyChecked -Source (Join-Path $repoRoot "python") -Destination (Join-Path $stageRoot "python") -ExtraArgs @(
     "/XD", ".venv", "__pycache__", ".pytest_cache", ".ruff_cache", "*.egg-info",

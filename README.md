@@ -93,7 +93,7 @@ CueMate still works locally. For mobile access, make sure Tailscale is installed
 Prerequisites:
 
 - Windows 10/11 recommended
-- Go 1.24+
+- Go 1.25+
 - Python 3.12+
 - Node.js/npm
 - Docker Desktop

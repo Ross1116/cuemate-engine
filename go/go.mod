@@ -1,6 +1,6 @@
 module github.com/Ross1116/cuemate-engine/go
 
-go 1.24.1
+go 1.25.0
 
 require (
 	google.golang.org/grpc v1.80.0

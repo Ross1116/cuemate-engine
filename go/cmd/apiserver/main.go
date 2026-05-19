@@ -44,6 +44,7 @@ type appConfig struct {
 	Addr     string
 	Database string
 	WebDist  string
+	Showcase bool
 }
 
 type recommendationRequest struct {
@@ -127,8 +128,9 @@ type pickPathRequest struct {
 }
 
 type server struct {
-	repo    *recommendationsrepo.Repository
-	runtime *scoringruntime.Runtime
+	repo     *recommendationsrepo.Repository
+	runtime  *scoringruntime.Runtime
+	showcase bool
 }
 
 func main() {
@@ -151,7 +153,7 @@ func run() int {
 	}
 	defer runtime.Close()
 
-	srv := &server{repo: repo, runtime: runtime}
+	srv := &server{repo: repo, runtime: runtime, showcase: cfg.Showcase}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", srv.handleHealthz)
 	mux.HandleFunc("/readyz", srv.handleReadyz)
@@ -232,7 +234,25 @@ func loadConfig() appConfig {
 		Addr:     addr,
 		Database: strings.TrimPrefix(databaseURL, "sqlite:"),
 		WebDist:  firstNonEmpty(strings.TrimSpace(os.Getenv("WEB_DIST_DIR")), "web/dist"),
+		Showcase: truthyEnv("CUEMATE_SHOWCASE_MODE"),
 	}
+}
+
+func truthyEnv(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *server) rejectShowcaseWrite(w http.ResponseWriter) bool {
+	if !s.showcase {
+		return false
+	}
+	writeJSON(w, http.StatusForbidden, map[string]string{"error": "CueMate showcase mode is read-only."})
+	return true
 }
 
 func (s *server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
@@ -260,11 +280,26 @@ func (s *server) handleSetupStatus(w http.ResponseWriter, r *http.Request) {
 		"status":       "unknown",
 		"step":         "",
 		"message":      "",
+		"mode":         "local",
+		"read_only":    false,
 		"core_ready":   true,
 		"docker_ready": false,
 		"model_ready":  false,
 		"mobile_ready": remoteBaseURL() != "",
 		"log_dir":      nullIfEmpty(logDir),
+	}
+	if s.showcase {
+		payload["available"] = true
+		payload["status"] = "complete"
+		payload["step"] = "showcase"
+		payload["message"] = "CueMate is running in hosted showcase mode."
+		payload["mode"] = "showcase"
+		payload["read_only"] = true
+		payload["docker_ready"] = false
+		payload["model_ready"] = false
+		payload["mobile_ready"] = false
+		writeJSON(w, http.StatusOK, payload)
+		return
 	}
 	if statePath == "" {
 		writeJSON(w, http.StatusOK, payload)
@@ -350,6 +385,10 @@ func handleWebApp(webDist string) http.HandlerFunc {
 
 func (s *server) remoteAccessMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.showcase {
+			next.ServeHTTP(w, r)
+			return
+		}
 		if isLocalRequest(r) || isRemotePublicRequest(r) {
 			next.ServeHTTP(w, r)
 			return
@@ -490,6 +529,9 @@ func (s *server) handlePlaylistRoutes(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) handlePlaylistDetail(w http.ResponseWriter, r *http.Request, playlistID string) {
 	if r.Method == http.MethodDelete {
+		if s.rejectShowcaseWrite(w) {
+			return
+		}
 		if err := s.repo.DeletePlaylist(r.Context(), playlistID); err != nil {
 			status := http.StatusInternalServerError
 			if errors.Is(err, recommendationsrepo.ErrPlaylistNotFound) {
@@ -664,6 +706,9 @@ func boundedRecommendationEvents(events []recommendationsrepo.RecommendationEven
 }
 
 func (s *server) handleToolCommand(w http.ResponseWriter, r *http.Request) {
+	if s.rejectShowcaseWrite(w) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
@@ -725,6 +770,9 @@ func (s *server) handleToolCommand(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handlePickPath(w http.ResponseWriter, r *http.Request) {
+	if s.rejectShowcaseWrite(w) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
@@ -776,6 +824,9 @@ func parsePickerPaths(output []byte) ([]string, error) {
 }
 
 func (s *server) handleToolRun(w http.ResponseWriter, r *http.Request) {
+	if s.rejectShowcaseWrite(w) {
+		return
+	}
 	if r.Method != http.MethodGet {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
@@ -1184,6 +1235,9 @@ func validAnalysisMode(mode string) bool {
 }
 
 func (s *server) handlePlaylistAnalysisEnqueue(w http.ResponseWriter, r *http.Request, playlistID string) {
+	if s.rejectShowcaseWrite(w) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
@@ -1249,6 +1303,9 @@ func (s *server) handlePlaylistAnalysisStatus(w http.ResponseWriter, r *http.Req
 }
 
 func (s *server) handlePlaylistAnalysisRefresh(w http.ResponseWriter, r *http.Request, playlistID string) {
+	if s.rejectShowcaseWrite(w) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
@@ -1379,6 +1436,12 @@ func (s *server) handleRecommendations(w http.ResponseWriter, r *http.Request) {
 
 	payload := translateRecommendationsResponse(response)
 	applyPlaylistWeightSource(payload, hydrated.Stats)
+	if s.showcase {
+		meta := payload["meta"].(map[string]any)
+		meta["recommendation_event_id"] = nil
+		writeJSON(w, http.StatusOK, payload)
+		return
+	}
 	eventID, err := s.recordRecommendationEvent(r.Context(), hydrated, response, payload)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -1390,6 +1453,9 @@ func (s *server) handleRecommendations(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handlePlayedEvent(w http.ResponseWriter, r *http.Request) {
+	if s.rejectShowcaseWrite(w) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
@@ -1494,6 +1560,9 @@ func (s *server) handlePlayedEvent(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleCorrections(w http.ResponseWriter, r *http.Request) {
+	if s.rejectShowcaseWrite(w) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
@@ -1675,6 +1744,9 @@ func (s *server) handleCorrections(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
+	if s.rejectShowcaseWrite(w) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
@@ -1815,6 +1887,9 @@ func (s *server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleSnapshotAck(w http.ResponseWriter, r *http.Request) {
+	if s.rejectShowcaseWrite(w) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
@@ -1849,6 +1924,9 @@ func (s *server) handleSnapshotAck(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleOutboxPull(w http.ResponseWriter, r *http.Request) {
+	if s.rejectShowcaseWrite(w) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
@@ -1894,6 +1972,9 @@ func (s *server) handleOutboxPull(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleOutboxAck(w http.ResponseWriter, r *http.Request) {
+	if s.rejectShowcaseWrite(w) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
@@ -1939,6 +2020,9 @@ func (s *server) handleRemoteStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleRemotePairingToken(w http.ResponseWriter, r *http.Request) {
+	if s.rejectShowcaseWrite(w) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
@@ -1977,6 +2061,9 @@ func (s *server) handleRemotePairingToken(w http.ResponseWriter, r *http.Request
 }
 
 func (s *server) handleRemotePair(w http.ResponseWriter, r *http.Request) {
+	if s.rejectShowcaseWrite(w) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
@@ -2024,6 +2111,9 @@ func (s *server) handleRemotePair(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleRemoteLogout(w http.ResponseWriter, r *http.Request) {
+	if s.rejectShowcaseWrite(w) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return

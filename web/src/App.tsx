@@ -9,6 +9,7 @@ import {
   ChevronDown,
   CircleHelp,
   CircleDot,
+  Eye,
   FileAudio,
   FolderPlus,
   FolderOpen,
@@ -448,16 +449,42 @@ export function App() {
 
   useEffect(() => {
     const token = new URLSearchParams(window.location.search).get("pair_token");
-    if (token && consumedPairTokenRef.current !== token) {
+    const showcase = setupStatus.data?.mode === "showcase" || setupStatus.data?.read_only === true;
+    if (!showcase && token && consumedPairTokenRef.current !== token) {
       consumedPairTokenRef.current = token;
       remoteConsumePairMutation.mutate(token);
     }
-  }, [remoteConsumePairMutation]);
+  }, [remoteConsumePairMutation, setupStatus.data?.mode, setupStatus.data?.read_only]);
 
   const selectedPlaylist = playlists.data?.items.find((item) => item.playlist_id === selectedPlaylistId) ?? playlists.data?.items[0];
   const currentTrack = tracks.data?.items.find((item) => item.track_id === currentTrackId);
+  const isShowcase = setupStatus.data?.mode === "showcase" || setupStatus.data?.read_only === true;
 
   const firstReadyTrack = tracks.data?.items.find((item) => item.analysis_state === "ready");
+
+  const advanceCurrentTrack = useCallback(
+    (trackId: string) => {
+      const nextHistory = currentTrackId ? [...history.slice(-7), currentTrackId] : history;
+      setHistory(nextHistory);
+      setCurrentTrackId(trackId);
+      localStorage.setItem("cuemate.current", trackId);
+      localStorage.setItem("cuemate.history", JSON.stringify(nextHistory));
+      setSelectedCandidate(null);
+      void queryClient.invalidateQueries({ queryKey: ["recommendations"] });
+    },
+    [currentTrackId, history, queryClient],
+  );
+
+  const confirmCandidate = useCallback(
+    (trackId: string) => {
+      if (isShowcase) {
+        advanceCurrentTrack(trackId);
+        return;
+      }
+      playMutation.mutate(trackId);
+    },
+    [advanceCurrentTrack, isShowcase, playMutation],
+  );
 
   useEffect(() => {
     if (!selectedPlaylistId && selectedPlaylist) {
@@ -473,6 +500,12 @@ export function App() {
     }
   }, [currentTrackId, firstReadyTrack]);
 
+  useEffect(() => {
+    if (isShowcase && mobileTab === "admin") {
+      setMobileTab("recommend");
+    }
+  }, [isShowcase, mobileTab]);
+
   const shellClass = `app-shell mode-${workMode} tab-${mobileTab}`;
 
   return (
@@ -480,7 +513,7 @@ export function App() {
       <header className="topbar">
         <div>
           <p className="eyebrow">CueMate Engine</p>
-          <h1>Performance Control</h1>
+          <h1>{isShowcase ? "Showcase Control" : "Performance Control"}</h1>
         </div>
         <div className="status-row">
           <div className="mode-switch" aria-label="Workspace mode">
@@ -513,7 +546,7 @@ export function App() {
           </div>
         ) : null}
         <SetupStatusBanner status={setupStatus.data} />
-        <OperationBanner message={operationMessage} run={activeToolRun.data} status={analysisStatus.data} />
+        {!isShowcase ? <OperationBanner message={operationMessage} run={activeToolRun.data} status={analysisStatus.data} /> : null}
       </div>
 
       <aside className="library-pane panel mobile-library">
@@ -523,17 +556,19 @@ export function App() {
         ) : (playlists.data?.items.length ?? 0) === 0 ? (
           <div className="empty-library">
             <strong>No playlists yet</strong>
-            <span>Import local files or a DJ library from Full Mode to get started.</span>
-            <button
-              className="wide-action secondary"
-              onClick={() => {
-                setWorkMode("full");
-                setMobileTab("admin");
-                localStorage.setItem("cuemate.mode", "full");
-              }}
-            >
-              Open import tools
-            </button>
+            <span>{isShowcase ? "This showcase snapshot does not include any playlists yet." : "Import local files or a DJ library from Full Mode to get started."}</span>
+            {!isShowcase ? (
+              <button
+                className="wide-action secondary"
+                onClick={() => {
+                  setWorkMode("full");
+                  setMobileTab("admin");
+                  localStorage.setItem("cuemate.mode", "full");
+                }}
+              >
+                Open import tools
+              </button>
+            ) : null}
           </div>
         ) : (
           <PlaylistList
@@ -618,8 +653,9 @@ export function App() {
             <LiveCandidatePanel
               candidate={selectedCandidate}
               response={recommendations.data}
-              onConfirm={(trackId) => playMutation.mutate(trackId)}
-              confirming={playMutation.isPending}
+              onConfirm={confirmCandidate}
+              confirming={!isShowcase && playMutation.isPending}
+              showcaseMode={isShowcase}
             />
             <CandidateSignalPanel candidate={selectedCandidate} playlistId={selectedPlaylist?.playlist_id} />
           </>
@@ -628,8 +664,9 @@ export function App() {
             <CandidateDetail
               candidate={selectedCandidate}
               response={recommendations.data}
-              onConfirm={(trackId) => playMutation.mutate(trackId)}
-              confirming={playMutation.isPending}
+              onConfirm={confirmCandidate}
+              confirming={!isShowcase && playMutation.isPending}
+              showcaseMode={isShowcase}
             />
             <FullCandidateAnalysisPanel candidate={selectedCandidate} playlistId={selectedPlaylist?.playlist_id} />
             <FeedbackPanel feedback={feedback.data} />
@@ -637,7 +674,7 @@ export function App() {
         )}
       </aside>
 
-      {workMode === "full" ? (
+      {workMode === "full" && !isShowcase ? (
         <aside className="admin-pane panel mobile-admin">
           <FullToolsPanel
             playlist={selectedPlaylist}
@@ -681,7 +718,7 @@ export function App() {
         <button className={mobileTab === "feedback" ? "active" : ""} onClick={() => setMobileTab("feedback")}>
           <BarChart3 size={18} /> Feedback
         </button>
-        <button className={mobileTab === "admin" ? "active" : ""} onClick={() => setMobileTab("admin")} disabled={workMode !== "full"}>
+        <button className={mobileTab === "admin" ? "active" : ""} onClick={() => setMobileTab("admin")} disabled={workMode !== "full" || isShowcase}>
           <Settings size={18} /> Full
         </button>
       </nav>
@@ -700,6 +737,14 @@ function StatusDot({ label, ok, loading }: { label: string; ok: boolean; loading
 
 function SetupStatusBanner({ status }: { status?: SetupStatus }) {
   if (!status?.available) return null;
+  if (status.mode === "showcase" || status.read_only) {
+    return (
+      <div className="setup-banner">
+        <Eye size={16} />
+        <span>Showcase mode is read-only. Browse the curated library and try live recommendations without importing files.</span>
+      </div>
+    );
+  }
   const isBlocked = status.status === "blocked" || status.status === "failed";
   const modelPending = status.core_ready && (!status.docker_ready || !status.model_ready);
   if (!isBlocked && !modelPending) return null;
@@ -897,15 +942,17 @@ function CandidateDetail({
   response,
   onConfirm,
   confirming,
+  showcaseMode = false,
 }: {
   candidate: LaneItem | null;
   response?: RecommendationResponse;
   onConfirm: (trackId: string) => void;
   confirming: boolean;
+  showcaseMode?: boolean;
 }) {
   return (
     <section className="detail-block">
-      <PaneTitle icon={<Sparkles />} title="Candidate" action={response?.meta.recommendation_event_id ? "event armed" : "preview"} />
+      <PaneTitle icon={<Sparkles />} title="Candidate" action={showcaseMode ? "showcase" : response?.meta.recommendation_event_id ? "event armed" : "preview"} />
       {!candidate ? (
         <p className="muted">Select a recommendation to inspect why it works, what to watch, and how to hand it off.</p>
       ) : (
@@ -922,11 +969,15 @@ function CandidateDetail({
             <Metric label="Risk" value={candidate.risk} hint={metricDescriptions.Risk} />
             <Metric label="Confidence" value={pct(candidate.move_confidence)} hint={metricDescriptions.Confidence} />
           </div>
-          <button className="wide-action confirm-next" disabled={confirming || !response?.meta.recommendation_event_id} onClick={() => onConfirm(candidate.track_id)}>
+          <button className="wide-action confirm-next" disabled={confirming || (!showcaseMode && !response?.meta.recommendation_event_id)} onClick={() => onConfirm(candidate.track_id)}>
             <Check size={16} />
-            {confirming ? "Setting next song..." : "Set as next song and make current"}
+            {confirming ? "Setting next song..." : showcaseMode ? "Use as current track" : "Set as next song and make current"}
           </button>
-          <p className="action-note">Records this recommendation as played, adds the previous base to history, and rescans from this track.</p>
+          <p className="action-note">
+            {showcaseMode
+              ? "Advances the demo session in this browser only; the public showcase database stays unchanged."
+              : "Records this recommendation as played, adds the previous base to history, and rescans from this track."}
+          </p>
           <NoteList title="Reasons" notes={candidate.reasons} />
           <NoteList title="Watchouts" notes={candidate.watchouts} />
           <NoteList title="Handoff" notes={candidate.explanation.handoff?.notes ?? []} />
@@ -1083,15 +1134,17 @@ function LiveCandidatePanel({
   response,
   onConfirm,
   confirming,
+  showcaseMode = false,
 }: {
   candidate: LaneItem | null;
   response?: RecommendationResponse;
   onConfirm: (trackId: string) => void;
   confirming: boolean;
+  showcaseMode?: boolean;
 }) {
   return (
     <section className="detail-block live-candidate-card">
-      <PaneTitle icon={<Sparkles />} title="Selected Next" action={response?.meta.recommendation_event_id ? "ready" : "preview"} />
+      <PaneTitle icon={<Sparkles />} title="Selected Next" action={showcaseMode ? "showcase" : response?.meta.recommendation_event_id ? "ready" : "preview"} />
       {!candidate ? (
         <p className="muted">Select a recommendation to inspect the next-song read.</p>
       ) : (
@@ -1116,9 +1169,9 @@ function LiveCandidatePanel({
               <strong>{pct(candidate.move_confidence)}</strong>
             </span>
           </div>
-          <button className="wide-action confirm-next" disabled={confirming || !response?.meta.recommendation_event_id} onClick={() => onConfirm(candidate.track_id)}>
+          <button className="wide-action confirm-next" disabled={confirming || (!showcaseMode && !response?.meta.recommendation_event_id)} onClick={() => onConfirm(candidate.track_id)}>
             <Check size={16} />
-            {confirming ? "Setting next song..." : "Set as next song and make current"}
+            {confirming ? "Setting next song..." : showcaseMode ? "Use as current track" : "Set as next song and make current"}
           </button>
         </>
       )}

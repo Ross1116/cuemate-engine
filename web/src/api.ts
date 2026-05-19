@@ -228,6 +228,8 @@ export type SetupStatus = {
   status: "unknown" | "running" | "blocked" | "failed" | "complete" | "skipped" | string;
   step: string;
   message: string;
+  mode?: "local" | "showcase" | string;
+  read_only?: boolean;
   core_ready: boolean;
   docker_ready: boolean;
   model_ready: boolean;

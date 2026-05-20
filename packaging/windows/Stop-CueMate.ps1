@@ -1,3 +1,4 @@
+[CmdletBinding(SupportsShouldProcess=$true)]
 param(
     [string]$InstallDir = $PSScriptRoot,
     [string]$AppDataRoot = (Join-Path $env:LOCALAPPDATA "CueMate"),
@@ -7,6 +8,13 @@ param(
 )
 
 $ErrorActionPreference = "Continue"
+
+if ([string]::IsNullOrWhiteSpace($InstallDir)) {
+    $InstallDir = $PSScriptRoot
+}
+if ([string]::IsNullOrWhiteSpace($AppDataRoot)) {
+    $AppDataRoot = Join-Path $env:LOCALAPPDATA "CueMate"
+}
 
 if ($DelaySeconds -gt 0) {
     Start-Sleep -Seconds $DelaySeconds
@@ -23,6 +31,7 @@ function Write-ShutdownLog {
 }
 
 function Stop-CueMateProcess {
+    [CmdletBinding(SupportsShouldProcess=$true)]
     param([int]$ProcessId, [string]$Reason)
     if ($ProcessId -le 0 -or $ProcessId -eq $PID) {
         return
@@ -31,7 +40,12 @@ function Stop-CueMateProcess {
     if (-not $process) {
         return
     }
-    Write-ShutdownLog "Stopping PID $ProcessId ($Reason)"
+    $target = "PID $ProcessId ($Reason)"
+    if (-not $PSCmdlet.ShouldProcess($target, "Stop process")) {
+        Write-ShutdownLog "WhatIf: Would stop $target"
+        return
+    }
+    Write-ShutdownLog "Stopping $target"
     try {
         Stop-Process -Id $ProcessId -Force -ErrorAction Stop
     } catch {
@@ -40,6 +54,8 @@ function Stop-CueMateProcess {
 }
 
 function Stop-ProcessesByCommand {
+    [CmdletBinding(SupportsShouldProcess=$true)]
+    param()
     $installNeedle = [System.IO.Path]::GetFullPath($InstallDir)
     $appDataNeedle = [System.IO.Path]::GetFullPath($AppDataRoot)
     $targets = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
@@ -65,11 +81,12 @@ function Stop-ProcessesByCommand {
         Sort-Object ParentProcessId -Descending
 
     foreach ($target in $targets) {
-        Stop-CueMateProcess -ProcessId ([int]$target.ProcessId) -Reason "CueMate Python service/worker"
+        Stop-CueMateProcess -ProcessId ([int]$target.ProcessId) -Reason "CueMate Python service/worker" -WhatIf:$WhatIfPreference
     }
 }
 
 function Stop-Container {
+    [CmdletBinding(SupportsShouldProcess=$true)]
     param([string]$Name)
     $docker = Get-Command docker -ErrorAction SilentlyContinue
     if (-not $docker) {
@@ -79,6 +96,10 @@ function Stop-Container {
     try {
         $exists = & docker ps -a --filter "name=^/${Name}$" --format "{{.Names}}" 2>$null
         if ($exists -contains $Name) {
+            if (-not $PSCmdlet.ShouldProcess("Docker container $Name", "Remove forcefully")) {
+                Write-ShutdownLog "WhatIf: Would stop Docker container $Name"
+                return
+            }
             Write-ShutdownLog "Stopping Docker container $Name"
             & docker rm -f $Name 2>&1 | Add-Content -Path $logPath -Encoding UTF8
         }
@@ -89,15 +110,15 @@ function Stop-Container {
 
 Write-ShutdownLog "CueMate shutdown requested."
 
-Stop-ProcessesByCommand
+Stop-ProcessesByCommand -WhatIf:$WhatIfPreference
 
 if (-not $SkipDocker) {
-    Stop-Container -Name "cuemate-essentia-semantics-service"
-    Stop-Container -Name "cuemate-musicalkeycnn-service"
+    Stop-Container -Name "cuemate-essentia-semantics-service" -WhatIf:$WhatIfPreference
+    Stop-Container -Name "cuemate-musicalkeycnn-service" -WhatIf:$WhatIfPreference
 }
 
 if ($ApiPid -gt 0) {
-    Stop-CueMateProcess -ProcessId $ApiPid -Reason "CueMate API"
+    Stop-CueMateProcess -ProcessId $ApiPid -Reason "CueMate API" -WhatIf:$WhatIfPreference
 } else {
     $apiTargets = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
         Where-Object {
@@ -108,7 +129,7 @@ if ($ApiPid -gt 0) {
             )
         }
     foreach ($target in $apiTargets) {
-        Stop-CueMateProcess -ProcessId ([int]$target.ProcessId) -Reason "CueMate API"
+        Stop-CueMateProcess -ProcessId ([int]$target.ProcessId) -Reason "CueMate API" -WhatIf:$WhatIfPreference
     }
 }
 

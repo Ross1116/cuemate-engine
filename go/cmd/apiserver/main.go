@@ -115,6 +115,7 @@ type toolCommandRequest struct {
 	Paths                   []string `json:"paths"`
 	Source                  string   `json:"source"`
 	Library                 string   `json:"library"`
+	PlaylistID              string   `json:"playlist_id"`
 	Playlist                string   `json:"playlist"`
 	AnalysisMode            string   `json:"analysis_mode"`
 	Force                   bool     `json:"force"`
@@ -760,28 +761,39 @@ func (s *server) handleStopAnalysisWorkers(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	playlistID := strings.TrimSpace(r.URL.Query().Get("playlist_id"))
-	stoppedProcesses, stopErr := stopCueMateAnalysisWorkerProcesses(r.Context())
+	stoppedProcesses, stopErr := stopCueMateAnalysisWorkerProcesses(r.Context(), playlistID)
+	payload := map[string]any{
+		"status":            "stopped",
+		"stopped_processes": stoppedProcesses,
+		"requeued_jobs":     int64(0),
+	}
+	if stopErr != nil {
+		payload["status"] = "failed"
+		payload["error"] = stopErr.Error()
+		writeJSON(w, http.StatusInternalServerError, payload)
+		return
+	}
 	requeuedJobs, requeueErr := s.repo.RequeueRunningAnalysisJobs(r.Context(), playlistID)
 	if requeueErr != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": requeueErr.Error()})
 		return
 	}
-	payload := map[string]any{
-		"status":            "stopped",
-		"stopped_processes": stoppedProcesses,
-		"requeued_jobs":     requeuedJobs,
-	}
-	if stopErr != nil {
-		payload["warning"] = stopErr.Error()
-	}
+	payload["requeued_jobs"] = requeuedJobs
 	writeJSON(w, http.StatusOK, payload)
 }
 
-func stopCueMateAnalysisWorkerProcesses(ctx context.Context) (int, error) {
+func stopCueMateAnalysisWorkerProcesses(ctx context.Context, playlistID string) (int, error) {
 	script := `
+param([string]$PlaylistId)
 $targets = Get-CimInstance Win32_Process |
   Where-Object {
-    $_.CommandLine -and $_.CommandLine -match 'cuemate_analysis\s+run-analysis-worker'
+    if (-not $_.CommandLine -or $_.CommandLine -notmatch 'cuemate_analysis\s+run-analysis-worker') {
+      return $false
+    }
+    if ([string]::IsNullOrWhiteSpace($PlaylistId)) {
+      return $true
+    }
+    return $_.CommandLine -match ('--playlist-id\s+(""{0}""|''{0}''|{0})(\s|$)' -f [regex]::Escape($PlaylistId))
   }
 $count = 0
 foreach ($target in $targets) {
@@ -795,7 +807,7 @@ Write-Output $count
 `
 	cmdCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	output, err := exec.CommandContext(cmdCtx, "powershell.exe", "-NoProfile", "-Command", script).CombinedOutput()
+	output, err := exec.CommandContext(cmdCtx, "powershell.exe", "-NoProfile", "-Command", script, "-PlaylistId", playlistID).CombinedOutput()
 	if err != nil {
 		return 0, fmt.Errorf("stop worker processes: %w: %s", err, strings.TrimSpace(string(output)))
 	}
@@ -1133,6 +1145,13 @@ func buildToolCommand(req toolCommandRequest) ([]string, bool, error) {
 	case "run_analysis_worker":
 		limit := boundedPositive(req.Limit, 5, 5)
 		args = append(args, "run-analysis-worker", "--limit", strconv.Itoa(limit))
+		playlistID, err := safeCLIValue(req.PlaylistID, "playlist_id")
+		if err != nil {
+			return nil, false, err
+		}
+		if playlistID != "" {
+			args = append(args, "--playlist-id", playlistID)
+		}
 		if req.PrintBackendDiagnostics {
 			args = append(args, "--print-backend-diagnostics")
 		}

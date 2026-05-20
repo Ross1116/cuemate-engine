@@ -176,6 +176,7 @@ export type ToolCommandRequest = {
   paths?: string[];
   source?: "rekordbox" | "traktor" | "serato";
   library?: string;
+  playlist_id?: string;
   playlist?: string;
   analysis_mode?: "fast_pass" | "staged" | "full";
   force?: boolean;

@@ -64,9 +64,12 @@ def _hash_file_identity(path: Path) -> str:
     if not path.is_file():
         return f"missing-{path.name}"
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(1024 * 1024):
-            digest.update(chunk)
+    try:
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+    except OSError:
+        return f"missing-{path.name}"
     return digest.hexdigest()[:12]
 
 

@@ -957,6 +957,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum pending jobs to process in one pass.",
     )
     run_worker_parser.add_argument(
+        "--playlist-id",
+        help="Optional playlist ID scope for pending jobs.",
+    )
+    run_worker_parser.add_argument(
         "--print-backend-diagnostics",
         action="store_true",
         help="Print backend diagnostics after processing jobs.",

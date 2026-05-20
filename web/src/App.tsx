@@ -287,6 +287,8 @@ export function App() {
   const [activeRunId, setActiveRunId] = useState("");
   const consumedPairTokenRef = useRef("");
   const chainedWorkerRunRef = useRef("");
+  const chainedWorkerPlaylistRef = useRef("");
+  const previousSelectedPlaylistRef = useRef("");
   const stopWorkerRequestedRef = useRef(false);
 
   const health = useQuery({ queryKey: ["health"], queryFn: api.health, refetchInterval: 15_000 });
@@ -297,6 +299,11 @@ export function App() {
   const tracks = useQuery({
     queryKey: ["playlistTracks", selectedPlaylistId, trackQuery],
     queryFn: () => api.playlistTracks(selectedPlaylistId, trackQuery),
+    enabled: !!selectedPlaylistId,
+  });
+  const playlistTracks = useQuery({
+    queryKey: ["playlistTracks", selectedPlaylistId, ""],
+    queryFn: () => api.playlistTracks(selectedPlaylistId),
     enabled: !!selectedPlaylistId,
   });
   const jobs = useQuery({
@@ -371,7 +378,7 @@ export function App() {
     mutationFn: async (body?: { force?: boolean; analysis_mode?: "fast_pass" | "staged" | "full" }) => {
       stopWorkerRequestedRef.current = false;
       const refresh = await api.refreshPlaylistAnalysis(selectedPlaylistId, body);
-      const worker = await api.toolCommand({ action: "run_analysis_worker", limit: ANALYSIS_WORKER_BATCH_LIMIT });
+      const worker = await api.toolCommand({ action: "run_analysis_worker", playlist_id: selectedPlaylistId, limit: ANALYSIS_WORKER_BATCH_LIMIT });
       return { refresh, worker };
     },
     onMutate: (body) => setOperationMessage(body?.force ? "Force reanalysis queued. Starting worker..." : "Smart refresh queued. Starting worker..."),
@@ -445,7 +452,13 @@ export function App() {
     },
     onSuccess: (result) => {
       setLastToolResult(result);
-      if (result.run_id) setActiveRunId(result.run_id);
+      if (result.run_id) {
+        setActiveRunId(result.run_id);
+        if (result.command?.some((part) => part === "run-analysis-worker")) {
+          const playlistIndex = result.command.indexOf("--playlist-id");
+          chainedWorkerPlaylistRef.current = playlistIndex >= 0 ? (result.command[playlistIndex + 1] ?? selectedPlaylistId) : selectedPlaylistId;
+        }
+      }
       setOperationMessage(result.mode === "background" ? "Started. Progress will update below." : "Completed.");
       void queryClient.invalidateQueries({ queryKey: ["playlists"] });
       void queryClient.invalidateQueries({ queryKey: ["jobs"] });
@@ -480,20 +493,24 @@ export function App() {
     void queryClient.invalidateQueries({ queryKey: ["recommendations"] });
     if (
       activeToolRun.data.status === "completed" &&
-      selectedPlaylistId &&
       activeToolRun.data.run_id !== chainedWorkerRunRef.current &&
       activeToolRun.data.command?.some((part) => part === "run-analysis-worker")
     ) {
       chainedWorkerRunRef.current = activeToolRun.data.run_id;
+      const playlistIndex = activeToolRun.data.command.indexOf("--playlist-id");
+      const capturedPlaylistId =
+        (playlistIndex >= 0 ? activeToolRun.data.command[playlistIndex + 1] : "") || chainedWorkerPlaylistRef.current || selectedPlaylistId;
+      if (!capturedPlaylistId) return;
+      chainedWorkerPlaylistRef.current = capturedPlaylistId;
       void new Promise((resolve) => window.setTimeout(resolve, 500))
-        .then(() => api.playlistAnalysisStatus(selectedPlaylistId))
+        .then(() => api.playlistAnalysisStatus(capturedPlaylistId))
         .then((status) => {
           if (stopWorkerRequestedRef.current) return;
           const pending = status.jobs.pending;
           const running = status.jobs.running;
           if (pending > 0 && running === 0) {
             setOperationMessage(`${pending} analysis job${pending === 1 ? "" : "s"} remaining. Starting next ${ANALYSIS_WORKER_BATCH_LIMIT}.`);
-            toolMutation.mutate({ action: "run_analysis_worker", limit: ANALYSIS_WORKER_BATCH_LIMIT });
+            toolMutation.mutate({ action: "run_analysis_worker", playlist_id: capturedPlaylistId, limit: ANALYSIS_WORKER_BATCH_LIMIT });
           }
         })
         .catch(() => undefined);
@@ -511,8 +528,9 @@ export function App() {
 
   const playlistItems = useMemo(() => playlists.data?.items ?? [], [playlists.data]);
   const selectedPlaylist = playlistItems.find((item) => item.playlist_id === selectedPlaylistId) ?? playlistItems[0];
-  const currentTrack = tracks.data?.items.find((item) => item.track_id === currentTrackId);
+  const currentTrack = playlistTracks.data?.items.find((item) => item.track_id === currentTrackId);
   const isShowcase = setupStatus.data?.mode === "showcase" || setupStatus.data?.read_only === true;
+  const canShutdown = !isShowcase && remoteStatus.data?.request_local === true;
 
   const advanceCurrentTrack = useCallback(
     (trackId: string) => {
@@ -568,9 +586,13 @@ export function App() {
   }, [currentTrackId, history.length, playlistItems, playlists.data, selectedPlaylistId]);
 
   useEffect(() => {
-    if (!selectedPlaylistId || !tracks.data) return;
-    const trackItems = tracks.data.items;
-    const nextTrack = trackItems.find((item) => item.track_id === currentTrackId) ?? trackItems.find((item) => item.analysis_state === "ready") ?? trackItems[0];
+    if (!selectedPlaylistId || !playlistTracks.data) return;
+    const playlistChanged = previousSelectedPlaylistRef.current !== selectedPlaylistId;
+    previousSelectedPlaylistRef.current = selectedPlaylistId;
+    const trackItems = playlistTracks.data.items;
+    const currentTrackStillExists = trackItems.some((item) => item.track_id === currentTrackId);
+    if (currentTrackId && currentTrackStillExists && !playlistChanged) return;
+    const nextTrack = trackItems.find((item) => item.analysis_state === "ready") ?? trackItems[0];
     if (!nextTrack) {
       if (currentTrackId) {
         setCurrentTrackId("");
@@ -584,7 +606,7 @@ export function App() {
       setSelectedCandidate(null);
       localStorage.setItem("cuemate.current", nextTrack.track_id);
     }
-  }, [currentTrackId, selectedPlaylistId, tracks.data]);
+  }, [currentTrackId, playlistTracks.data, selectedPlaylistId]);
 
   useEffect(() => {
     if (isShowcase && mobileTab === "admin") {
@@ -621,7 +643,7 @@ export function App() {
           <span className={metadata.data?.breaker_open ? "pill hot" : "pill cyan"}>
             {metadata.data?.breaker_open ? "breaker open" : "breaker calm"}
           </span>
-          {!isShowcase ? (
+          {canShutdown ? (
             <button
               className="shutdown-button"
               type="button"
@@ -794,7 +816,7 @@ export function App() {
             queueResult={refreshMutation.data?.refresh.queued_count}
             onRemovePlaylist={(id) => removePlaylistMutation.mutate(id)}
             removeBusy={removePlaylistMutation.isPending}
-            onRunWorker={() => toolMutation.mutate({ action: "run_analysis_worker", limit: ANALYSIS_WORKER_BATCH_LIMIT })}
+            onRunWorker={() => toolMutation.mutate({ action: "run_analysis_worker", playlist_id: selectedPlaylistId, limit: ANALYSIS_WORKER_BATCH_LIMIT })}
             onStopWorkers={() => stopWorkersMutation.mutate()}
             onTool={(payload) => toolMutation.mutate(payload)}
             toolBusy={toolMutation.isPending}

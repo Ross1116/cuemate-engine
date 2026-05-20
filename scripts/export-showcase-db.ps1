@@ -71,12 +71,12 @@ with sqlite3.connect(db_path) as conn:
 
     for table in feature_hash_tables:
         if table_exists(conn, table) and "source_file_hash" in columns(conn, table):
-            conn.execute(f'UPDATE "{table}" SET source_file_hash = "showcase"')
+            conn.execute(f"""UPDATE "{table}" SET source_file_hash = 'showcase'""")
 
     for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'"):
         table = str(row[0])
         if "user_id" in columns(conn, table):
-            conn.execute(f'UPDATE "{table}" SET user_id = "showcase"')
+            conn.execute(f"""UPDATE "{table}" SET user_id = 'showcase'""")
 
     for table in private_tables:
         if table_exists(conn, table):
@@ -111,4 +111,3 @@ try {
 } finally {
     Remove-Item -Path $sanitizer -Force -ErrorAction SilentlyContinue
 }
-

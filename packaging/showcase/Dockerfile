@@ -24,9 +24,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 RUN apt-get update \
-    && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends libsndfile1 \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system cuemate \
+    && useradd --system --gid cuemate --home-dir /app --shell /usr/sbin/nologin cuemate
 
 COPY python/ /app/python/
 RUN python -m pip install --no-cache-dir --upgrade pip \
@@ -39,6 +40,9 @@ COPY --from=go-build /out/apiserver /app/apiserver
 COPY dist/showcase/cuemate-showcase.db /app/data/cuemate-showcase.db
 COPY packaging/showcase/entrypoint.sh /app/entrypoint.sh
 
-RUN chmod +x /app/entrypoint.sh
+RUN chown -R cuemate:cuemate /app \
+    && chmod +x /app/entrypoint.sh \
+    && chmod -R u+rwX,go+rX /app /app/data /app/web/dist
 EXPOSE 8080
+USER cuemate
 ENTRYPOINT ["/app/entrypoint.sh"]

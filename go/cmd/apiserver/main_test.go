@@ -1434,6 +1434,20 @@ func TestShowcaseModeRejectsMutatingEndpoints(t *testing.T) {
 			call:   srv.handleToolCommand,
 		},
 		{
+			name:   "app shutdown",
+			path:   "/app/shutdown",
+			method: http.MethodPost,
+			body:   `{}`,
+			call:   srv.handleAppShutdown,
+		},
+		{
+			name:   "analysis workers stop",
+			path:   "/analysis/workers/stop",
+			method: http.MethodPost,
+			body:   `{}`,
+			call:   srv.handleStopAnalysisWorkers,
+		},
+		{
 			name:   "remote token",
 			path:   "/remote/pairing-token",
 			method: http.MethodPost,

@@ -346,6 +346,7 @@ export function App() {
         max_per_lane: 5,
       }),
     enabled: !!selectedPlaylistId && !!currentTrackId,
+    refetchInterval: (query) => (query.state.data?.recommendations_status === "temporarily_unavailable" ? 2_000 : false),
   });
 
   const shutdownMutation = useMutation({
@@ -525,6 +526,12 @@ export function App() {
       remoteConsumePairMutation.mutate(token);
     }
   }, [remoteConsumePairMutation, setupStatus.data?.mode, setupStatus.data?.read_only]);
+
+  useEffect(() => {
+    if (readiness.data?.status === "ready") {
+      void queryClient.invalidateQueries({ queryKey: ["recommendations"] });
+    }
+  }, [queryClient, readiness.data?.status]);
 
   const playlistItems = useMemo(() => playlists.data?.items ?? [], [playlists.data]);
   const selectedPlaylist = playlistItems.find((item) => item.playlist_id === selectedPlaylistId) ?? playlistItems[0];

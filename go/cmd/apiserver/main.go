@@ -1587,6 +1587,9 @@ func (s *server) handleRecommendations(w http.ResponseWriter, r *http.Request) {
 	}
 
 	request := buildRecommendationsRequest(hydrated, target, req.MaxPerLane)
+	if s.showcase {
+		applyActiveSignaturesForShowcase(request, metadata.GetActiveSignatures())
+	}
 	response, err := s.runtime.GetRecommendations(r.Context(), request)
 	if err != nil {
 		switch {
@@ -2439,6 +2442,25 @@ func signaturePayloadFromRecord(item recommendationsrepo.TrackContextRecord) *sc
 		AnalysisSignature: stringValue(item.AnalysisSignature),
 		ConfigSignature:   stringValue(item.ConfigSignature),
 		ScoringContractId: stringValue(item.ScoringContractAtAnalysis),
+	}
+}
+
+func applyActiveSignaturesForShowcase(req *scoringv1.GetRecommendationsRequest, signatures *scoringv1.SignatureMetadata) {
+	if req == nil || signatures == nil {
+		return
+	}
+	active := &scoringv1.SignatureMetadata{
+		AnalysisSignature: signatures.GetAnalysisSignature(),
+		ConfigSignature:   signatures.GetConfigSignature(),
+		ScoringContractId: signatures.GetScoringContractId(),
+	}
+	if req.CurrentTrack != nil {
+		req.CurrentTrack.Signatures = active
+	}
+	for _, candidate := range req.Candidates {
+		if candidate != nil {
+			candidate.Signatures = active
+		}
 	}
 }
 

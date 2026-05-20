@@ -24,9 +24,55 @@ esac
 python -m cuemate_analysis serve-scoring --host "$scoring_host" --port "$scoring_port" &
 scorer_pid="$!"
 
+wait_for_scorer() {
+    python - "$scoring_host" "$scoring_port" <<'PY'
+import sys
+
+import grpc
+
+from cuemate_analysis.scoring_service import load_scoring_proto_modules
+
+try:
+    host = sys.argv[1]
+    port = sys.argv[2]
+    pb2, pb2_grpc = load_scoring_proto_modules()
+    with grpc.insecure_channel(f"{host}:{port}") as channel:
+        grpc.channel_ready_future(channel).result(timeout=1.0)
+        stub = pb2_grpc.ScoringServiceStub(channel)
+        stub.GetScoringMetadata(pb2.GetScoringMetadataRequest(), timeout=1.0)
+except Exception:
+    sys.exit(1)
+PY
+}
+
+for attempt in $(seq 1 30); do
+    if wait_for_scorer; then
+        break
+    fi
+    if ! kill -0 "$scorer_pid" 2>/dev/null; then
+        echo "Scoring service exited before it became ready." >&2
+        exit 1
+    fi
+    if [ "$attempt" -eq 30 ]; then
+        echo "Scoring service did not become ready on ${scoring_host}:${scoring_port}." >&2
+        exit 1
+    fi
+    sleep 1
+done
+
 cleanup() {
     kill "$scorer_pid" 2>/dev/null || true
+    kill "${api_pid:-}" 2>/dev/null || true
 }
 trap cleanup INT TERM EXIT
 
-exec /app/apiserver
+/app/apiserver &
+api_pid="$!"
+
+(
+    wait "$scorer_pid"
+    echo "Scoring service exited; stopping API." >&2
+    kill "$api_pid" 2>/dev/null || true
+) &
+
+wait "$api_pid"

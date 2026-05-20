@@ -30,7 +30,14 @@ RUN apt-get update \
     && useradd --system --gid cuemate --home-dir /app --shell /usr/sbin/nologin cuemate
 
 COPY python/ /app/python/
+COPY proto/ /app/proto/
 RUN python -m pip install --no-cache-dir --upgrade pip \
+    && python -m pip install --no-cache-dir "grpcio-tools==1.80.0" \
+    && python -m grpc_tools.protoc \
+        --proto_path=/app/proto \
+        --python_out=/app/python/src \
+        --grpc_python_out=/app/python/src \
+        /app/proto/djengine/scoring/v1/scoring.proto \
     && python -m pip install --no-cache-dir /app/python
 
 COPY config/ /app/config/

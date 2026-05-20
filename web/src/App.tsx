@@ -8,7 +8,6 @@ import {
   Check,
   ChevronDown,
   CircleHelp,
-  CircleDot,
   Eye,
   FileAudio,
   FolderPlus,
@@ -548,6 +547,9 @@ export function App() {
   const currentTrack = playlistTracks.data?.items.find((item) => item.track_id === currentTrackId);
   const isShowcase = setupStatus.data?.mode === "showcase" || setupStatus.data?.read_only === true;
   const canShutdown = !isShowcase && remoteStatus.data?.request_local === true;
+  const apiUnavailable = !health.isLoading && (health.isError || health.data?.status !== "ok");
+  const scorerUnavailable = !readiness.isLoading && (readiness.isError || readiness.data?.status !== "ready");
+  const scorerRecovering = !scorerUnavailable && metadata.data?.breaker_open === true;
 
   const advanceCurrentTrack = useCallback(
     (trackId: string) => {
@@ -655,11 +657,9 @@ export function App() {
               </button>
             ))}
           </div>
-          <StatusDot label="API" ok={health.data?.status === "ok"} loading={health.isLoading} />
-          <StatusDot label="Scorer" ok={readiness.data?.status === "ready"} loading={readiness.isLoading} />
-          <span className={metadata.data?.breaker_open ? "pill hot" : "pill cyan"}>
-            {metadata.data?.breaker_open ? "breaker open" : "breaker calm"}
-          </span>
+          {apiUnavailable ? <span className="pill hot">API unavailable</span> : null}
+          {scorerUnavailable ? <span className="pill hot">Scorer unavailable</span> : null}
+          {scorerRecovering ? <span className="pill hot">Scorer recovering</span> : null}
           {canShutdown ? (
             <button
               className="shutdown-button"
@@ -879,15 +879,6 @@ export function App() {
         </button>
       </nav>
     </div>
-  );
-}
-
-function StatusDot({ label, ok, loading }: { label: string; ok: boolean; loading: boolean }) {
-  return (
-    <span className={ok ? "status ok" : "status bad"}>
-      <CircleDot size={14} />
-      {loading ? `${label}...` : label}
-    </span>
   );
 }
 
@@ -1213,8 +1204,8 @@ function CurrentTrackInfo({ track, playlistId, showcaseMode = false }: { track?:
         {
           label: "Energy",
           value: percentOrMissing(energy),
-          detail: energyLevelCopy(energy),
-          hint: "Playlist-relative energy where available, with analyzer energy as fallback.",
+          detail: `relative to playlist / ${energyLevelCopy(energy)}`,
+          hint: "Energy relative to the selected playlist where available, with analyzer energy as fallback.",
         },
         {
           label: "Mood",
@@ -1225,14 +1216,14 @@ function CurrentTrackInfo({ track, playlistId, showcaseMode = false }: { track?:
       ],
       groups: [
         {
-          title: "Current Track Body",
-          note: "The sound profile this recommendation round is anchored to.",
+          title: "Current Track Playlist Profile",
+          note: "The current track's position relative to the selected playlist.",
           metrics: [
-            percentBarMetric("Energy", energy, "How much room pressure the current track carries."),
-            percentBarMetric("Bass", bass, "Low-end weight in the current base track."),
-            percentBarMetric("Drums", drums, "Percussive strength in the current base track."),
-            percentBarMetric("Groove", groove, "Groove or rhythmic drive in the current base track."),
-            percentBarMetric("Vocals", vocals, "How much vocal content the current base track carries."),
+            percentBarMetric("Energy", energy, "Current track energy relative to the selected playlist."),
+            percentBarMetric("Bass", bass, "Current track low-end weight relative to the selected playlist."),
+            percentBarMetric("Drums", drums, "Current track percussive strength relative to the selected playlist."),
+            percentBarMetric("Groove", groove, "Current track groove or rhythmic drive relative to the selected playlist."),
+            percentBarMetric("Vocals", vocals, "Current track vocal content relative to the selected playlist."),
           ],
         },
         {
@@ -1377,7 +1368,8 @@ function CandidateSignalPanel({ candidate, playlistId }: { candidate: LaneItem |
     const moodTone = maybeNumber(semantic.valence_abs);
     const mood = dominantMood(semantic);
     const bpmDistance = maybeNumber(transition.effective_bpm_distance);
-    const keyFit = stringValueFromUnknown(transition.key_compat_label) || candidate.tempo_key.key_text || "unknown";
+    const keyFitRaw = stringValueFromUnknown(transition.key_compat_label);
+    const harmony = harmonyRead(keyFitRaw, maybeNumber(transition.key_distance), candidate.tempo_key.key_text);
     const vocalPhrase = vocalHandoffPhrase(maybeNumber(transition.current_vocals_rel), maybeNumber(transition.candidate_vocals_rel));
     const tempoPhrase = candidate.tempo_key.tempo_text || (bpmDistance == null ? "unknown" : `${bpmDistance.toFixed(1)} BPM away`);
     const energyPhrase = deltaEnergy == null ? "unknown" : signedPercent(deltaEnergy);
@@ -1395,7 +1387,7 @@ function CandidateSignalPanel({ candidate, playlistId }: { candidate: LaneItem |
       .slice(0, 3);
 
     return {
-      summary: buildDJReadSummary({ energyChange: deltaEnergy, risk: candidate.risk, tempo: tempoPhrase, keyFit, mood }),
+      summary: buildDJReadSummary({ energyChange: deltaEnergy, risk: candidate.risk, tempo: tempoPhrase, keyFit: harmony.value, mood }),
       hero: [
         {
           label: "Energy move",
@@ -1406,7 +1398,7 @@ function CandidateSignalPanel({ candidate, playlistId }: { candidate: LaneItem |
         {
           label: "Mix safety",
           value: `${riskToSafety(candidate.risk_score)}%`,
-          detail: `${candidate.risk} risk / ${keyFit}`,
+          detail: `${candidate.risk} risk / ${harmony.value}`,
           hint: "A quick read of transition difficulty using risk, harmonic fit, and scorer confidence.",
         },
         {
@@ -1425,8 +1417,8 @@ function CandidateSignalPanel({ candidate, playlistId }: { candidate: LaneItem |
         },
         {
           label: "Harmony",
-          value: keyFit,
-          detail: keyDecisionCopy(maybeNumber(transition.key_distance)),
+          value: harmony.value,
+          detail: harmony.detail,
           hint: "Whether the key relationship is likely to sound smooth or tense.",
         },
         {
@@ -1444,7 +1436,7 @@ function CandidateSignalPanel({ candidate, playlistId }: { candidate: LaneItem |
       ],
       room: [
         {
-          label: "Candidate energy",
+          label: "Relative energy",
           value: percentOrMissing(energyRel),
           detail: `${stringValueFromUnknown(relative.intensity_band) || stringValueFromUnknown(candidateRel.intensity_band) || "band unknown"} / ${energyLevelCopy(energyRel)}`,
           hint: "Where this track sits in this playlist's energy range.",
@@ -1598,11 +1590,11 @@ function FullCandidateAnalysisPanel({ candidate, playlistId }: { candidate: Lane
         title: "Relative Playlist Profile",
         note: "Where this track sits compared with the selected playlist.",
         metrics: [
-          percentBarMetric("Energy", firstNumber(relative.energy_rel, candidateRel.energy_rel), "Playlist-relative energy."),
-          percentBarMetric("Bass", firstNumber(relative.bass_rel, candidateRel.bass_rel), "Playlist-relative low-end weight."),
-          percentBarMetric("Drums", firstNumber(relative.drums_rel, candidateRel.drums_rel), "Playlist-relative drum/percussive strength."),
-          percentBarMetric("Groove", firstNumber(relative.groove_rel, candidateRel.groove_rel), "Playlist-relative groove estimate."),
-          percentBarMetric("Vocals", firstNumber(relative.vocals_rel, candidateRel.vocals_rel), "Playlist-relative vocal content; missing means unknown."),
+          percentBarMetric("Energy", firstNumber(relative.energy_rel, candidateRel.energy_rel), "Candidate energy relative to the selected playlist."),
+          percentBarMetric("Bass", firstNumber(relative.bass_rel, candidateRel.bass_rel), "Candidate low-end weight relative to the selected playlist."),
+          percentBarMetric("Drums", firstNumber(relative.drums_rel, candidateRel.drums_rel), "Candidate drum/percussive strength relative to the selected playlist."),
+          percentBarMetric("Groove", firstNumber(relative.groove_rel, candidateRel.groove_rel), "Candidate groove estimate relative to the selected playlist."),
+          percentBarMetric("Vocals", firstNumber(relative.vocals_rel, candidateRel.vocals_rel), "Candidate vocal content relative to the selected playlist; missing means unknown."),
         ],
       },
       {
@@ -1633,14 +1625,10 @@ function FullCandidateAnalysisPanel({ candidate, playlistId }: { candidate: Lane
       },
       {
         title: "Transition From Current",
-        note: "How this candidate changes the handoff.",
+        note: "How this candidate changes energy and bass relative to the current track.",
         metrics: [
-          signedBarMetric("Energy change", transition.delta_energy_rel, "Positive builds pressure; negative creates space."),
-          signedBarMetric("Bass change", transition.delta_bass_rel, "Positive adds low end; negative lightens the handoff."),
-          percentBarMetric("Current vocals", transition.current_vocals_rel, "Vocal content in the current base track."),
-          percentBarMetric("Candidate vocals", transition.candidate_vocals_rel, "Vocal content in the selected candidate."),
-          percentBarMetric("Current low end", transition.current_outro_low_end, "Low-end content near the current outro."),
-          percentBarMetric("Candidate low end", transition.candidate_intro_low_end, "Low-end content near the candidate intro."),
+          signedBarMetric("Energy change", transition.delta_energy_rel, "Candidate energy change relative to the current track; positive builds pressure, negative creates space."),
+          signedBarMetric("Bass change", transition.delta_bass_rel, "Candidate bass change relative to the current track; positive adds low end, negative lightens the handoff."),
         ],
       },
       {
@@ -1710,8 +1698,8 @@ function AnalysisBarGroup({ title, note, metrics }: { title: string; note: strin
               </span>
               <strong>{metric.display}</strong>
             </div>
-            <div className={metric.signed ? "analysis-meter signed" : "analysis-meter"}>
-              <i style={{ width: `${barWidth(metric)}%` }} />
+            <div className={analysisMeterClass(metric)}>
+              <i style={analysisBarStyle(metric)} />
             </div>
             {metric.detail ? <small>{metric.detail}</small> : null}
           </div>
@@ -1768,6 +1756,17 @@ function barWidth(metric: BarMetric) {
   if (metric.value == null) return 0;
   if (metric.signed) return clampPercent(Math.round(Math.abs(metric.value) * 100));
   return clampPercent(Math.round(clamp01(metric.value) * 100));
+}
+
+function analysisMeterClass(metric: BarMetric) {
+  if ((!metric.signed && (metric.value == null || metric.value >= 0)) || metric.value == null) return "analysis-meter";
+  return metric.value < 0 ? "analysis-meter signed negative" : "analysis-meter signed positive";
+}
+
+function analysisBarStyle(metric: BarMetric) {
+  if (!metric.signed && (metric.value == null || metric.value >= 0)) return { width: `${barWidth(metric)}%` };
+  const width = metric.value == null ? 0 : clampPercent(Math.round(Math.abs(metric.value) * 50));
+  return { width: `${width}%` };
 }
 
 function clamp01(value: number) {
@@ -1841,6 +1840,21 @@ function keyDecisionCopy(distance: number | null) {
   if (distance <= 1) return "harmonically comfortable";
   if (distance <= 3) return "usable with attention";
   return "harmonic contrast; mix carefully";
+}
+
+function harmonyRead(label: string, distance: number | null, fallback: string) {
+  const friendly: Record<string, { value: string; detail: string }> = {
+    perfect: { value: "Same key", detail: "tonally matched" },
+    relative_key: { value: "Relative key", detail: "same Camelot number, major/minor shift" },
+    adjacent: { value: "Adjacent key", detail: "one step on the Camelot wheel" },
+    cross_adjacent: { value: "Cross-adjacent key", detail: "one step with a major/minor shift" },
+    energy_boost: { value: "Energy-boost key change", detail: "two steps on the Camelot wheel" },
+    energy_key_change: { value: "Dominant key change", detail: "strong harmonic move; usable with attention" },
+    mismatch: { value: "Harmonic contrast", detail: "higher key tension; mix carefully" },
+  };
+  if (friendly[label]) return friendly[label];
+  const value = fallback && fallback !== "unknown" ? fallback : "Unknown harmony";
+  return { value, detail: keyDecisionCopy(distance) };
 }
 
 function bassDecisionCopy(deltaBass: number | null, bassRel: number | null) {
@@ -1947,8 +1961,7 @@ function ShowcaseFullPanel({ candidate, playlistId }: { candidate: LaneItem | nu
   return (
     <div className="full-tools">
       <PaneTitle icon={<Eye />} title="Full Mode" action="track data" />
-      <p className="mode-note">Select a recommendation to inspect its score drivers, transition read, and full analysis bars.</p>
-      <CandidateSignalPanel candidate={candidate} playlistId={playlistId} />
+      <p className="mode-note">Select a recommendation to inspect its full analysis bars.</p>
       <FullCandidateAnalysisPanel candidate={candidate} playlistId={playlistId} />
     </div>
   );

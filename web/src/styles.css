@@ -1483,6 +1483,7 @@ h1 {
   font-weight: 900;
   letter-spacing: 0;
   text-transform: uppercase;
+  overflow-wrap: anywhere;
 }
 
 .insight-tile strong {
@@ -1621,6 +1622,7 @@ h1 {
 .analysis-bar-label span {
   display: inline-flex;
   align-items: center;
+  flex-wrap: wrap;
   min-width: 0;
   color: #99aa6d;
   font-size: 0.76rem;
@@ -1639,6 +1641,7 @@ h1 {
 }
 
 .analysis-meter {
+  position: relative;
   height: 9px;
   overflow: hidden;
   border-radius: 999px;
@@ -1664,10 +1667,47 @@ h1 {
     0 0 12px rgba(127, 145, 82, 0.22);
 }
 
+.analysis-meter.signed {
+  background:
+    linear-gradient(180deg, rgba(231, 236, 235, 0.035), transparent 48%),
+    linear-gradient(90deg, rgba(49, 22, 24, 0.54), rgba(6, 18, 24, 0.92) 50%, rgba(8, 32, 51, 0.78)),
+    rgba(6, 18, 24, 0.88);
+}
+
+.analysis-meter.signed::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 1px;
+  background: rgba(231, 236, 235, 0.32);
+  box-shadow: 0 0 8px rgba(231, 236, 235, 0.18);
+}
+
 .analysis-meter.signed i {
+  position: absolute;
+  top: 0;
+  width: 0;
+}
+
+.analysis-meter.signed.positive i {
+  left: 50%;
+  border-radius: 0 999px 999px 0;
   background:
     linear-gradient(180deg, rgba(231, 236, 235, 0.18), transparent 44%),
     linear-gradient(90deg, #9dab66 0%, #72824d 50%, #425e6b 100%);
+}
+
+.analysis-meter.signed.negative i {
+  right: 50%;
+  border-radius: 999px 0 0 999px;
+  background:
+    linear-gradient(180deg, rgba(231, 236, 235, 0.18), transparent 44%),
+    linear-gradient(90deg, #7a423f 0%, #b36458 58%, #d98c73 100%);
+  box-shadow:
+    0 0 0 1px rgba(231, 236, 235, 0.1) inset,
+    0 0 12px rgba(222, 92, 82, 0.2);
 }
 
 .ops {

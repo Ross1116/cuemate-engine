@@ -26,6 +26,7 @@ import {
 } from "lucide-react";
 import { Bar, BarChart, LabelList, ResponsiveContainer, XAxis, YAxis } from "recharts";
 import {
+  AnalysisJob,
   api,
   FeedbackSummary,
   LaneItem,
@@ -616,10 +617,10 @@ export function App() {
   }, [currentTrackId, playlistTracks.data, selectedPlaylistId]);
 
   useEffect(() => {
-    if (isShowcase && mobileTab === "admin") {
+    if (workMode !== "full" && mobileTab === "admin") {
       setMobileTab("recommend");
     }
-  }, [isShowcase, mobileTab]);
+  }, [mobileTab, workMode]);
 
   const shellClass = `app-shell mode-${workMode} tab-${mobileTab}`;
 
@@ -727,6 +728,7 @@ export function App() {
           <TrackList
             tracks={tracks.data?.items ?? []}
             currentTrackId={currentTrackId}
+            showcaseMode={isShowcase}
             onSelect={(track) => {
               setCurrentTrackId(track.track_id);
               setSelectedCandidate(null);
@@ -781,7 +783,7 @@ export function App() {
       </main>
 
       <aside className="detail-pane panel mobile-feedback">
-        <CurrentTrackInfo track={currentTrack} playlistId={selectedPlaylist?.playlist_id} />
+        <CurrentTrackInfo track={currentTrack} playlistId={selectedPlaylist?.playlist_id} showcaseMode={isShowcase} />
         {workMode === "live" ? (
           <>
             <LiveCandidatePanel
@@ -844,6 +846,18 @@ export function App() {
         </aside>
       ) : null}
 
+      {workMode === "full" && isShowcase ? (
+        <aside className="admin-pane panel mobile-admin">
+          <ShowcaseFullPanel
+            playlist={selectedPlaylist}
+            analysisStatus={analysisStatus.data}
+            analysisStatusLoading={analysisStatus.isLoading}
+            jobs={jobs.data?.items ?? []}
+            metadata={metadata.data?.metadata}
+          />
+        </aside>
+      ) : null}
+
       <nav className="mobile-nav">
         <button className={mobileTab === "recommend" ? "active" : ""} onClick={() => setMobileTab("recommend")}>
           <Radar size={18} /> Recommend
@@ -854,7 +868,7 @@ export function App() {
         <button className={mobileTab === "feedback" ? "active" : ""} onClick={() => setMobileTab("feedback")}>
           <BarChart3 size={18} /> Feedback
         </button>
-        <button className={mobileTab === "admin" ? "active" : ""} onClick={() => setMobileTab("admin")} disabled={workMode !== "full" || isShowcase}>
+        <button className={mobileTab === "admin" ? "active" : ""} onClick={() => setMobileTab("admin")} disabled={workMode !== "full"}>
           <Settings size={18} /> Full
         </button>
       </nav>
@@ -968,7 +982,17 @@ function SkeletonRows({ count }: { count: number }) {
   );
 }
 
-function TrackList({ tracks, currentTrackId, onSelect }: { tracks: Track[]; currentTrackId: string; onSelect: (track: Track) => void }) {
+function TrackList({
+  tracks,
+  currentTrackId,
+  showcaseMode = false,
+  onSelect,
+}: {
+  tracks: Track[];
+  currentTrackId: string;
+  showcaseMode?: boolean;
+  onSelect: (track: Track) => void;
+}) {
   return (
     <div className="track-list">
       {tracks.map((track) => (
@@ -978,7 +1002,7 @@ function TrackList({ tracks, currentTrackId, onSelect }: { tracks: Track[]; curr
             <strong>{track.title || track.track_id}</strong>
             <small>{track.artist || "Unknown artist"}</small>
           </span>
-          <span className={pillClass(track.analysis_state)}>{track.analysis_state}</span>
+          {!showcaseMode ? <span className={pillClass(track.analysis_state)}>{track.analysis_state}</span> : null}
         </button>
       ))}
     </div>
@@ -1131,7 +1155,7 @@ function CandidateDetail({
   );
 }
 
-function CurrentTrackInfo({ track, playlistId }: { track?: Track; playlistId?: string }) {
+function CurrentTrackInfo({ track, playlistId, showcaseMode = false }: { track?: Track; playlistId?: string; showcaseMode?: boolean }) {
   const [expanded, setExpanded] = useState(false);
   const detailId = useId();
   const features = useQuery({
@@ -1240,7 +1264,7 @@ function CurrentTrackInfo({ track, playlistId }: { track?: Track; playlistId?: s
                 <span>{insight?.bpm == null ? "BPM pending" : `${insight.bpm.toFixed(1)} BPM`}</span>
                 <span>{insight?.key ?? "key pending"}</span>
                 <span>{insight?.intensity ?? "band pending"}</span>
-                <span>{track.analysis_state}</span>
+                {!showcaseMode ? <span>{track.analysis_state}</span> : null}
               </div>
               {track.role_hints.length ? (
                 <div className="mini-tags">
@@ -1754,6 +1778,10 @@ function labelize(value: string) {
   return value.replace(/_/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
+function shortHash(value: string) {
+  return value.length <= 12 ? value : `${value.slice(0, 12)}...`;
+}
+
 function clampPercent(value: number) {
   if (!Number.isFinite(value)) return 0;
   return Math.max(0, Math.min(100, value));
@@ -1910,6 +1938,93 @@ function FeedbackPanel({ feedback }: { feedback?: FeedbackSummary }) {
       </div>
       <NoteList title="Tuning notes" notes={feedback?.tuning.notes ?? []} />
     </section>
+  );
+}
+
+function ShowcaseFullPanel({
+  playlist,
+  analysisStatus,
+  analysisStatusLoading,
+  jobs,
+  metadata,
+}: {
+  playlist?: Playlist;
+  analysisStatus?: PlaylistAnalysisStatus;
+  analysisStatusLoading: boolean;
+  jobs: AnalysisJob[];
+  metadata?: { capability_flags?: Record<string, boolean>; active_signatures?: Record<string, string> };
+}) {
+  const total = playlist?.track_count ?? analysisStatus?.total_tracks ?? 0;
+  const analysed = playlist?.track_count_analyzed ?? analysisStatus?.ready_tracks ?? 0;
+  const eligible = playlist?.eligible_track_count ?? 0;
+  const feedbackEvents = playlist?.feedback_event_count ?? 0;
+  const flags = Object.entries(metadata?.capability_flags ?? {})
+    .filter(([, enabled]) => enabled)
+    .map(([key]) => labelize(key));
+  const signatures = Object.entries(metadata?.active_signatures ?? {}).filter(([, value]) => value);
+  const recentJobs = jobs.slice(0, 5);
+
+  return (
+    <div className="full-tools">
+      <PaneTitle icon={<Eye />} title="Full Mode" action="read-only" />
+      <p className="mode-note">Stored playlist, scoring, and analysis-job data from this curated snapshot.</p>
+
+      <section className="detail-block">
+        <PaneTitle icon={<Library />} title="Playlist Snapshot" action={analysisStatusLoading ? "checking" : playlist?.name ?? "none"} />
+        {!playlist ? (
+          <p className="muted">Choose a playlist from the library to inspect the stored showcase data.</p>
+        ) : (
+          <>
+            <div className="metric-grid">
+              <Metric label="Tracks" value={total.toString()} />
+              <Metric label="Analysis rows" value={analysed.toString()} />
+              <Metric label="Eligible" value={eligible.toString()} />
+              <Metric label="Feedback events" value={feedbackEvents.toString()} />
+            </div>
+            {analysisStatus?.latest_error ? <p className="action-note danger">Latest analysis note: {analysisStatus.latest_error}</p> : null}
+          </>
+        )}
+      </section>
+
+      <section className="detail-block">
+        <PaneTitle icon={<BarChart3 />} title="Scoring Snapshot" action={signatures.length ? "active" : "metadata"} />
+        {signatures.length ? (
+          <div className="weight-list">
+            {signatures.slice(0, 6).map(([key, value]) => (
+              <div key={key} className="weight-row">
+                <span>{labelize(key)}</span>
+                <strong>{shortHash(value)}</strong>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <p className="muted">No scoring signature metadata is attached to this snapshot.</p>
+        )}
+        {flags.length ? (
+          <div className="mini-tags">
+            {flags.slice(0, 8).map((flag) => (
+              <span key={flag}>{flag}</span>
+            ))}
+          </div>
+        ) : null}
+      </section>
+
+      <section className="detail-block">
+        <PaneTitle icon={<PlayCircle />} title="Analysis Jobs" action={recentJobs.length ? `${recentJobs.length} recent` : "snapshot"} />
+        {recentJobs.length ? (
+          <div className="weight-list">
+            {recentJobs.map((job) => (
+              <div key={job.id} className="weight-row">
+                <span>{job.track_id ?? job.job_kind}</span>
+                <strong>{labelize(job.status)}</strong>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <p className="muted">No analysis jobs are queued in this showcase snapshot.</p>
+        )}
+      </section>
+    </div>
   );
 }
 

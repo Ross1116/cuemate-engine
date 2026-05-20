@@ -670,10 +670,6 @@ func (s *server) handlePlaylistTracks(w http.ResponseWriter, r *http.Request, pl
 	metadata, metadataErr := s.runtime.RefreshMetadata(r.Context())
 	if metadataErr != nil {
 		metadata = s.runtime.CachedMetadata()
-		if metadata == nil {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": scoringruntime.DescribeUnavailable(metadataErr)})
-			return
-		}
 	}
 	var analysisSignature, configSignature, scoringContractID string
 	if metadata != nil {

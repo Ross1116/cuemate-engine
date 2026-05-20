@@ -1,18 +1,18 @@
-FROM node:22-bookworm-slim AS web-build
+FROM node:22.21.0-bookworm-slim AS web-build
 WORKDIR /src/web
 COPY web/package*.json ./
 RUN npm ci
 COPY web/ ./
 RUN npm run build
 
-FROM golang:1.25-bookworm AS go-build
+FROM golang:1.25-bookworm-slim AS go-build
 WORKDIR /src/go
 COPY go/go.mod go/go.sum ./
 RUN go mod download
 COPY go/ ./
 RUN go build -o /out/apiserver ./cmd/apiserver
 
-FROM python:3.12-slim-bookworm AS runtime
+FROM python:3.12-bookworm-slim AS runtime
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PORT=8080 \
@@ -24,6 +24,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 RUN apt-get update \
+    && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
 

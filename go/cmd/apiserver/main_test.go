@@ -1504,6 +1504,27 @@ func TestClientPlaylistAndTrackBrowseEndpoints(t *testing.T) {
 	}
 }
 
+func TestClientPlaylistTracksDoesNotRequireScorerMetadata(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataErr: status.Error(codes.Unavailable, "scorer down"),
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/playlists/pl_1/tracks?query=Candidate", nil)
+	rec := httptest.NewRecorder()
+	srv.handlePlaylistRoutes(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var tracks map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &tracks); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	trackItems := tracks["items"].([]any)
+	if len(trackItems) != 1 || trackItems[0].(map[string]any)["track_id"] != "trk_candidate" {
+		t.Fatalf("tracks = %#v", tracks)
+	}
+}
+
 func TestClientAnalysisEnqueueEndpoint(t *testing.T) {
 	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
 		metadataResp: fakeMetadata("rel_sig_current"),

@@ -509,11 +509,10 @@ export function App() {
     }
   }, [remoteConsumePairMutation, setupStatus.data?.mode, setupStatus.data?.read_only]);
 
-  const selectedPlaylist = playlists.data?.items.find((item) => item.playlist_id === selectedPlaylistId) ?? playlists.data?.items[0];
+  const playlistItems = useMemo(() => playlists.data?.items ?? [], [playlists.data]);
+  const selectedPlaylist = playlistItems.find((item) => item.playlist_id === selectedPlaylistId) ?? playlistItems[0];
   const currentTrack = tracks.data?.items.find((item) => item.track_id === currentTrackId);
   const isShowcase = setupStatus.data?.mode === "showcase" || setupStatus.data?.read_only === true;
-
-  const firstReadyTrack = tracks.data?.items.find((item) => item.analysis_state === "ready");
 
   const advanceCurrentTrack = useCallback(
     (trackId: string) => {
@@ -540,18 +539,52 @@ export function App() {
   );
 
   useEffect(() => {
-    if (!selectedPlaylistId && selectedPlaylist) {
-      setSelectedPlaylistId(selectedPlaylist.playlist_id);
-      localStorage.setItem("cuemate.playlist", selectedPlaylist.playlist_id);
+    if (!playlists.data) return;
+    const nextPlaylist = playlistItems.find((item) => item.playlist_id === selectedPlaylistId) ?? playlistItems[0];
+    if (!nextPlaylist) {
+      if (selectedPlaylistId) {
+        setSelectedPlaylistId("");
+        localStorage.removeItem("cuemate.playlist");
+      }
+      if (currentTrackId) {
+        setCurrentTrackId("");
+        localStorage.removeItem("cuemate.current");
+      }
+      if (history.length > 0) {
+        setHistory([]);
+        localStorage.removeItem("cuemate.history");
+      }
+      return;
     }
-  }, [selectedPlaylist, selectedPlaylistId]);
+    if (nextPlaylist.playlist_id !== selectedPlaylistId) {
+      setSelectedPlaylistId(nextPlaylist.playlist_id);
+      localStorage.setItem("cuemate.playlist", nextPlaylist.playlist_id);
+      setCurrentTrackId("");
+      setHistory([]);
+      setSelectedCandidate(null);
+      localStorage.removeItem("cuemate.current");
+      localStorage.removeItem("cuemate.history");
+    }
+  }, [currentTrackId, history.length, playlistItems, playlists.data, selectedPlaylistId]);
 
   useEffect(() => {
-    if (!currentTrackId && firstReadyTrack) {
-      setCurrentTrackId(firstReadyTrack.track_id);
-      localStorage.setItem("cuemate.current", firstReadyTrack.track_id);
+    if (!selectedPlaylistId || !tracks.data) return;
+    const trackItems = tracks.data.items;
+    const nextTrack = trackItems.find((item) => item.track_id === currentTrackId) ?? trackItems.find((item) => item.analysis_state === "ready") ?? trackItems[0];
+    if (!nextTrack) {
+      if (currentTrackId) {
+        setCurrentTrackId("");
+        setSelectedCandidate(null);
+        localStorage.removeItem("cuemate.current");
+      }
+      return;
     }
-  }, [currentTrackId, firstReadyTrack]);
+    if (nextTrack.track_id !== currentTrackId) {
+      setCurrentTrackId(nextTrack.track_id);
+      setSelectedCandidate(null);
+      localStorage.setItem("cuemate.current", nextTrack.track_id);
+    }
+  }, [currentTrackId, selectedPlaylistId, tracks.data]);
 
   useEffect(() => {
     if (isShowcase && mobileTab === "admin") {
@@ -647,6 +680,7 @@ export function App() {
               localStorage.setItem("cuemate.playlist", id);
               setCurrentTrackId("");
               setHistory([]);
+              setSelectedCandidate(null);
               localStorage.removeItem("cuemate.current");
               localStorage.removeItem("cuemate.history");
             }}
@@ -658,12 +692,15 @@ export function App() {
         </div>
         {tracks.isLoading ? (
           <SkeletonRows count={6} />
+        ) : tracks.error ? (
+          <div className="empty-state danger">{tracks.error.message}</div>
         ) : (
           <TrackList
             tracks={tracks.data?.items ?? []}
             currentTrackId={currentTrackId}
             onSelect={(track) => {
               setCurrentTrackId(track.track_id);
+              setSelectedCandidate(null);
               localStorage.setItem("cuemate.current", track.track_id);
             }}
           />

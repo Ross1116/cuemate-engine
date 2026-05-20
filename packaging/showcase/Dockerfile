@@ -12,7 +12,7 @@ RUN go mod download
 COPY go/ ./
 RUN go build -o /out/apiserver ./cmd/apiserver
 
-FROM python:3.12-bookworm-slim AS runtime
+FROM python:3.12-slim-bookworm AS runtime
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PORT=8080 \

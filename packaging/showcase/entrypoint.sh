@@ -69,10 +69,10 @@ trap cleanup INT TERM EXIT
 /app/apiserver &
 api_pid="$!"
 
-(
+{
     wait "$scorer_pid"
     echo "Scoring service exited; stopping API." >&2
     kill "$api_pid" 2>/dev/null || true
-) &
+} &
 
 wait "$api_pid"

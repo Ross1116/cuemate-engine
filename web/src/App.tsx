@@ -289,6 +289,7 @@ export function App() {
   const chainedWorkerRunRef = useRef("");
   const chainedWorkerPlaylistRef = useRef("");
   const previousSelectedPlaylistRef = useRef("");
+  const previousReadinessStatusRef = useRef<string | undefined>(undefined);
   const stopWorkerRequestedRef = useRef(false);
 
   const health = useQuery({ queryKey: ["health"], queryFn: api.health, refetchInterval: 15_000 });
@@ -528,7 +529,16 @@ export function App() {
   }, [remoteConsumePairMutation, setupStatus.data?.mode, setupStatus.data?.read_only]);
 
   useEffect(() => {
-    if (readiness.data?.status === "ready") {
+    const status = readiness.data?.status;
+    const previousStatus = previousReadinessStatusRef.current;
+    previousReadinessStatusRef.current = status;
+    if (status !== "ready") return;
+
+    const recovered = previousStatus !== undefined && previousStatus !== "ready";
+    const hasTemporarilyUnavailableRecommendations = queryClient
+      .getQueriesData<RecommendationResponse>({ queryKey: ["recommendations"] })
+      .some(([, data]) => data?.recommendations_status === "temporarily_unavailable");
+    if (recovered || hasTemporarilyUnavailableRecommendations) {
       void queryClient.invalidateQueries({ queryKey: ["recommendations"] });
     }
   }, [queryClient, readiness.data?.status]);

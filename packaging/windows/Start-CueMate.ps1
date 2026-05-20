@@ -15,11 +15,16 @@ $databasePath = Join-Path $dataDir "cuemate.db"
 $cachePath = Join-Path $dataDir "inference-cache.db"
 $setupStatePath = Join-Path $AppDataRoot "setup-state.json"
 $remoteConfigPath = Join-Path $AppDataRoot "remote.json"
+$bootstrapLogPath = Join-Path $logDir "bootstrap.log"
+$launcherLogPath = Join-Path $logDir "launcher.log"
+$launcherErrorLogPath = Join-Path $logDir "launcher-error.log"
+$scorerOutLogPath = Join-Path $logDir "scorer.out.log"
+$scorerErrLogPath = Join-Path $logDir "scorer.err.log"
+$apiOutLogPath = Join-Path $logDir "apiserver.out.log"
+$apiErrLogPath = Join-Path $logDir "apiserver.err.log"
 $apiUrl = "http://127.0.0.1:8080"
 
-New-Item -ItemType Directory -Force -Path $dataDir, $logDir | Out-Null
-Import-Module (Join-Path $InstallDir "CueMate-Common.psm1") -Force
-Start-Transcript -Path (Join-Path $logDir "launcher.log") -Append | Out-Null
+$script:TranscriptStarted = $false
 
 function Get-TailscaleCommand {
     $candidates = @(
@@ -190,25 +195,120 @@ function Start-LoggedProcess {
     Start-Process @startParams | Out-Null
 }
 
+function Read-SetupState {
+    if (-not (Test-Path $setupStatePath -PathType Leaf)) {
+        return $null
+    }
+    try {
+        return Get-Content $setupStatePath -Raw | ConvertFrom-Json
+    } catch {
+        return $null
+    }
+}
+
+function Test-CoreSetupReady {
+    return ((Test-Path $venvPython -PathType Leaf) -and (Test-Path $databasePath -PathType Leaf))
+}
+
+function Test-FullSetupComplete {
+    if (-not (Test-CoreSetupReady)) {
+        return $false
+    }
+    $state = Read-SetupState
+    if (-not $state) {
+        return $false
+    }
+    return (
+        [string]$state.status -eq "complete" -and
+        [string]$state.step -eq "complete" -and
+        [bool]$state.core_ready -and
+        [bool]$state.docker_ready -and
+        [bool]$state.model_ready
+    )
+}
+
 function Ensure-BootstrapComplete {
-    if ((Test-Path $venvPython -PathType Leaf) -and (Test-Path $databasePath -PathType Leaf)) {
+    if (Test-FullSetupComplete) {
         return
     }
     $bootstrap = Join-Path $InstallDir "Bootstrap-CueMate.ps1"
     if (-not (Test-Path $bootstrap -PathType Leaf)) {
         throw "CueMate bootstrap script is missing at $bootstrap"
     }
-    Write-Host "CueMate needs to finish first-time setup. Logs are in $logDir."
+    if (Test-CoreSetupReady) {
+        Write-Host "CueMate is resuming Docker/model setup. Bootstrap log: $bootstrapLogPath"
+    } else {
+        Write-Host "CueMate needs to finish first-time setup. Bootstrap log: $bootstrapLogPath"
+    }
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $bootstrap -InstallDir $InstallDir -AppDataRoot $AppDataRoot
     if ($LASTEXITCODE -ne 0) {
-        throw "CueMate setup could not finish. Check bootstrap.log in $logDir, fix any Python/Docker prompt, then launch CueMate again."
+        throw "CueMate setup could not finish. Check $bootstrapLogPath, fix any Python/Docker prompt, then launch CueMate again."
     }
-    if ((-not (Test-Path $venvPython -PathType Leaf)) -or (-not (Test-Path $databasePath -PathType Leaf))) {
-        throw "CueMate core setup is not ready yet. Finish any required prerequisite prompts, then launch CueMate again. See logs in $logDir."
+    if (-not (Test-CoreSetupReady)) {
+        throw "CueMate core setup is not ready yet. Finish any required prerequisite prompts, then launch CueMate again. See $bootstrapLogPath."
+    }
+    if (-not (Test-FullSetupComplete)) {
+        $state = Read-SetupState
+        $message = if ($state -and $state.message) { [string]$state.message } else { "Docker/model setup is not complete yet." }
+        Write-Warning "$message CueMate will still open, and setup will resume on the next launch."
+    }
+}
+
+function Write-LaunchFailure {
+    param([object]$ErrorRecord)
+
+    $errorMessage = if ($ErrorRecord -and $ErrorRecord.Exception) { [string]$ErrorRecord.Exception.Message } else { [string]$ErrorRecord }
+    $details = @"
+CueMate failed to launch.
+
+Error:
+$errorMessage
+
+Logs:
+Launcher: $launcherLogPath
+Last launch error: $launcherErrorLogPath
+Bootstrap/setup: $bootstrapLogPath
+API stdout: $apiOutLogPath
+API stderr: $apiErrLogPath
+Scorer stdout: $scorerOutLogPath
+Scorer stderr: $scorerErrLogPath
+
+Install directory:
+$InstallDir
+
+App data directory:
+$AppDataRoot
+"@
+
+    New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+    $details | Set-Content -Path $launcherErrorLogPath -Encoding UTF8
+    Write-Host $details -ForegroundColor Red
+
+    try {
+        Add-Type -AssemblyName System.Windows.Forms
+        [System.Windows.Forms.MessageBox]::Show(
+            $details,
+            "CueMate launch failed",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error
+        ) | Out-Null
+    } catch {
+        # The console output and launcher-error.log still contain the same details.
+    }
+
+    try {
+        Start-Process -FilePath "notepad.exe" -ArgumentList @($launcherErrorLogPath) | Out-Null
+    } catch {
+        # Best effort only.
     }
 }
 
 try {
+    New-Item -ItemType Directory -Force -Path $dataDir, $logDir | Out-Null
+    Start-Transcript -Path $launcherLogPath -Append | Out-Null
+    $script:TranscriptStarted = $true
+    Import-Module (Join-Path $InstallDir "CueMate-Common.psm1") -Force
+
     Set-CueMateRuntimeEnvironment
     Ensure-BootstrapComplete
     Set-CueMateRuntimeEnvironment
@@ -222,7 +322,7 @@ try {
             Start-LoggedProcess -Name "scorer" -FilePath $venvPython -Arguments @("-m", "cuemate_analysis", "serve-scoring", "--host", "127.0.0.1", "--port", "47834")
             $scorerReady = Wait-Until -Predicate { Test-TcpPort -HostName "127.0.0.1" -Port 47834 } -TimeoutSeconds 45 -Description "CueMate scorer"
             if (-not $scorerReady) {
-                throw "CueMate scorer did not become ready on 127.0.0.1:47834. Check $logDir\scorer.log and confirm $venvPython can start the scorer."
+                throw "CueMate scorer did not become ready on 127.0.0.1:47834. Check $scorerErrLogPath and $scorerOutLogPath, then confirm $venvPython can start the scorer."
             }
         }
 
@@ -235,7 +335,7 @@ try {
             Start-LoggedProcess -Name "apiserver" -FilePath $apiExe -Arguments @()
             $apiReady = Wait-Until -Predicate { Test-HttpOk -Url "$apiUrl/healthz" } -TimeoutSeconds 45 -Description "CueMate API"
             if (-not $apiReady) {
-                throw "CueMate API did not become ready at $apiUrl/healthz after starting $apiExe. Check $logDir\apiserver.log."
+                throw "CueMate API did not become ready at $apiUrl/healthz after starting $apiExe. Check $apiErrLogPath and $apiOutLogPath."
             }
         }
 
@@ -246,6 +346,11 @@ try {
     } finally {
         Pop-Location
     }
+} catch {
+    Write-LaunchFailure -ErrorRecord $_
+    exit 1
 } finally {
-    Stop-Transcript | Out-Null
+    if ($script:TranscriptStarted) {
+        Stop-Transcript | Out-Null
+    }
 }

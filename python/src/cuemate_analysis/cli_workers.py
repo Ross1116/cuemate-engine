@@ -137,6 +137,7 @@ def handle_run_analysis_worker(args: argparse.Namespace) -> int:
     with _cli.Database(settings.database_path) as database:
         jobs = database.claim_pending_analysis_jobs(
             job_kind="enrichment",
+            playlist_id=(args.playlist_id or None),
             limit=args.limit,
             started_at=utc_now(),
         )

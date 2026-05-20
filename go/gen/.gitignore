@@ -1,3 +1,5 @@
 # Generated Go protobuf artifacts live here.
 *
 !.gitignore
+!*/
+!*.go

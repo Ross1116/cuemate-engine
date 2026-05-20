@@ -23,6 +23,8 @@ function Set-CueMateEnvironment {
     )
 
     $env:DATABASE_URL = "sqlite:$DatabasePath"
+    $env:CUEMATE_INSTALL_DIR = $InstallDir
+    $env:CUEMATE_REPO_ROOT = $InstallDir
     $env:CUEMATE_INFERENCE_CACHE_PATH = $CachePath
     if ($SetupStatePath) {
         $env:CUEMATE_SETUP_STATE_PATH = $SetupStatePath

@@ -135,6 +135,8 @@ Common logs:
 - configures Tailscale Serve when possible
 - opens `http://127.0.0.1:8080`
 
+`Stop-CueMate.ps1` is used by the in-app **Quit** button and the **Quit CueMate** Start Menu shortcut. It stops CueMate's Python scorer/workers, named Docker model-service containers, and the Go API process.
+
 ## Clean VM Acceptance Checklist
 
 On a clean Windows VM:

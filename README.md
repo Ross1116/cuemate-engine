@@ -36,6 +36,8 @@ http://127.0.0.1:8080
 
 The first launch can take a while because CueMate may install Python, install Docker Desktop, create its private Python environment, build model-service images, and download model assets. If Docker asks you to sign in, update WSL, or restart Windows, finish that prompt and launch CueMate again. Setup resumes from its saved state.
 
+Use **Quit** in the top bar when you are done. It stops CueMate's local API, scorer, analysis workers, and model-service containers so they do not keep memory reserved in the background. The Start Menu also includes **Quit CueMate** for the same cleanup.
+
 ## First Use
 
 1. Open CueMate.
@@ -151,17 +153,6 @@ Output:
 dist\windows-installer\output\CueMateSetup.exe
 ```
 
-`dist/` is ignored by git on purpose. The installer is a generated release artifact, so it should be uploaded to a GitHub Release instead of committed to the repository.
-
-Publish a release installer:
-
-```powershell
-git tag v0.1.0-beta.1
-git push origin v0.1.0-beta.1
-```
-
-Pushing a `v*` tag runs the Release workflow. For beta builds, use prerelease-style tags such as `v0.1.0-beta.1`, `v0.1.0-beta.2`, and so on. The workflow builds `CueMateSetup.exe` on Windows and attaches it to the matching GitHub Release. You can also run the Release workflow manually from GitHub Actions and provide a beta version such as `v0.1.0-beta.1`.
-
 Fast staging-only check:
 
 ```powershell
@@ -193,13 +184,15 @@ React/Vite UI
 
 Key engineering choices:
 
-- **SQLite local data model** for tracks, playlists, analysis jobs, recommendation events, and feedback.
-- **Go API** for local HTTP endpoints, health checks, remote pairing, and safe tool execution.
-- **Python analysis service** for import, feature extraction, model-backed analysis, and scoring.
-- **gRPC/protobuf boundary** between Go and Python for typed scorer contracts.
-- **Docker model services** for heavier BPM, key, and semantic analysis dependencies.
+- **SQLite local data model** for imported tracks, playlist membership, analysis signatures, queued analysis jobs, recommendation events, and feedback history.
+- **Go API** for the browser-facing HTTP surface, playlist browsing, recommendation hydration, health checks, remote pairing, and controlled local tool execution.
+- **Python analysis service** for imports, audio feature extraction, model-backed BPM/key/semantic analysis, relative transition features, and scoring metadata.
+- **gRPC/protobuf boundary** between Go and Python so recommendation requests, scoring explanations, and signature metadata stay typed across the process boundary.
+- **Signature-aware analysis refresh** so CueMate can tell whether a track is missing, stale, or analyzed with an older config/model contract before queueing work.
+- **Docker model services** for heavier BPM, key, and semantic analysis dependencies that are easier to isolate outside the main Python runtime.
+- **React/Vite client** for the local browser UI, including playlist health, analysis controls, recommendation lanes, candidate details, and optional phone pairing.
 - **Tailscale remote mode** for private phone access without opening public ports.
-- **Windows installer bootstrap** for resumable setup on non-developer machines.
+- **Windows installer bootstrap** for resumable setup on non-developer machines, including prerequisite checks, runtime environment setup, and local service startup.
 
 ## Project Layout
 
@@ -214,7 +207,3 @@ python/              analysis engine, scorer, CLI, and Python tests
 scripts/             developer and model-service helpers
 web/                 React/Vite app
 ```
-
-## Status
-
-CueMate is a Windows-first private beta. The installer is unsigned. The next production-readiness steps are clean-VM acceptance testing, code signing, and broader hardening for locked-down enterprise Windows environments.

@@ -784,16 +784,23 @@ class Database:
         self,
         *,
         job_kind: str,
+        playlist_id: str | None = None,
         limit: int = 100,
         started_at: str,
     ) -> list[sqlite3.Row]:
+        playlist_filter = ""
+        params: list[Any] = [job_kind]
+        if playlist_id:
+            playlist_filter = " AND playlist_id = ?"
+            params.append(playlist_id)
+        params.extend([limit, started_at])
         with self.connection:
             rows = self.connection.execute(
-                """
+                f"""
                 WITH to_claim AS (
                     SELECT id
                     FROM analysis_jobs
-                    WHERE status = 'pending' AND job_kind = ?
+                    WHERE status = 'pending' AND job_kind = ?{playlist_filter}
                     ORDER BY priority DESC, created_at ASC
                     LIMIT ?
                 )
@@ -803,7 +810,7 @@ class Database:
                 WHERE id IN (SELECT id FROM to_claim)
                 RETURNING *
                 """,
-                (job_kind, limit, started_at),
+                params,
             ).fetchall()
         return rows
     

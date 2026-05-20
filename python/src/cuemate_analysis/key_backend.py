@@ -22,7 +22,15 @@ from cuemate_analysis.persistent_inference_cache import (
     resolve_inference_cache_path,
 )
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+
+def resolve_runtime_root() -> Path:
+    configured = os.getenv("CUEMATE_REPO_ROOT")
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return Path(__file__).resolve().parents[3]
+
+
+REPO_ROOT = resolve_runtime_root()
 DEFAULT_MUSICALKEYCNN_MODEL = REPO_ROOT / "python" / "models" / "musicalkeycnn" / "keynet.pt"
 DEFAULT_MUSICALKEYCNN_IMAGE = "cuemate-musicalkeycnn:local"
 DEFAULT_MUSICALKEYCNN_SERVICE_NAME = "cuemate-musicalkeycnn-service"

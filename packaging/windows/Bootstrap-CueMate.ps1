@@ -20,6 +20,7 @@ $databasePath = Join-Path $dataDir "cuemate.db"
 $cachePath = Join-Path $dataDir "inference-cache.db"
 $bootstrapLog = Join-Path $logDir "bootstrap.log"
 $script:SetupBlocked = $false
+$script:DockerInstallDeferred = $false
 
 New-Item -ItemType Directory -Force -Path $AppDataRoot, $dataDir, $logDir | Out-Null
 Import-Module (Join-Path $InstallDir "CueMate-Common.psm1") -Force
@@ -116,77 +117,204 @@ function Invoke-External {
         [Parameter(Mandatory = $true)]
         [string]$FilePath,
         [string[]]$Arguments = @(),
-        [string]$WorkingDirectory = $InstallDir
+        [string]$WorkingDirectory = $InstallDir,
+        [int]$TimeoutSeconds = 0
     )
 
     Push-Location $WorkingDirectory
     try {
         Write-Host ">> $FilePath $($Arguments -join ' ')"
-        & $FilePath @Arguments
-        if ($LASTEXITCODE -ne 0) {
-            throw "$FilePath exited with code $LASTEXITCODE"
+        if ($TimeoutSeconds -gt 0) {
+            $process = Start-Process -FilePath $FilePath -ArgumentList $Arguments -WorkingDirectory $WorkingDirectory -NoNewWindow -PassThru
+            if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+                $taskkill = Get-Command "taskkill.exe" -ErrorAction SilentlyContinue
+                if ($taskkill) {
+                    & $taskkill.Source /PID $process.Id /T /F *> $null
+                } else {
+                    Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+                }
+                throw "$FilePath timed out after $TimeoutSeconds seconds"
+            }
+            if ($null -eq $process.ExitCode) {
+                Write-Warning "$FilePath finished without reporting an exit code."
+                return
+            }
+            if ($process.ExitCode -ne 0) {
+                throw "$FilePath exited with code $($process.ExitCode)"
+            }
+        } else {
+            & $FilePath @Arguments
+            if ($LASTEXITCODE -ne 0) {
+                throw "$FilePath exited with code $LASTEXITCODE"
+            }
         }
     } finally {
         Pop-Location
     }
 }
 
-function Ensure-WingetPackage {
+function Update-ProcessPath {
+    $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+    $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    $env:Path = (($machinePath, $userPath) | Where-Object { $_ }) -join ";"
+}
+
+function Get-InstalledCommand {
     param(
         [string]$CommandName,
-        [string]$PackageId
+        [string[]]$CandidatePaths = @()
     )
 
-    if (Get-Command $CommandName -ErrorAction SilentlyContinue) {
-        return
+    $cmd = Get-Command $CommandName -ErrorAction SilentlyContinue
+    if ($cmd) {
+        return $cmd.Source
     }
-    if ($SkipWingetInstall) {
-        throw "$CommandName is required but was not found. Rerun setup without -SkipWingetInstall."
+    foreach ($candidate in $CandidatePaths) {
+        if ($candidate -and (Test-Path $candidate -PathType Leaf)) {
+            return $candidate
+        }
     }
+    return $null
+}
+
+function Invoke-WingetInstall {
+    param(
+        [string]$PackageId,
+        [int]$TimeoutSeconds = 1800
+    )
+
     $winget = Get-Command "winget.exe" -ErrorAction SilentlyContinue
     if (-not $winget) {
         throw "winget is required to install $PackageId automatically."
     }
-    Invoke-External -FilePath $winget.Source -Arguments @(
+    Invoke-External -FilePath $winget.Source -TimeoutSeconds $TimeoutSeconds -Arguments @(
         "install",
         "--id", $PackageId,
         "--source", "winget",
         "--accept-package-agreements",
-        "--accept-source-agreements"
+        "--accept-source-agreements",
+        "--disable-interactivity",
+        "--silent"
+    )
+    Update-ProcessPath
+}
+
+function Test-WingetPackageInstalled {
+    param([string]$PackageId)
+
+    $winget = Get-Command "winget.exe" -ErrorAction SilentlyContinue
+    if (-not $winget) {
+        return $false
+    }
+    $output = & $winget.Source list --id $PackageId --exact --accept-source-agreements 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $output) {
+        return $false
+    }
+    return (([string]$output) -match [regex]::Escape($PackageId))
+}
+
+function Ensure-WingetPackage {
+    param(
+        [string]$CommandName,
+        [string]$PackageId,
+        [string[]]$CandidatePaths = @(),
+        [switch]$Optional
+    )
+
+    if (Get-InstalledCommand -CommandName $CommandName -CandidatePaths $CandidatePaths) {
+        return $true
+    }
+    if (Test-WingetPackageInstalled -PackageId $PackageId) {
+        Update-ProcessPath
+        return [bool](Get-InstalledCommand -CommandName $CommandName -CandidatePaths $CandidatePaths)
+    }
+    if ($SkipWingetInstall) {
+        if ($Optional) {
+            Write-Warning "$CommandName was not found. Skipping automatic $PackageId install because -SkipWingetInstall was supplied."
+            return $false
+        }
+        throw "$CommandName is required but was not found. Rerun setup without -SkipWingetInstall."
+    }
+    try {
+        Invoke-WingetInstall -PackageId $PackageId
+    } catch {
+        if (Test-WingetPackageInstalled -PackageId $PackageId) {
+            Update-ProcessPath
+            return [bool](Get-InstalledCommand -CommandName $CommandName -CandidatePaths $CandidatePaths)
+        }
+        if ($Optional) {
+            Write-Warning "Could not install $PackageId automatically: $($_.Exception.Message)"
+            return $false
+        }
+        throw
+    }
+    return [bool](Get-InstalledCommand -CommandName $CommandName -CandidatePaths $CandidatePaths)
+}
+
+function Get-DockerCommand {
+    return Get-InstalledCommand -CommandName "docker.exe" -CandidatePaths @(
+        "$env:ProgramFiles\Docker\Docker\resources\bin\docker.exe",
+        "${env:ProgramFiles(x86)}\Docker\Docker\resources\bin\docker.exe"
     )
 }
 
 function Get-PythonCommand {
+    $candidates = @(
+        "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe",
+        "$env:ProgramFiles\Python312\python.exe",
+        "${env:ProgramFiles(x86)}\Python312\python.exe"
+    )
     $python = Get-Command "python.exe" -ErrorAction SilentlyContinue
-    if (-not $python) {
-        return $null
+    if ($python) {
+        $candidates = @($python.Source) + $candidates
     }
-    $versionText = & $python.Source -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
-    if ($LASTEXITCODE -ne 0) {
-        return $null
+    $python312 = Get-Command "python3.12.exe" -ErrorAction SilentlyContinue
+    if ($python312) {
+        $candidates = @($python312.Source) + $candidates
     }
-    $versionMatch = [regex]::Match([string]$versionText, '^\s*(\d+\.\d+)')
-    if (-not $versionMatch.Success) {
-        return $null
+    $pyLauncher = Get-Command "py.exe" -ErrorAction SilentlyContinue
+    if ($pyLauncher) {
+        $launcherPython = & $pyLauncher.Source -3.12 -c "import sys; print(sys.executable)" 2>$null
+        if ($LASTEXITCODE -eq 0 -and $launcherPython) {
+            $candidates = @([string]$launcherPython) + $candidates
+        }
     }
-    try {
-        $parsedVersion = [version]$versionMatch.Groups[1].Value
-    } catch {
-        return $null
+
+    foreach ($candidate in ($candidates | Select-Object -Unique)) {
+        if (-not $candidate -or -not (Test-Path $candidate -PathType Leaf)) {
+            continue
+        }
+        $versionText = & $candidate -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
+        if ($LASTEXITCODE -ne 0) {
+            continue
+        }
+        $versionMatch = [regex]::Match([string]$versionText, '^\s*(\d+\.\d+)')
+        if (-not $versionMatch.Success) {
+            continue
+        }
+        try {
+            $parsedVersion = [version]$versionMatch.Groups[1].Value
+        } catch {
+            continue
+        }
+        if ($parsedVersion -ge [version]"3.12") {
+            return $candidate
+        }
     }
-    if ($parsedVersion -lt [version]"3.12") {
-        return $null
-    }
-    return $python.Source
+    return $null
 }
 
 function Wait-DockerReady {
     param([int]$TimeoutSeconds = 300)
 
+    $docker = Get-DockerCommand
+    if (-not $docker) {
+        return $false
+    }
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     while ((Get-Date) -lt $deadline) {
         try {
-            & docker info *> $null
+            & $docker info *> $null
             if ($LASTEXITCODE -eq 0) {
                 return $true
             }
@@ -246,18 +374,30 @@ try {
                 throw "CueMate could not find winget, so it cannot install Python 3.12 automatically. Install Python 3.12 manually, then launch CueMate again."
             }
             Write-SetupState -Step "install-prerequisites" -Status "running" -Message "Installing Python 3.12. If Windows updates PATH, launch CueMate again after this step finishes."
-            Invoke-External -FilePath $winget.Source -Arguments @(
-                "install",
-                "--id", "Python.Python.3.12",
-                "--source", "winget",
-                "--accept-package-agreements",
-                "--accept-source-agreements"
-            )
+            if (Test-WingetPackageInstalled -PackageId "Python.Python.3.12") {
+                Update-ProcessPath
+            } else {
+                Invoke-WingetInstall -PackageId "Python.Python.3.12"
+            }
         }
-        Ensure-WingetPackage -CommandName "docker.exe" -PackageId "Docker.DockerDesktop"
+        $dockerReady = Ensure-WingetPackage -CommandName "docker.exe" -PackageId "Docker.DockerDesktop" -CandidatePaths @(
+            "$env:ProgramFiles\Docker\Docker\resources\bin\docker.exe",
+            "${env:ProgramFiles(x86)}\Docker\Docker\resources\bin\docker.exe"
+        ) -Optional
+        if (-not $dockerReady) {
+            $script:DockerInstallDeferred = $true
+            Write-SetupState -Step "install-prerequisites" -Status "running" -DockerReady $false -Message "Docker Desktop was not installed automatically. Install Docker Desktop manually, then launch CueMate again to resume full setup."
+        }
         if (-not $SkipTailscaleInstall) {
-            Ensure-WingetPackage -CommandName "tailscale.exe" -PackageId "Tailscale.Tailscale"
-            Write-SetupState -Step "install-prerequisites" -Status "running" -MobileReady $true
+            $tailscaleReady = Ensure-WingetPackage -CommandName "tailscale.exe" -PackageId "Tailscale.Tailscale" -CandidatePaths @(
+                "$env:ProgramFiles\Tailscale\tailscale.exe",
+                "${env:ProgramFiles(x86)}\Tailscale\tailscale.exe"
+            ) -Optional
+            if ($tailscaleReady) {
+                Write-SetupState -Step "install-prerequisites" -Status "running" -MobileReady $true
+            } else {
+                Write-SetupState -Step "install-prerequisites" -Status "running" -MobileReady $false -Message "Tailscale was not installed automatically; mobile access can be enabled later."
+            }
         } else {
             Write-SetupState -Step "install-prerequisites" -Status "running" -MobileReady $false -Message "Tailscale installation was skipped; mobile access can be enabled later."
         }
@@ -297,6 +437,11 @@ CUEMATE_INFERENCE_CACHE_PATH=$cachePath
 
     if (-not $SkipDockerSetup) {
         Invoke-Step "prepare-docker" {
+            if ($script:DockerInstallDeferred -or -not (Get-DockerCommand)) {
+                Write-SetupState -Step "prepare-docker" -Status "blocked" -DockerReady $false -Message "Docker Desktop is not installed. Install Docker Desktop, finish any required restart or WSL prompt, then launch CueMate again. Setup will resume automatically."
+                Write-Warning "Docker Desktop is not installed. CueMate setup will resume on next launch."
+                return
+            }
             Write-SetupState -Step "prepare-docker" -Status "running" -Message "Starting Docker Desktop. If Docker asks you to sign in, update WSL, or restart Windows, finish that prompt and launch CueMate again."
             Start-DockerDesktop
             if (-not (Wait-DockerReady -TimeoutSeconds 300)) {
@@ -329,7 +474,13 @@ CUEMATE_INFERENCE_CACHE_PATH=$cachePath
                 return
             }
             Write-SetupState -Step "prepare-models" -Status "running" -Message "Prewarming Docker model services."
-            Invoke-External -FilePath $venvPython -Arguments @("-m", "cuemate_analysis", "prewarm-model-services")
+            try {
+                Invoke-External -FilePath $venvPython -Arguments @("-m", "cuemate_analysis", "prewarm-model-services")
+            } catch {
+                Write-SetupState -Step "prepare-models" -Status "blocked" -ModelReady $false -Message "Docker model-service prewarm failed: $($_.Exception.Message). CueMate can still open; setup will retry on the next launch. See $bootstrapLog."
+                Write-Warning "Docker model-service prewarm failed. CueMate can still open; setup will retry on the next launch. See $bootstrapLog."
+                return
+            }
             Write-SetupState -Step "prepare-models" -Status "running" -ModelReady $true
         }
     } else {

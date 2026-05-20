@@ -305,6 +305,30 @@ h1 {
   transform: translateY(-1px);
 }
 
+.shutdown-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 30px;
+  padding: 6px 10px;
+  border: 1px solid rgba(222, 92, 82, 0.42);
+  border-radius: 8px;
+  color: #ffb6ae;
+  background:
+    linear-gradient(180deg, rgba(222, 92, 82, 0.12), transparent),
+    rgba(8, 12, 16, 0.32);
+  cursor: pointer;
+  font-size: 0.74rem;
+  font-weight: 900;
+}
+
+.shutdown-button:hover:not(:disabled) {
+  border-color: rgba(222, 92, 82, 0.68);
+  background:
+    linear-gradient(180deg, rgba(222, 92, 82, 0.18), transparent),
+    rgba(8, 12, 16, 0.4);
+}
+
 .status,
 .pill {
   display: inline-flex;
@@ -2080,6 +2104,18 @@ h1 {
 .wide-action.danger:hover {
   border-color: rgba(222, 92, 82, 0.58);
   color: #ffd5cf;
+}
+
+.wide-action.danger-soft {
+  border-color: rgba(222, 92, 82, 0.32);
+  color: #f0b2a9;
+}
+
+.wide-action.danger-soft:hover:not(:disabled) {
+  border-color: rgba(222, 92, 82, 0.52);
+  background:
+    linear-gradient(135deg, rgba(222, 92, 82, 0.1), rgba(8, 12, 16, 0.22)),
+    rgba(10, 21, 25, 0.42);
 }
 
 .check-row {

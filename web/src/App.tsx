@@ -9,12 +9,14 @@ import {
   ChevronDown,
   CircleHelp,
   CircleDot,
+  Eye,
   FileAudio,
   FolderPlus,
   FolderOpen,
   Library,
   ListMusic,
   PlayCircle,
+  Power,
   Radar,
   RefreshCw,
   Search,
@@ -265,6 +267,8 @@ function boundedPercent(value: number) {
   return Math.max(0, Math.min(100, value));
 }
 
+const ANALYSIS_WORKER_BATCH_LIMIT = 5;
+
 export function App() {
   const queryClient = useQueryClient();
   const [selectedPlaylistId, setSelectedPlaylistId] = useState<string>(() => localStorage.getItem("cuemate.playlist") ?? "");
@@ -282,6 +286,11 @@ export function App() {
   const [operationMessage, setOperationMessage] = useState("");
   const [activeRunId, setActiveRunId] = useState("");
   const consumedPairTokenRef = useRef("");
+  const chainedWorkerRunRef = useRef("");
+  const chainedWorkerPlaylistRef = useRef("");
+  const previousSelectedPlaylistRef = useRef("");
+  const previousReadinessStatusRef = useRef<string | undefined>(undefined);
+  const stopWorkerRequestedRef = useRef(false);
 
   const health = useQuery({ queryKey: ["health"], queryFn: api.health, refetchInterval: 15_000 });
   const readiness = useQuery({ queryKey: ["ready"], queryFn: api.readiness, refetchInterval: 15_000 });
@@ -291,6 +300,11 @@ export function App() {
   const tracks = useQuery({
     queryKey: ["playlistTracks", selectedPlaylistId, trackQuery],
     queryFn: () => api.playlistTracks(selectedPlaylistId, trackQuery),
+    enabled: !!selectedPlaylistId,
+  });
+  const playlistTracks = useQuery({
+    queryKey: ["playlistTracks", selectedPlaylistId, ""],
+    queryFn: () => api.playlistTracks(selectedPlaylistId),
     enabled: !!selectedPlaylistId,
   });
   const jobs = useQuery({
@@ -333,6 +347,14 @@ export function App() {
         max_per_lane: 5,
       }),
     enabled: !!selectedPlaylistId && !!currentTrackId,
+    refetchInterval: (query) => (query.state.data?.recommendations_status === "temporarily_unavailable" ? 2_000 : false),
+  });
+
+  const shutdownMutation = useMutation({
+    mutationFn: api.shutdown,
+    onMutate: () => setOperationMessage("Closing CueMate and stopping local services..."),
+    onSuccess: () => setOperationMessage("CueMate is shutting down. You can close this browser tab."),
+    onError: (error) => setOperationMessage(`Shutdown failed: ${error instanceof Error ? error.message : "could not stop CueMate"}`),
   });
 
   const playMutation = useMutation({
@@ -356,8 +378,9 @@ export function App() {
 
   const refreshMutation = useMutation({
     mutationFn: async (body?: { force?: boolean; analysis_mode?: "fast_pass" | "staged" | "full" }) => {
+      stopWorkerRequestedRef.current = false;
       const refresh = await api.refreshPlaylistAnalysis(selectedPlaylistId, body);
-      const worker = await api.toolCommand({ action: "run_analysis_worker", limit: 1000 });
+      const worker = await api.toolCommand({ action: "run_analysis_worker", playlist_id: selectedPlaylistId, limit: ANALYSIS_WORKER_BATCH_LIMIT });
       return { refresh, worker };
     },
     onMutate: (body) => setOperationMessage(body?.force ? "Force reanalysis queued. Starting worker..." : "Smart refresh queued. Starting worker..."),
@@ -367,7 +390,7 @@ export function App() {
       const queued = result.refresh.queued_count;
       setOperationMessage(
         queued
-          ? `${queued} analysis job${queued === 1 ? "" : "s"} queued. Worker started in the background.`
+          ? `${queued} analysis job${queued === 1 ? "" : "s"} queued. Processing ${ANALYSIS_WORKER_BATCH_LIMIT} at a time.`
           : "No new jobs were queued. Worker checked for any pending analysis.",
       );
       void queryClient.invalidateQueries({ queryKey: ["jobs"] });
@@ -425,16 +448,42 @@ export function App() {
 
   const toolMutation = useMutation({
     mutationFn: (payload: ToolCommandRequest) => api.toolCommand(payload),
-    onMutate: (payload) => setOperationMessage(operationStartedMessage(payload.action)),
+    onMutate: (payload) => {
+      if (payload.action === "run_analysis_worker") stopWorkerRequestedRef.current = false;
+      setOperationMessage(operationStartedMessage(payload.action));
+    },
     onSuccess: (result) => {
       setLastToolResult(result);
-      if (result.run_id) setActiveRunId(result.run_id);
+      if (result.run_id) {
+        setActiveRunId(result.run_id);
+        if (result.command?.some((part) => part === "run-analysis-worker")) {
+          const playlistIndex = result.command.indexOf("--playlist-id");
+          chainedWorkerPlaylistRef.current = playlistIndex >= 0 ? (result.command[playlistIndex + 1] ?? selectedPlaylistId) : selectedPlaylistId;
+        }
+      }
       setOperationMessage(result.mode === "background" ? "Started. Progress will update below." : "Completed.");
       void queryClient.invalidateQueries({ queryKey: ["playlists"] });
       void queryClient.invalidateQueries({ queryKey: ["jobs"] });
       void queryClient.invalidateQueries({ queryKey: ["analysisStatus"] });
     },
     onError: (error) => setOperationMessage(`Failed: ${error instanceof Error ? error.message : "tool command failed"}`),
+  });
+
+  const stopWorkersMutation = useMutation({
+    mutationFn: () => api.stopAnalysisWorkers(selectedPlaylistId || undefined),
+    onMutate: () => {
+      stopWorkerRequestedRef.current = true;
+      setOperationMessage("Stopping analysis workers and keeping remaining jobs queued...");
+    },
+    onSuccess: (result) => {
+      setActiveRunId("");
+      const warning = result.warning ? ` Warning: ${result.warning}` : "";
+      setOperationMessage(`Stopped ${result.stopped_processes} worker process${result.stopped_processes === 1 ? "" : "es"} and returned ${result.requeued_jobs} job${result.requeued_jobs === 1 ? "" : "s"} to the queue.${warning}`);
+      void queryClient.invalidateQueries({ queryKey: ["jobs"] });
+      void queryClient.invalidateQueries({ queryKey: ["analysisStatus"] });
+      void queryClient.invalidateQueries({ queryKey: ["playlists"] });
+    },
+    onError: (error) => setOperationMessage(`Stop failed: ${error instanceof Error ? error.message : "could not stop workers"}`),
   });
 
   useEffect(() => {
@@ -444,34 +493,143 @@ export function App() {
     void queryClient.invalidateQueries({ queryKey: ["jobs"] });
     void queryClient.invalidateQueries({ queryKey: ["analysisStatus"] });
     void queryClient.invalidateQueries({ queryKey: ["recommendations"] });
-  }, [activeToolRun.data, queryClient]);
+    if (
+      activeToolRun.data.status === "completed" &&
+      activeToolRun.data.run_id !== chainedWorkerRunRef.current &&
+      activeToolRun.data.command?.some((part) => part === "run-analysis-worker")
+    ) {
+      chainedWorkerRunRef.current = activeToolRun.data.run_id;
+      const playlistIndex = activeToolRun.data.command.indexOf("--playlist-id");
+      const capturedPlaylistId =
+        (playlistIndex >= 0 ? activeToolRun.data.command[playlistIndex + 1] : "") || chainedWorkerPlaylistRef.current || selectedPlaylistId;
+      if (!capturedPlaylistId) return;
+      chainedWorkerPlaylistRef.current = capturedPlaylistId;
+      void new Promise((resolve) => window.setTimeout(resolve, 500))
+        .then(() => api.playlistAnalysisStatus(capturedPlaylistId))
+        .then((status) => {
+          if (stopWorkerRequestedRef.current) return;
+          const pending = status.jobs.pending;
+          const running = status.jobs.running;
+          if (pending > 0 && running === 0) {
+            setOperationMessage(`${pending} analysis job${pending === 1 ? "" : "s"} remaining. Starting next ${ANALYSIS_WORKER_BATCH_LIMIT}.`);
+            toolMutation.mutate({ action: "run_analysis_worker", playlist_id: capturedPlaylistId, limit: ANALYSIS_WORKER_BATCH_LIMIT });
+          }
+        })
+        .catch(() => undefined);
+    }
+  }, [activeToolRun.data, queryClient, selectedPlaylistId, toolMutation]);
 
   useEffect(() => {
     const token = new URLSearchParams(window.location.search).get("pair_token");
-    if (token && consumedPairTokenRef.current !== token) {
+    const showcase = setupStatus.data?.mode === "showcase" || setupStatus.data?.read_only === true;
+    if (!showcase && token && consumedPairTokenRef.current !== token) {
       consumedPairTokenRef.current = token;
       remoteConsumePairMutation.mutate(token);
     }
-  }, [remoteConsumePairMutation]);
-
-  const selectedPlaylist = playlists.data?.items.find((item) => item.playlist_id === selectedPlaylistId) ?? playlists.data?.items[0];
-  const currentTrack = tracks.data?.items.find((item) => item.track_id === currentTrackId);
-
-  const firstReadyTrack = tracks.data?.items.find((item) => item.analysis_state === "ready");
+  }, [remoteConsumePairMutation, setupStatus.data?.mode, setupStatus.data?.read_only]);
 
   useEffect(() => {
-    if (!selectedPlaylistId && selectedPlaylist) {
-      setSelectedPlaylistId(selectedPlaylist.playlist_id);
-      localStorage.setItem("cuemate.playlist", selectedPlaylist.playlist_id);
+    const status = readiness.data?.status;
+    const previousStatus = previousReadinessStatusRef.current;
+    previousReadinessStatusRef.current = status;
+    if (status !== "ready") return;
+
+    const recovered = previousStatus !== undefined && previousStatus !== "ready";
+    const hasTemporarilyUnavailableRecommendations = queryClient
+      .getQueriesData<RecommendationResponse>({ queryKey: ["recommendations"] })
+      .some(([, data]) => data?.recommendations_status === "temporarily_unavailable");
+    if (recovered || hasTemporarilyUnavailableRecommendations) {
+      void queryClient.invalidateQueries({ queryKey: ["recommendations"] });
     }
-  }, [selectedPlaylist, selectedPlaylistId]);
+  }, [queryClient, readiness.data?.status]);
+
+  const playlistItems = useMemo(() => playlists.data?.items ?? [], [playlists.data]);
+  const selectedPlaylist = playlistItems.find((item) => item.playlist_id === selectedPlaylistId) ?? playlistItems[0];
+  const currentTrack = playlistTracks.data?.items.find((item) => item.track_id === currentTrackId);
+  const isShowcase = setupStatus.data?.mode === "showcase" || setupStatus.data?.read_only === true;
+  const canShutdown = !isShowcase && remoteStatus.data?.request_local === true;
+
+  const advanceCurrentTrack = useCallback(
+    (trackId: string) => {
+      const nextHistory = currentTrackId ? [...history.slice(-7), currentTrackId] : history;
+      setHistory(nextHistory);
+      setCurrentTrackId(trackId);
+      localStorage.setItem("cuemate.current", trackId);
+      localStorage.setItem("cuemate.history", JSON.stringify(nextHistory));
+      setSelectedCandidate(null);
+      void queryClient.invalidateQueries({ queryKey: ["recommendations"] });
+    },
+    [currentTrackId, history, queryClient],
+  );
+
+  const confirmCandidate = useCallback(
+    (trackId: string) => {
+      if (isShowcase) {
+        advanceCurrentTrack(trackId);
+        return;
+      }
+      playMutation.mutate(trackId);
+    },
+    [advanceCurrentTrack, isShowcase, playMutation],
+  );
 
   useEffect(() => {
-    if (!currentTrackId && firstReadyTrack) {
-      setCurrentTrackId(firstReadyTrack.track_id);
-      localStorage.setItem("cuemate.current", firstReadyTrack.track_id);
+    if (!playlists.data) return;
+    const nextPlaylist = playlistItems.find((item) => item.playlist_id === selectedPlaylistId) ?? playlistItems[0];
+    if (!nextPlaylist) {
+      if (selectedPlaylistId) {
+        setSelectedPlaylistId("");
+        localStorage.removeItem("cuemate.playlist");
+      }
+      if (currentTrackId) {
+        setCurrentTrackId("");
+        localStorage.removeItem("cuemate.current");
+      }
+      if (history.length > 0) {
+        setHistory([]);
+        localStorage.removeItem("cuemate.history");
+      }
+      return;
     }
-  }, [currentTrackId, firstReadyTrack]);
+    if (nextPlaylist.playlist_id !== selectedPlaylistId) {
+      setSelectedPlaylistId(nextPlaylist.playlist_id);
+      localStorage.setItem("cuemate.playlist", nextPlaylist.playlist_id);
+      setCurrentTrackId("");
+      setHistory([]);
+      setSelectedCandidate(null);
+      localStorage.removeItem("cuemate.current");
+      localStorage.removeItem("cuemate.history");
+    }
+  }, [currentTrackId, history.length, playlistItems, playlists.data, selectedPlaylistId]);
+
+  useEffect(() => {
+    if (!selectedPlaylistId || !playlistTracks.data) return;
+    const playlistChanged = previousSelectedPlaylistRef.current !== selectedPlaylistId;
+    previousSelectedPlaylistRef.current = selectedPlaylistId;
+    const trackItems = playlistTracks.data.items;
+    const currentTrackStillExists = trackItems.some((item) => item.track_id === currentTrackId);
+    if (currentTrackId && currentTrackStillExists && !playlistChanged) return;
+    const nextTrack = trackItems.find((item) => item.analysis_state === "ready") ?? trackItems[0];
+    if (!nextTrack) {
+      if (currentTrackId) {
+        setCurrentTrackId("");
+        setSelectedCandidate(null);
+        localStorage.removeItem("cuemate.current");
+      }
+      return;
+    }
+    if (nextTrack.track_id !== currentTrackId) {
+      setCurrentTrackId(nextTrack.track_id);
+      setSelectedCandidate(null);
+      localStorage.setItem("cuemate.current", nextTrack.track_id);
+    }
+  }, [currentTrackId, playlistTracks.data, selectedPlaylistId]);
+
+  useEffect(() => {
+    if (workMode !== "full" && mobileTab === "admin") {
+      setMobileTab("recommend");
+    }
+  }, [mobileTab, workMode]);
 
   const shellClass = `app-shell mode-${workMode} tab-${mobileTab}`;
 
@@ -480,7 +638,7 @@ export function App() {
       <header className="topbar">
         <div>
           <p className="eyebrow">CueMate Engine</p>
-          <h1>Performance Control</h1>
+          <h1>{isShowcase ? "Showcase Control" : "Performance Control"}</h1>
         </div>
         <div className="status-row">
           <div className="mode-switch" aria-label="Workspace mode">
@@ -502,6 +660,21 @@ export function App() {
           <span className={metadata.data?.breaker_open ? "pill hot" : "pill cyan"}>
             {metadata.data?.breaker_open ? "breaker open" : "breaker calm"}
           </span>
+          {canShutdown ? (
+            <button
+              className="shutdown-button"
+              type="button"
+              disabled={shutdownMutation.isPending}
+              onClick={() => {
+                if (window.confirm("Quit CueMate and stop the local API, scorer, workers, and model containers?")) {
+                  shutdownMutation.mutate();
+                }
+              }}
+              title="Quit CueMate"
+            >
+              <Power size={15} /> {shutdownMutation.isPending ? "Closing" : "Quit"}
+            </button>
+          ) : null}
         </div>
       </header>
       <div className="global-status-stack">
@@ -513,7 +686,7 @@ export function App() {
           </div>
         ) : null}
         <SetupStatusBanner status={setupStatus.data} />
-        <OperationBanner message={operationMessage} run={activeToolRun.data} status={analysisStatus.data} />
+        {!isShowcase ? <OperationBanner message={operationMessage} run={activeToolRun.data} status={analysisStatus.data} /> : null}
       </div>
 
       <aside className="library-pane panel mobile-library">
@@ -523,17 +696,19 @@ export function App() {
         ) : (playlists.data?.items.length ?? 0) === 0 ? (
           <div className="empty-library">
             <strong>No playlists yet</strong>
-            <span>Import local files or a DJ library from Full Mode to get started.</span>
-            <button
-              className="wide-action secondary"
-              onClick={() => {
-                setWorkMode("full");
-                setMobileTab("admin");
-                localStorage.setItem("cuemate.mode", "full");
-              }}
-            >
-              Open import tools
-            </button>
+            <span>{isShowcase ? "This showcase snapshot does not include any playlists yet." : "Import local files or a DJ library from Full Mode to get started."}</span>
+            {!isShowcase ? (
+              <button
+                className="wide-action secondary"
+                onClick={() => {
+                  setWorkMode("full");
+                  setMobileTab("admin");
+                  localStorage.setItem("cuemate.mode", "full");
+                }}
+              >
+                Open import tools
+              </button>
+            ) : null}
           </div>
         ) : (
           <PlaylistList
@@ -544,6 +719,7 @@ export function App() {
               localStorage.setItem("cuemate.playlist", id);
               setCurrentTrackId("");
               setHistory([]);
+              setSelectedCandidate(null);
               localStorage.removeItem("cuemate.current");
               localStorage.removeItem("cuemate.history");
             }}
@@ -555,12 +731,16 @@ export function App() {
         </div>
         {tracks.isLoading ? (
           <SkeletonRows count={6} />
+        ) : tracks.error ? (
+          <div className="empty-state danger">{tracks.error.message}</div>
         ) : (
           <TrackList
             tracks={tracks.data?.items ?? []}
             currentTrackId={currentTrackId}
+            showcaseMode={isShowcase}
             onSelect={(track) => {
               setCurrentTrackId(track.track_id);
+              setSelectedCandidate(null);
               localStorage.setItem("cuemate.current", track.track_id);
             }}
           />
@@ -612,14 +792,15 @@ export function App() {
       </main>
 
       <aside className="detail-pane panel mobile-feedback">
-        <CurrentTrackInfo track={currentTrack} playlistId={selectedPlaylist?.playlist_id} />
+        <CurrentTrackInfo track={currentTrack} playlistId={selectedPlaylist?.playlist_id} showcaseMode={isShowcase} />
         {workMode === "live" ? (
           <>
             <LiveCandidatePanel
               candidate={selectedCandidate}
               response={recommendations.data}
-              onConfirm={(trackId) => playMutation.mutate(trackId)}
-              confirming={playMutation.isPending}
+              onConfirm={confirmCandidate}
+              confirming={!isShowcase && playMutation.isPending}
+              showcaseMode={isShowcase}
             />
             <CandidateSignalPanel candidate={selectedCandidate} playlistId={selectedPlaylist?.playlist_id} />
           </>
@@ -628,16 +809,17 @@ export function App() {
             <CandidateDetail
               candidate={selectedCandidate}
               response={recommendations.data}
-              onConfirm={(trackId) => playMutation.mutate(trackId)}
-              confirming={playMutation.isPending}
+              onConfirm={confirmCandidate}
+              confirming={!isShowcase && playMutation.isPending}
+              showcaseMode={isShowcase}
             />
-            <FullCandidateAnalysisPanel candidate={selectedCandidate} playlistId={selectedPlaylist?.playlist_id} />
+            {!isShowcase ? <FullCandidateAnalysisPanel candidate={selectedCandidate} playlistId={selectedPlaylist?.playlist_id} /> : null}
             <FeedbackPanel feedback={feedback.data} />
           </>
         )}
       </aside>
 
-      {workMode === "full" ? (
+      {workMode === "full" && !isShowcase ? (
         <aside className="admin-pane panel mobile-admin">
           <FullToolsPanel
             playlist={selectedPlaylist}
@@ -652,9 +834,11 @@ export function App() {
             queueResult={refreshMutation.data?.refresh.queued_count}
             onRemovePlaylist={(id) => removePlaylistMutation.mutate(id)}
             removeBusy={removePlaylistMutation.isPending}
-            onRunWorker={() => toolMutation.mutate({ action: "run_analysis_worker", limit: 1000 })}
+            onRunWorker={() => toolMutation.mutate({ action: "run_analysis_worker", playlist_id: selectedPlaylistId, limit: ANALYSIS_WORKER_BATCH_LIMIT })}
+            onStopWorkers={() => stopWorkersMutation.mutate()}
             onTool={(payload) => toolMutation.mutate(payload)}
             toolBusy={toolMutation.isPending}
+            stopWorkersBusy={stopWorkersMutation.isPending}
             toolResult={lastToolResult}
             toolError={toolMutation.error}
             toolRun={activeToolRun.data}
@@ -667,6 +851,15 @@ export function App() {
             onGenerateRemotePair={() => remotePairMutation.mutate()}
             remotePairBusy={remotePairMutation.isPending}
             remotePairError={remotePairMutation.error}
+          />
+        </aside>
+      ) : null}
+
+      {workMode === "full" && isShowcase ? (
+        <aside className="admin-pane panel mobile-admin">
+          <ShowcaseFullPanel
+            candidate={selectedCandidate}
+            playlistId={selectedPlaylist?.playlist_id}
           />
         </aside>
       ) : null}
@@ -700,6 +893,14 @@ function StatusDot({ label, ok, loading }: { label: string; ok: boolean; loading
 
 function SetupStatusBanner({ status }: { status?: SetupStatus }) {
   if (!status?.available) return null;
+  if (status.mode === "showcase" || status.read_only) {
+    return (
+      <div className="setup-banner">
+        <Eye size={16} />
+        <span>Showcase mode is read-only. Browse the curated library and try live recommendations without importing files.</span>
+      </div>
+    );
+  }
   const isBlocked = status.status === "blocked" || status.status === "failed";
   const modelPending = status.core_ready && (!status.docker_ready || !status.model_ready);
   if (!isBlocked && !modelPending) return null;
@@ -787,7 +988,17 @@ function SkeletonRows({ count }: { count: number }) {
   );
 }
 
-function TrackList({ tracks, currentTrackId, onSelect }: { tracks: Track[]; currentTrackId: string; onSelect: (track: Track) => void }) {
+function TrackList({
+  tracks,
+  currentTrackId,
+  showcaseMode = false,
+  onSelect,
+}: {
+  tracks: Track[];
+  currentTrackId: string;
+  showcaseMode?: boolean;
+  onSelect: (track: Track) => void;
+}) {
   return (
     <div className="track-list">
       {tracks.map((track) => (
@@ -797,7 +1008,7 @@ function TrackList({ tracks, currentTrackId, onSelect }: { tracks: Track[]; curr
             <strong>{track.title || track.track_id}</strong>
             <small>{track.artist || "Unknown artist"}</small>
           </span>
-          <span className={pillClass(track.analysis_state)}>{track.analysis_state}</span>
+          {!showcaseMode ? <span className={pillClass(track.analysis_state)}>{track.analysis_state}</span> : null}
         </button>
       ))}
     </div>
@@ -821,11 +1032,12 @@ function RecommendationBoard({
   if (error) return <div className="empty-state danger">{error.message}</div>;
   if (!response) return <div className="empty-state">Choose a ready track to open the lanes.</div>;
   if (response.recommendations_status !== "available") {
+    const statusNote = recommendationUnavailableMessage(response);
     return (
       <div className="empty-state danger">
         <AlertTriangle />
-        <strong>{response.recommendations_status}</strong>
-        <span>{response.meta.status_note ?? response.meta.fallback_note ?? "Recommendations are unavailable."}</span>
+        <strong>{response.recommendations_status === "requires_reanalysis" ? "Analysis incomplete" : response.recommendations_status}</strong>
+        <span>{statusNote}</span>
       </div>
     );
   }
@@ -892,20 +1104,29 @@ function RecommendationBoard({
   );
 }
 
+function recommendationUnavailableMessage(response: RecommendationResponse) {
+  if (response.recommendations_status === "requires_reanalysis") {
+    return "Playlist analysis needs to finish before CueMate can show recommendation data for this track.";
+  }
+  return response.meta.status_note ?? response.meta.fallback_note ?? "Recommendations are unavailable.";
+}
+
 function CandidateDetail({
   candidate,
   response,
   onConfirm,
   confirming,
+  showcaseMode = false,
 }: {
   candidate: LaneItem | null;
   response?: RecommendationResponse;
   onConfirm: (trackId: string) => void;
   confirming: boolean;
+  showcaseMode?: boolean;
 }) {
   return (
     <section className="detail-block">
-      <PaneTitle icon={<Sparkles />} title="Candidate" action={response?.meta.recommendation_event_id ? "event armed" : "preview"} />
+      <PaneTitle icon={<Sparkles />} title="Candidate" action={showcaseMode ? "showcase" : response?.meta.recommendation_event_id ? "event armed" : "preview"} />
       {!candidate ? (
         <p className="muted">Select a recommendation to inspect why it works, what to watch, and how to hand it off.</p>
       ) : (
@@ -922,11 +1143,15 @@ function CandidateDetail({
             <Metric label="Risk" value={candidate.risk} hint={metricDescriptions.Risk} />
             <Metric label="Confidence" value={pct(candidate.move_confidence)} hint={metricDescriptions.Confidence} />
           </div>
-          <button className="wide-action confirm-next" disabled={confirming || !response?.meta.recommendation_event_id} onClick={() => onConfirm(candidate.track_id)}>
+          <button className="wide-action confirm-next" disabled={confirming || (!showcaseMode && !response?.meta.recommendation_event_id)} onClick={() => onConfirm(candidate.track_id)}>
             <Check size={16} />
-            {confirming ? "Setting next song..." : "Set as next song and make current"}
+            {confirming ? "Setting next song..." : showcaseMode ? "Use as current track" : "Set as next song and make current"}
           </button>
-          <p className="action-note">Records this recommendation as played, adds the previous base to history, and rescans from this track.</p>
+          <p className="action-note">
+            {showcaseMode
+              ? "Advances the demo session in this browser only; the public showcase database stays unchanged."
+              : "Records this recommendation as played, adds the previous base to history, and rescans from this track."}
+          </p>
           <NoteList title="Reasons" notes={candidate.reasons} />
           <NoteList title="Watchouts" notes={candidate.watchouts} />
           <NoteList title="Handoff" notes={candidate.explanation.handoff?.notes ?? []} />
@@ -936,7 +1161,7 @@ function CandidateDetail({
   );
 }
 
-function CurrentTrackInfo({ track, playlistId }: { track?: Track; playlistId?: string }) {
+function CurrentTrackInfo({ track, playlistId, showcaseMode = false }: { track?: Track; playlistId?: string; showcaseMode?: boolean }) {
   const [expanded, setExpanded] = useState(false);
   const detailId = useId();
   const features = useQuery({
@@ -1045,7 +1270,7 @@ function CurrentTrackInfo({ track, playlistId }: { track?: Track; playlistId?: s
                 <span>{insight?.bpm == null ? "BPM pending" : `${insight.bpm.toFixed(1)} BPM`}</span>
                 <span>{insight?.key ?? "key pending"}</span>
                 <span>{insight?.intensity ?? "band pending"}</span>
-                <span>{track.analysis_state}</span>
+                {!showcaseMode ? <span>{track.analysis_state}</span> : null}
               </div>
               {track.role_hints.length ? (
                 <div className="mini-tags">
@@ -1083,15 +1308,17 @@ function LiveCandidatePanel({
   response,
   onConfirm,
   confirming,
+  showcaseMode = false,
 }: {
   candidate: LaneItem | null;
   response?: RecommendationResponse;
   onConfirm: (trackId: string) => void;
   confirming: boolean;
+  showcaseMode?: boolean;
 }) {
   return (
     <section className="detail-block live-candidate-card">
-      <PaneTitle icon={<Sparkles />} title="Selected Next" action={response?.meta.recommendation_event_id ? "ready" : "preview"} />
+      <PaneTitle icon={<Sparkles />} title="Selected Next" action={showcaseMode ? "showcase" : response?.meta.recommendation_event_id ? "ready" : "preview"} />
       {!candidate ? (
         <p className="muted">Select a recommendation to inspect the next-song read.</p>
       ) : (
@@ -1116,9 +1343,9 @@ function LiveCandidatePanel({
               <strong>{pct(candidate.move_confidence)}</strong>
             </span>
           </div>
-          <button className="wide-action confirm-next" disabled={confirming || !response?.meta.recommendation_event_id} onClick={() => onConfirm(candidate.track_id)}>
+          <button className="wide-action confirm-next" disabled={confirming || (!showcaseMode && !response?.meta.recommendation_event_id)} onClick={() => onConfirm(candidate.track_id)}>
             <Check size={16} />
-            {confirming ? "Setting next song..." : "Set as next song and make current"}
+            {confirming ? "Setting next song..." : showcaseMode ? "Use as current track" : "Set as next song and make current"}
           </button>
         </>
       )}
@@ -1716,6 +1943,17 @@ function FeedbackPanel({ feedback }: { feedback?: FeedbackSummary }) {
   );
 }
 
+function ShowcaseFullPanel({ candidate, playlistId }: { candidate: LaneItem | null; playlistId?: string }) {
+  return (
+    <div className="full-tools">
+      <PaneTitle icon={<Eye />} title="Full Mode" action="track data" />
+      <p className="mode-note">Select a recommendation to inspect its score drivers, transition read, and full analysis bars.</p>
+      <CandidateSignalPanel candidate={candidate} playlistId={playlistId} />
+      <FullCandidateAnalysisPanel candidate={candidate} playlistId={playlistId} />
+    </div>
+  );
+}
+
 function FullToolsPanel({
   playlist,
   candidate,
@@ -1730,8 +1968,10 @@ function FullToolsPanel({
   onRemovePlaylist,
   removeBusy,
   onRunWorker,
+  onStopWorkers,
   onTool,
   toolBusy,
+  stopWorkersBusy,
   toolResult,
   toolError,
   toolRun,
@@ -1758,8 +1998,10 @@ function FullToolsPanel({
   onRemovePlaylist: (playlistId: string) => void;
   removeBusy: boolean;
   onRunWorker: () => void;
+  onStopWorkers: () => void;
   onTool: (payload: ToolCommandRequest) => void;
   toolBusy: boolean;
+  stopWorkersBusy: boolean;
   toolResult: ToolCommandResult | null;
   toolError: Error | null;
   toolRun?: ToolRunStatus;
@@ -1790,6 +2032,13 @@ function FullToolsPanel({
     .filter(Boolean);
   const pickerBusy = pickPathMutation.isPending;
   const pickerError = pickPathMutation.error instanceof Error ? pickPathMutation.error.message : null;
+  const localImportDisabledReason = toolBusy
+    ? "Import is already running."
+    : !localPathList.length
+      ? "Choose files/folders or paste at least one path."
+      : !localName.trim()
+        ? "Add a CueMate playlist name."
+        : "";
 
   const applyDJPlaylistOptions = useCallback((names: string[]) => {
     setDjPlaylistOptions(names);
@@ -1849,12 +2098,18 @@ function FullToolsPanel({
   }, [djLibrary, djSource, loadDJPlaylistOptions]);
 
   const appendLocalPaths = (paths: string[]) => {
+    const cleanPaths = paths.map((item) => item.trim()).filter(Boolean);
+    if (!cleanPaths.length) return;
+    if (!localName.trim()) {
+      const first = cleanPaths[0].split(/[\\/]/).filter(Boolean).pop();
+      if (first) setLocalName(first.replace(/\.[^.]+$/, ""));
+    }
     setLocalPaths((current) => {
       const existing = current
         .split(/\r?\n/)
         .map((item) => item.trim())
         .filter(Boolean);
-      const next = Array.from(new Set([...existing, ...paths.map((item) => item.trim()).filter(Boolean)]));
+      const next = Array.from(new Set([...existing, ...cleanPaths]));
       return next.join("\n");
     });
   };
@@ -1902,9 +2157,11 @@ function FullToolsPanel({
           queueBusy={queueBusy}
           queueResult={queueResult}
           workerBusy={toolBusy}
+          stopWorkersBusy={stopWorkersBusy}
           onSmartRefresh={onSmartRefresh}
           onForceRefresh={onForceRefresh}
           onRunWorker={onRunWorker}
+          onStopWorkers={onStopWorkers}
           onRemovePlaylist={onRemovePlaylist}
           removeBusy={removeBusy}
         />
@@ -1930,11 +2187,12 @@ function FullToolsPanel({
         </div>
         <button
           className="wide-action"
-          disabled={toolBusy || !localName.trim() || localPathList.length === 0}
+          disabled={Boolean(localImportDisabledReason)}
           onClick={() => onTool({ action: "import_playlist", name: localName, paths: localPathList })}
         >
           <FolderPlus size={16} /> Import local playlist
         </button>
+        {localImportDisabledReason ? <p className="selection-summary">{localImportDisabledReason}</p> : null}
       </ToolSection>
 
       <ToolSection icon={<ListMusic />} title="Import DJ library" description="Pull an existing Rekordbox, Traktor, or Serato playlist into CueMate.">
@@ -2070,9 +2328,11 @@ function PlaylistSetupPanel({
   queueBusy,
   queueResult,
   workerBusy,
+  stopWorkersBusy,
   onSmartRefresh,
   onForceRefresh,
   onRunWorker,
+  onStopWorkers,
   onRemovePlaylist,
   removeBusy,
 }: {
@@ -2083,9 +2343,11 @@ function PlaylistSetupPanel({
   queueBusy: boolean;
   queueResult?: number;
   workerBusy: boolean;
+  stopWorkersBusy: boolean;
   onSmartRefresh: () => void;
   onForceRefresh: () => void;
   onRunWorker: () => void;
+  onStopWorkers: () => void;
   onRemovePlaylist: (playlistId: string) => void;
   removeBusy: boolean;
 }) {
@@ -2161,6 +2423,9 @@ function PlaylistSetupPanel({
           <button className="wide-action secondary" disabled={workerBusy} onClick={onRunWorker}>
             <PlayCircle size={16} /> {workerBusy ? "Worker running..." : "Run analysis worker"}
           </button>
+          <button className="wide-action secondary danger-soft" disabled={stopWorkersBusy || running === 0} onClick={onStopWorkers}>
+            {stopWorkersBusy ? "Stopping workers..." : "Stop analysis workers"}
+          </button>
           {queueResult != null ? <p className="muted">{queueResult} analysis jobs queued.</p> : null}
           <button className="wide-action danger" disabled={removeBusy} onClick={confirmRemove}>
             {removeBusy ? "Removing..." : "Remove playlist from CueMate"}
@@ -2186,10 +2451,10 @@ function setupStateLabel(status?: PlaylistAnalysisStatus, playlist?: Playlist) {
 function setupGuidance(status: PlaylistAnalysisStatus | undefined, total: number, ready: number) {
   if (!total) return "Import tracks first. CueMate will analyse them before recommendations become useful.";
   if (status?.jobs.failed) return "Some analysis jobs failed. Check the tool output below, then try Smart refresh again.";
-  if (status?.jobs.running) return status.outdated_tracks ? "Reanalysis is running. Existing rows are old and recommendations unlock as current jobs finish." : "Analysis is running. This page will update as tracks become ready.";
-  if (status?.jobs.pending) return status.outdated_tracks ? "Reanalysis is queued. Run the analysis worker if nothing is moving." : "Analysis is queued. Run the analysis worker if nothing is moving.";
-  if (status?.is_stale) return `Out of date: ${status.stale_reason || "playlist analysis needs refresh"}. Smart refresh will queue only what changed.`;
-  if (status?.outdated_tracks) return `${status.outdated_tracks} track${status.outdated_tracks === 1 ? "" : "s"} need reanalysis for the current scoring engine.`;
+  if (status?.jobs.running) return "Playlist analysis needs to finish before CueMate can show the full recommendation data. This page will update as each batch completes.";
+  if (status?.jobs.pending) return "Playlist analysis is not fully done yet. Keep the worker running to unlock recommendation data for every track.";
+  if (status?.is_stale) return "Playlist analysis needs to be fully refreshed before CueMate can show current recommendation data. Smart refresh will queue only what changed.";
+  if (status?.outdated_tracks) return "Playlist analysis needs to be fully refreshed before CueMate can show current recommendation data.";
   if (ready < total) return "Some tracks still need analysis. Smart refresh queues only missing or outdated work.";
   return "Ready. Recommendations can use this playlist now.";
 }

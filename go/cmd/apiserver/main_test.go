@@ -236,6 +236,56 @@ func TestRecommendationsCreatesRecommendationEvent(t *testing.T) {
 	}
 }
 
+func TestShowcaseRecommendationsDoNotCreateRecommendationEvent(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+		recResp: &scoringv1.GetRecommendationsResponse{
+			RecommendationsStatus: "available",
+			CurrentTrack:          &scoringv1.TrackContext{TrackId: "trk_current"},
+			Meta: &scoringv1.RecommendationMeta{
+				Target:           "maintain",
+				TotalCandidates:  2,
+				ScoredCandidates: 1,
+				CurrentTrackId:   "trk_current",
+			},
+			LaneOrder: []string{"maintain", "build", "reset", "jump", "contrast"},
+			Lanes: []*scoringv1.RecommendationLane{
+				{
+					LaneGroup:    &scoringv1.LaneGroup{LaneId: "maintain"},
+					Availability: "available",
+					Items: []*scoringv1.ScoredCandidate{
+						{Candidate: &scoringv1.TrackContext{TrackId: "trk_candidate"}, FinalScore: 0.9},
+					},
+				},
+			},
+			ActiveSignatures: &scoringv1.SignatureMetadata{ScoringContractId: "m3-v1"},
+		},
+	})
+	srv.showcase = true
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/recommendations", bytes.NewBufferString(`{"playlist_name":"Test Playlist","current_track_id":"trk_current"}`))
+	srv.handleRecommendations(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	meta := payload["meta"].(map[string]any)
+	if meta["recommendation_event_id"] != nil {
+		t.Fatalf("recommendation_event_id = %#v, want nil", meta["recommendation_event_id"])
+	}
+	var count int
+	if err := srv.repo.DB().QueryRow(`SELECT COUNT(*) FROM recommendation_events`).Scan(&count); err != nil {
+		t.Fatalf("count recommendation_events: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("recommendation_events count = %d, want 0", count)
+	}
+}
+
 func TestRecommendationEventsClampsNegativeLimit(t *testing.T) {
 	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
 		metadataResp: fakeMetadata("rel_sig_current"),
@@ -1122,6 +1172,15 @@ func TestRemoteAccessBlocksAdminRoutesEvenWithSession(t *testing.T) {
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
 	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/app/shutdown", bytes.NewBufferString(`{}`))
+	req.Host = "cue.example"
+	req.AddCookie(&http.Cookie{Name: "cuemate_remote_session", Value: sessionSecret})
+	srv.remoteAccessMiddleware(http.HandlerFunc(srv.handleAppShutdown)).ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("shutdown status = %d body=%s", rec.Code, rec.Body.String())
+	}
 }
 
 func TestRemoteAccessDoesNotTrustSpoofedHostHeader(t *testing.T) {
@@ -1134,6 +1193,22 @@ func TestRemoteAccessDoesNotTrustSpoofedHostHeader(t *testing.T) {
 	req.RemoteAddr = "203.0.113.10:49152"
 	srv.remoteAccessMiddleware(http.HandlerFunc(srv.handlePlaylists)).ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestShowcaseModeBypassesRemotePairing(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+	srv.showcase = true
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/setup/status", nil)
+	req.RemoteAddr = "203.0.113.10:49152"
+	srv.remoteAccessMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})).ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
 		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
 	}
 }
@@ -1299,6 +1374,114 @@ func TestSetupStatusReadsInstallerState(t *testing.T) {
 	}
 }
 
+func TestSetupStatusReportsShowcaseMode(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+	srv.showcase = true
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/setup/status", nil)
+	srv.handleSetupStatus(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	if payload["mode"] != "showcase" || payload["read_only"] != true || payload["status"] != "complete" {
+		t.Fatalf("setup payload = %#v", payload)
+	}
+}
+
+func TestShowcaseModeRejectsMutatingEndpoints(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+	srv.showcase = true
+	cases := []struct {
+		name   string
+		path   string
+		method string
+		body   string
+		call   func(http.ResponseWriter, *http.Request)
+	}{
+		{
+			name:   "playlist delete",
+			path:   "/playlists/pl_1",
+			method: http.MethodDelete,
+			call:   srv.handlePlaylistRoutes,
+		},
+		{
+			name:   "analysis enqueue",
+			path:   "/playlists/pl_1/analysis/enqueue",
+			method: http.MethodPost,
+			body:   `{"analysis_mode":"staged"}`,
+			call:   srv.handlePlaylistRoutes,
+		},
+		{
+			name:   "played event",
+			path:   "/events/played",
+			method: http.MethodPost,
+			body:   `{"recommendation_event_id":"evt_1","chosen_track_id":"trk_candidate"}`,
+			call:   srv.handlePlayedEvent,
+		},
+		{
+			name:   "tool command",
+			path:   "/tools/cli",
+			method: http.MethodPost,
+			body:   `{}`,
+			call:   srv.handleToolCommand,
+		},
+		{
+			name:   "app shutdown",
+			path:   "/app/shutdown",
+			method: http.MethodPost,
+			body:   `{}`,
+			call:   srv.handleAppShutdown,
+		},
+		{
+			name:   "analysis workers stop",
+			path:   "/analysis/workers/stop",
+			method: http.MethodPost,
+			body:   `{}`,
+			call:   srv.handleStopAnalysisWorkers,
+		},
+		{
+			name:   "remote token",
+			path:   "/remote/pairing-token",
+			method: http.MethodPost,
+			body:   `{"device_label":"Phone"}`,
+			call:   srv.handleRemotePairingToken,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(tc.method, tc.path, bytes.NewBufferString(tc.body))
+			tc.call(rec, req)
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+			}
+			var payload map[string]string
+			if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+				t.Fatalf("json: %v", err)
+			}
+			if payload["error"] != "CueMate showcase mode is read-only." {
+				t.Fatalf("payload = %#v", payload)
+			}
+		})
+	}
+}
+
+func TestLoadConfigRecognizesShowcaseMode(t *testing.T) {
+	t.Setenv("CUEMATE_SHOWCASE_MODE", "1")
+	cfg := loadConfig()
+	if !cfg.Showcase {
+		t.Fatalf("Showcase = false, want true")
+	}
+}
+
 func TestClientPlaylistAndTrackBrowseEndpoints(t *testing.T) {
 	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
 		metadataResp: fakeMetadata("rel_sig_current"),
@@ -1321,6 +1504,27 @@ func TestClientPlaylistAndTrackBrowseEndpoints(t *testing.T) {
 
 	req = httptest.NewRequest(http.MethodGet, "/playlists/pl_1/tracks?query=Candidate", nil)
 	rec = httptest.NewRecorder()
+	srv.handlePlaylistRoutes(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var tracks map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &tracks); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	trackItems := tracks["items"].([]any)
+	if len(trackItems) != 1 || trackItems[0].(map[string]any)["track_id"] != "trk_candidate" {
+		t.Fatalf("tracks = %#v", tracks)
+	}
+}
+
+func TestClientPlaylistTracksDoesNotRequireScorerMetadata(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataErr: status.Error(codes.Unavailable, "scorer down"),
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/playlists/pl_1/tracks?query=Candidate", nil)
+	rec := httptest.NewRecorder()
 	srv.handlePlaylistRoutes(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
@@ -1425,6 +1629,23 @@ func TestBuildToolCommandRejectsOptionLikeUserValues(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "must not start with '-'") {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestBuildToolCommandCapsAnalysisWorkerBatch(t *testing.T) {
+	args, background, err := buildToolCommand(toolCommandRequest{
+		Action: "run_analysis_worker",
+		Limit:  1000,
+	})
+	if err != nil {
+		t.Fatalf("buildToolCommand() error = %v", err)
+	}
+	if !background {
+		t.Fatalf("background = false")
+	}
+	want := []string{"-m", pythonModule, "run-analysis-worker", "--limit", "5"}
+	if fmt.Sprint(args) != fmt.Sprint(want) {
+		t.Fatalf("args = %#v, want %#v", args, want)
 	}
 }
 

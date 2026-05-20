@@ -145,6 +145,7 @@ function Assert-StagedRuntime {
         @{ Path = (Join-Path $stageRoot "scripts\docker-compose.ps1"); Description = "runtime scripts" },
         @{ Path = (Join-Path $stageRoot "Bootstrap-CueMate.ps1"); Description = "bootstrap script" },
         @{ Path = (Join-Path $stageRoot "Start-CueMate.ps1"); Description = "launcher script" },
+        @{ Path = (Join-Path $stageRoot "Stop-CueMate.ps1"); Description = "shutdown script" },
         @{ Path = (Join-Path $stageRoot "CueMate-Common.psm1"); Description = "shared PowerShell module" },
         @{ Path = (Join-Path $stageRoot "README.md"); Description = "user README" },
         @{ Path = (Join-Path $stageRoot ".env.example"); Description = "environment example" }
@@ -188,6 +189,7 @@ Copy-Item (Join-Path $repoRoot ".env.example") (Join-Path $stageRoot ".env.examp
 Copy-Item (Join-Path $repoRoot "README.md") (Join-Path $stageRoot "README.md") -Force
 Copy-Item (Join-Path $packagingRoot "Bootstrap-CueMate.ps1") (Join-Path $stageRoot "Bootstrap-CueMate.ps1") -Force
 Copy-Item (Join-Path $packagingRoot "Start-CueMate.ps1") (Join-Path $stageRoot "Start-CueMate.ps1") -Force
+Copy-Item (Join-Path $packagingRoot "Stop-CueMate.ps1") (Join-Path $stageRoot "Stop-CueMate.ps1") -Force
 Copy-Item (Join-Path $packagingRoot "CueMate-Common.psm1") (Join-Path $stageRoot "CueMate-Common.psm1") -Force
 Set-Content -Path (Join-Path $stageRoot "VERSION") -Value $Version -Encoding UTF8
 

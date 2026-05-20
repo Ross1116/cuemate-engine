@@ -44,6 +44,7 @@ type appConfig struct {
 	Addr     string
 	Database string
 	WebDist  string
+	Showcase bool
 }
 
 type recommendationRequest struct {
@@ -114,6 +115,7 @@ type toolCommandRequest struct {
 	Paths                   []string `json:"paths"`
 	Source                  string   `json:"source"`
 	Library                 string   `json:"library"`
+	PlaylistID              string   `json:"playlist_id"`
 	Playlist                string   `json:"playlist"`
 	AnalysisMode            string   `json:"analysis_mode"`
 	Force                   bool     `json:"force"`
@@ -127,8 +129,9 @@ type pickPathRequest struct {
 }
 
 type server struct {
-	repo    *recommendationsrepo.Repository
-	runtime *scoringruntime.Runtime
+	repo     *recommendationsrepo.Repository
+	runtime  *scoringruntime.Runtime
+	showcase bool
 }
 
 func main() {
@@ -151,7 +154,7 @@ func run() int {
 	}
 	defer runtime.Close()
 
-	srv := &server{repo: repo, runtime: runtime}
+	srv := &server{repo: repo, runtime: runtime, showcase: cfg.Showcase}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", srv.handleHealthz)
 	mux.HandleFunc("/readyz", srv.handleReadyz)
@@ -161,6 +164,7 @@ func run() int {
 	mux.HandleFunc("/playlists/", srv.handlePlaylistRoutes)
 	mux.HandleFunc("/tracks/search", srv.handleTrackSearch)
 	mux.HandleFunc("/analysis/jobs", srv.handleAnalysisJobs)
+	mux.HandleFunc("/analysis/workers/stop", srv.handleStopAnalysisWorkers)
 	mux.HandleFunc("/recommendation-events", srv.handleRecommendationEvents)
 	mux.HandleFunc("/recommendations", srv.handleRecommendations)
 	mux.HandleFunc("/events/played", srv.handlePlayedEvent)
@@ -174,6 +178,7 @@ func run() int {
 	mux.HandleFunc("/remote/pairing-token", srv.handleRemotePairingToken)
 	mux.HandleFunc("/remote/pair", srv.handleRemotePair)
 	mux.HandleFunc("/remote/logout", srv.handleRemoteLogout)
+	mux.HandleFunc("/app/shutdown", srv.handleAppShutdown)
 	mux.HandleFunc("/tools/cli", srv.handleToolCommand)
 	mux.HandleFunc("/tools/runs/", srv.handleToolRun)
 	mux.HandleFunc("/tools/pick-path", srv.handlePickPath)
@@ -232,7 +237,25 @@ func loadConfig() appConfig {
 		Addr:     addr,
 		Database: strings.TrimPrefix(databaseURL, "sqlite:"),
 		WebDist:  firstNonEmpty(strings.TrimSpace(os.Getenv("WEB_DIST_DIR")), "web/dist"),
+		Showcase: truthyEnv("CUEMATE_SHOWCASE_MODE"),
 	}
+}
+
+func truthyEnv(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *server) rejectShowcaseWrite(w http.ResponseWriter) bool {
+	if !s.showcase {
+		return false
+	}
+	writeJSON(w, http.StatusForbidden, map[string]string{"error": "CueMate showcase mode is read-only."})
+	return true
 }
 
 func (s *server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
@@ -260,11 +283,26 @@ func (s *server) handleSetupStatus(w http.ResponseWriter, r *http.Request) {
 		"status":       "unknown",
 		"step":         "",
 		"message":      "",
+		"mode":         "local",
+		"read_only":    false,
 		"core_ready":   true,
 		"docker_ready": false,
 		"model_ready":  false,
 		"mobile_ready": remoteBaseURL() != "",
 		"log_dir":      nullIfEmpty(logDir),
+	}
+	if s.showcase {
+		payload["available"] = true
+		payload["status"] = "complete"
+		payload["step"] = "showcase"
+		payload["message"] = "CueMate is running in hosted showcase mode."
+		payload["mode"] = "showcase"
+		payload["read_only"] = true
+		payload["docker_ready"] = false
+		payload["model_ready"] = false
+		payload["mobile_ready"] = false
+		writeJSON(w, http.StatusOK, payload)
+		return
 	}
 	if statePath == "" {
 		writeJSON(w, http.StatusOK, payload)
@@ -350,6 +388,10 @@ func handleWebApp(webDist string) http.HandlerFunc {
 
 func (s *server) remoteAccessMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.showcase {
+			next.ServeHTTP(w, r)
+			return
+		}
 		if isLocalRequest(r) || isRemotePublicRequest(r) {
 			next.ServeHTTP(w, r)
 			return
@@ -408,6 +450,7 @@ func isAPIPath(path string) bool {
 		"/corrections",
 		"/sync/",
 		"/setup/",
+		"/app/",
 		"/tools/",
 		"/remote/",
 	} {
@@ -419,12 +462,91 @@ func isAPIPath(path string) bool {
 }
 
 func isRemoteBlockedPath(path string) bool {
-	for _, prefix := range []string{"/tools/", "/analysis/", "/corrections", "/sync/outbox", "/remote/pairing-token"} {
+	for _, prefix := range []string{"/app/", "/tools/", "/analysis/", "/corrections", "/sync/outbox", "/remote/pairing-token"} {
 		if path == strings.TrimSuffix(prefix, "/") || strings.HasPrefix(path, prefix) {
 			return true
 		}
 	}
 	return false
+}
+
+func (s *server) handleAppShutdown(w http.ResponseWriter, r *http.Request) {
+	if s.rejectShowcaseWrite(w) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	if !isLoopbackRemoteAddr(r.RemoteAddr) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "shutdown is only available from this computer"})
+		return
+	}
+	scriptPath, err := cueMateShutdownScriptPath()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	cmd := exec.Command(
+		"powershell.exe",
+		"-NoProfile",
+		"-ExecutionPolicy",
+		"Bypass",
+		"-File",
+		scriptPath,
+		"-ApiPid",
+		strconv.Itoa(os.Getpid()),
+		"-DelaySeconds",
+		"1",
+	)
+	if err := cmd.Start(); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"status": "shutting_down",
+		"pid":    cmd.Process.Pid,
+	})
+}
+
+func isLoopbackRemoteAddr(remoteAddr string) bool {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = remoteAddr
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
+}
+
+func cueMateShutdownScriptPath() (string, error) {
+	candidates := []string{}
+	if installDir := strings.TrimSpace(os.Getenv("CUEMATE_INSTALL_DIR")); installDir != "" {
+		candidates = append(candidates, filepath.Join(installDir, "Stop-CueMate.ps1"))
+	}
+	if exe, err := os.Executable(); err == nil {
+		candidates = append(candidates, filepath.Join(filepath.Dir(exe), "Stop-CueMate.ps1"))
+	}
+	if cwd, err := os.Getwd(); err == nil {
+		candidates = append(
+			candidates,
+			filepath.Join(cwd, "Stop-CueMate.ps1"),
+			filepath.Join(cwd, "packaging", "windows", "Stop-CueMate.ps1"),
+			filepath.Join(cwd, "..", "packaging", "windows", "Stop-CueMate.ps1"),
+		)
+	}
+	for _, candidate := range candidates {
+		if candidate == "" {
+			continue
+		}
+		abs, err := filepath.Abs(candidate)
+		if err != nil {
+			continue
+		}
+		if info, err := os.Stat(abs); err == nil && !info.IsDir() {
+			return abs, nil
+		}
+	}
+	return "", errors.New("Stop-CueMate.ps1 was not found")
 }
 
 func (s *server) remoteSession(r *http.Request) (*recommendationsrepo.RemoteSession, bool) {
@@ -490,6 +612,9 @@ func (s *server) handlePlaylistRoutes(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) handlePlaylistDetail(w http.ResponseWriter, r *http.Request, playlistID string) {
 	if r.Method == http.MethodDelete {
+		if s.rejectShowcaseWrite(w) {
+			return
+		}
 		if err := s.repo.DeletePlaylist(r.Context(), playlistID); err != nil {
 			status := http.StatusInternalServerError
 			if errors.Is(err, recommendationsrepo.ErrPlaylistNotFound) {
@@ -546,10 +671,6 @@ func (s *server) handlePlaylistTracks(w http.ResponseWriter, r *http.Request, pl
 	metadata, metadataErr := s.runtime.RefreshMetadata(r.Context())
 	if metadataErr != nil {
 		metadata = s.runtime.CachedMetadata()
-		if metadata == nil {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": scoringruntime.DescribeUnavailable(metadataErr)})
-			return
-		}
 	}
 	var analysisSignature, configSignature, scoringContractID string
 	if metadata != nil {
@@ -627,6 +748,76 @@ func (s *server) handleAnalysisJobs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }
 
+func (s *server) handleStopAnalysisWorkers(w http.ResponseWriter, r *http.Request) {
+	if s.rejectShowcaseWrite(w) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	if !isLoopbackRemoteAddr(r.RemoteAddr) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "analysis workers can only be stopped from this computer"})
+		return
+	}
+	playlistID := strings.TrimSpace(r.URL.Query().Get("playlist_id"))
+	stoppedProcesses, stopErr := stopCueMateAnalysisWorkerProcesses(r.Context(), playlistID)
+	payload := map[string]any{
+		"status":            "stopped",
+		"stopped_processes": stoppedProcesses,
+		"requeued_jobs":     int64(0),
+	}
+	if stopErr != nil {
+		payload["status"] = "failed"
+		payload["error"] = stopErr.Error()
+		writeJSON(w, http.StatusInternalServerError, payload)
+		return
+	}
+	requeuedJobs, requeueErr := s.repo.RequeueRunningAnalysisJobs(r.Context(), playlistID)
+	if requeueErr != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": requeueErr.Error()})
+		return
+	}
+	payload["requeued_jobs"] = requeuedJobs
+	writeJSON(w, http.StatusOK, payload)
+}
+
+func stopCueMateAnalysisWorkerProcesses(ctx context.Context, playlistID string) (int, error) {
+	script := `
+param([string]$PlaylistId)
+$targets = Get-CimInstance Win32_Process |
+  Where-Object {
+    if (-not $_.CommandLine -or $_.CommandLine -notmatch 'cuemate_analysis\s+run-analysis-worker') {
+      return $false
+    }
+    if ([string]::IsNullOrWhiteSpace($PlaylistId)) {
+      return $true
+    }
+    return $_.CommandLine -match ('--playlist-id\s+(""{0}""|''{0}''|{0})(\s|$)' -f [regex]::Escape($PlaylistId))
+  }
+$count = 0
+foreach ($target in $targets) {
+  try {
+    Stop-Process -Id $target.ProcessId -Force -ErrorAction Stop
+    $count += 1
+  } catch {
+  }
+}
+Write-Output $count
+`
+	cmdCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	output, err := exec.CommandContext(cmdCtx, "powershell.exe", "-NoProfile", "-Command", script, "-PlaylistId", playlistID).CombinedOutput()
+	if err != nil {
+		return 0, fmt.Errorf("stop worker processes: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	count, err := strconv.Atoi(strings.TrimSpace(string(output)))
+	if err != nil {
+		return 0, fmt.Errorf("parse stopped worker count %q: %w", strings.TrimSpace(string(output)), err)
+	}
+	return count, nil
+}
+
 func (s *server) handleRecommendationEvents(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
@@ -664,6 +855,9 @@ func boundedRecommendationEvents(events []recommendationsrepo.RecommendationEven
 }
 
 func (s *server) handleToolCommand(w http.ResponseWriter, r *http.Request) {
+	if s.rejectShowcaseWrite(w) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
@@ -725,6 +919,9 @@ func (s *server) handleToolCommand(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handlePickPath(w http.ResponseWriter, r *http.Request) {
+	if s.rejectShowcaseWrite(w) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
@@ -776,6 +973,9 @@ func parsePickerPaths(output []byte) ([]string, error) {
 }
 
 func (s *server) handleToolRun(w http.ResponseWriter, r *http.Request) {
+	if s.rejectShowcaseWrite(w) {
+		return
+	}
 	if r.Method != http.MethodGet {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
@@ -943,8 +1143,15 @@ func buildToolCommand(req toolCommandRequest) ([]string, bool, error) {
 		}
 		return args, true, nil
 	case "run_analysis_worker":
-		limit := boundedPositive(req.Limit, 100, 1000)
+		limit := boundedPositive(req.Limit, 5, 5)
 		args = append(args, "run-analysis-worker", "--limit", strconv.Itoa(limit))
+		playlistID, err := safeCLIValue(req.PlaylistID, "playlist_id")
+		if err != nil {
+			return nil, false, err
+		}
+		if playlistID != "" {
+			args = append(args, "--playlist-id", playlistID)
+		}
 		if req.PrintBackendDiagnostics {
 			args = append(args, "--print-backend-diagnostics")
 		}
@@ -973,6 +1180,10 @@ func startBackgroundToolCommand(pythonExe string, cliArgs []string) (map[string]
 	runID := uuid.NewString()
 	logDir := toolRunDir()
 	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		return nil, err
+	}
+	logDir, err := filepath.Abs(logDir)
+	if err != nil {
 		return nil, err
 	}
 	startedAt := time.Now().UTC().Format(time.RFC3339Nano)
@@ -1028,7 +1239,13 @@ func startBackgroundToolCommand(pythonExe string, cliArgs []string) (map[string]
 
 func toolRunDir() string {
 	if logDir := strings.TrimSpace(os.Getenv("CUEMATE_LOG_DIR")); logDir != "" {
+		if abs, err := filepath.Abs(filepath.Join(logDir, "tool-runs")); err == nil {
+			return abs
+		}
 		return filepath.Join(logDir, "tool-runs")
+	}
+	if abs, err := filepath.Abs(filepath.Join("tmp", "tool-runs")); err == nil {
+		return abs
 	}
 	return filepath.Join("tmp", "tool-runs")
 }
@@ -1184,6 +1401,9 @@ func validAnalysisMode(mode string) bool {
 }
 
 func (s *server) handlePlaylistAnalysisEnqueue(w http.ResponseWriter, r *http.Request, playlistID string) {
+	if s.rejectShowcaseWrite(w) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
@@ -1249,6 +1469,9 @@ func (s *server) handlePlaylistAnalysisStatus(w http.ResponseWriter, r *http.Req
 }
 
 func (s *server) handlePlaylistAnalysisRefresh(w http.ResponseWriter, r *http.Request, playlistID string) {
+	if s.rejectShowcaseWrite(w) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
@@ -1364,6 +1587,9 @@ func (s *server) handleRecommendations(w http.ResponseWriter, r *http.Request) {
 	}
 
 	request := buildRecommendationsRequest(hydrated, target, req.MaxPerLane)
+	if s.showcase {
+		applyActiveSignaturesForShowcase(request, metadata.GetActiveSignatures())
+	}
 	response, err := s.runtime.GetRecommendations(r.Context(), request)
 	if err != nil {
 		switch {
@@ -1379,6 +1605,12 @@ func (s *server) handleRecommendations(w http.ResponseWriter, r *http.Request) {
 
 	payload := translateRecommendationsResponse(response)
 	applyPlaylistWeightSource(payload, hydrated.Stats)
+	if s.showcase {
+		meta := payload["meta"].(map[string]any)
+		meta["recommendation_event_id"] = nil
+		writeJSON(w, http.StatusOK, payload)
+		return
+	}
 	eventID, err := s.recordRecommendationEvent(r.Context(), hydrated, response, payload)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -1390,6 +1622,9 @@ func (s *server) handleRecommendations(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handlePlayedEvent(w http.ResponseWriter, r *http.Request) {
+	if s.rejectShowcaseWrite(w) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
@@ -1494,6 +1729,9 @@ func (s *server) handlePlayedEvent(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleCorrections(w http.ResponseWriter, r *http.Request) {
+	if s.rejectShowcaseWrite(w) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
@@ -1675,6 +1913,9 @@ func (s *server) handleCorrections(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
+	if s.rejectShowcaseWrite(w) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
@@ -1815,6 +2056,9 @@ func (s *server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleSnapshotAck(w http.ResponseWriter, r *http.Request) {
+	if s.rejectShowcaseWrite(w) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
@@ -1849,6 +2093,9 @@ func (s *server) handleSnapshotAck(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleOutboxPull(w http.ResponseWriter, r *http.Request) {
+	if s.rejectShowcaseWrite(w) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
@@ -1894,6 +2141,9 @@ func (s *server) handleOutboxPull(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleOutboxAck(w http.ResponseWriter, r *http.Request) {
+	if s.rejectShowcaseWrite(w) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
@@ -1939,6 +2189,9 @@ func (s *server) handleRemoteStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleRemotePairingToken(w http.ResponseWriter, r *http.Request) {
+	if s.rejectShowcaseWrite(w) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
@@ -1977,6 +2230,9 @@ func (s *server) handleRemotePairingToken(w http.ResponseWriter, r *http.Request
 }
 
 func (s *server) handleRemotePair(w http.ResponseWriter, r *http.Request) {
+	if s.rejectShowcaseWrite(w) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
@@ -2024,6 +2280,9 @@ func (s *server) handleRemotePair(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleRemoteLogout(w http.ResponseWriter, r *http.Request) {
+	if s.rejectShowcaseWrite(w) {
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
 		return
@@ -2183,6 +2442,25 @@ func signaturePayloadFromRecord(item recommendationsrepo.TrackContextRecord) *sc
 		AnalysisSignature: stringValue(item.AnalysisSignature),
 		ConfigSignature:   stringValue(item.ConfigSignature),
 		ScoringContractId: stringValue(item.ScoringContractAtAnalysis),
+	}
+}
+
+func applyActiveSignaturesForShowcase(req *scoringv1.GetRecommendationsRequest, signatures *scoringv1.SignatureMetadata) {
+	if req == nil || signatures == nil {
+		return
+	}
+	active := &scoringv1.SignatureMetadata{
+		AnalysisSignature: signatures.GetAnalysisSignature(),
+		ConfigSignature:   signatures.GetConfigSignature(),
+		ScoringContractId: signatures.GetScoringContractId(),
+	}
+	if req.CurrentTrack != nil {
+		req.CurrentTrack.Signatures = active
+	}
+	for _, candidate := range req.Candidates {
+		if candidate != nil {
+			candidate.Signatures = active
+		}
 	}
 }
 

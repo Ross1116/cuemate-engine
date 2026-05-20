@@ -19,7 +19,15 @@ from cuemate_analysis.persistent_inference_cache import (
     resolve_inference_cache_path,
 )
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+
+def resolve_runtime_root() -> Path:
+    configured = os.getenv("CUEMATE_REPO_ROOT")
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return Path(__file__).resolve().parents[3]
+
+
+REPO_ROOT = resolve_runtime_root()
 DEFAULT_ESSENTIA_SEMANTIC_IMAGE = "cuemate-essentia-semantics:local"
 DEFAULT_ESSENTIA_SEMANTIC_SERVICE_NAME = "cuemate-essentia-semantics-service"
 DEFAULT_ESSENTIA_SEMANTIC_SERVICE_PORT = 47833

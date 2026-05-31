@@ -64,6 +64,9 @@ with sqlite3.connect(db_path) as conn:
     if playlist_count < 1:
         raise SystemExit("Showcase export requires at least one playlist.")
 
+    if "spotify_url" not in columns(conn, "playlists"):
+        conn.execute("ALTER TABLE playlists ADD COLUMN spotify_url TEXT")
+
     if "file_path" in columns(conn, "tracks"):
         conn.execute("UPDATE tracks SET file_path = 'showcase://tracks/' || id")
     if "file_hash" in columns(conn, "tracks"):

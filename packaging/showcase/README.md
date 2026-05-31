@@ -16,7 +16,9 @@ The default output is:
 dist\showcase\cuemate-showcase.db
 ```
 
-The exporter keeps real track titles, artists, playlists, analysis values, playlist stats, recommendation events, and feedback history. It strips local file paths, file hashes, sessions, remote tokens, analysis jobs, sync state, manual corrections, and worker state.
+The exporter keeps real track titles, artists, playlists, Spotify playlist links, analysis values, playlist stats, recommendation events, and feedback history. It strips local file paths, file hashes, sessions, remote tokens, analysis jobs, sync state, manual corrections, and worker state.
+
+Spotify playlist buttons come from the `spotify_url` value saved on each playlist in the local dev app. Attach or clear those links in the dev UI, then export the showcase DB so the read-only demo uses the same values.
 
 ## Build And Run Locally
 

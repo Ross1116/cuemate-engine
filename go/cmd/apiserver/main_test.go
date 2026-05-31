@@ -1570,6 +1570,80 @@ func TestClientPlaylistAndTrackBrowseEndpoints(t *testing.T) {
 	}
 }
 
+func TestPlaylistSpotifyURLPersistsToPlaylistSummary(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+
+	req := httptest.NewRequest(http.MethodPut, "/playlists/pl_1/spotify-url", bytes.NewBufferString(`{"spotify_url":"https://open.spotify.com/playlist/demo123?si=abc"}`))
+	rec := httptest.NewRecorder()
+	srv.handlePlaylistRoutes(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var playlist map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &playlist); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	if playlist["spotify_url"] != "https://open.spotify.com/playlist/demo123?si=abc" {
+		t.Fatalf("playlist = %#v", playlist)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/playlists", nil)
+	rec = httptest.NewRecorder()
+	srv.handlePlaylists(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list status = %d body = %s", rec.Code, rec.Body.String())
+	}
+	var playlists map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &playlists); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	items := playlists["items"].([]any)
+	if items[0].(map[string]any)["spotify_url"] != "https://open.spotify.com/playlist/demo123?si=abc" {
+		t.Fatalf("playlists = %#v", playlists)
+	}
+}
+
+func TestPlaylistSpotifyURLRejectsLookalikeHosts(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+
+	req := httptest.NewRequest(http.MethodPut, "/playlists/pl_1/spotify-url", bytes.NewBufferString(`{"spotify_url":"https://open.spotify.com.evil.test/playlist/demo123"}`))
+	rec := httptest.NewRecorder()
+	srv.handlePlaylistRoutes(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPlaylistSpotifyURLAcceptsSpotifyLocalePlaylistPath(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+
+	req := httptest.NewRequest(http.MethodPut, "/playlists/pl_1/spotify-url", bytes.NewBufferString(`{"spotify_url":"https://open.spotify.com/intl-ja/playlist/demo123?si=abc"}`))
+	rec := httptest.NewRecorder()
+	srv.handlePlaylistRoutes(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPlaylistSpotifyURLAcceptsSpotifyAlbumPath(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+
+	req := httptest.NewRequest(http.MethodPut, "/playlists/pl_1/spotify-url", bytes.NewBufferString(`{"spotify_url":"https://open.spotify.com/album/2ClZ9xWAYg1BH8zkR96dJo?si=abc"}`))
+	rec := httptest.NewRecorder()
+	srv.handlePlaylistRoutes(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestClientPlaylistTracksDoesNotRequireScorerMetadata(t *testing.T) {
 	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
 		metadataErr: status.Error(codes.Unavailable, "scorer down"),

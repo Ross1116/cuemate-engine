@@ -109,6 +109,10 @@ type enqueueAnalysisRequest struct {
 	Force        bool   `json:"force"`
 }
 
+type playlistSpotifyURLRequest struct {
+	SpotifyURL string `json:"spotify_url"`
+}
+
 type toolCommandRequest struct {
 	Action                  string   `json:"action"`
 	Name                    string   `json:"name"`
@@ -590,6 +594,8 @@ func (s *server) handlePlaylistRoutes(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case len(parts) == 1 && (r.Method == http.MethodGet || r.Method == http.MethodDelete):
 		s.handlePlaylistDetail(w, r, playlistID)
+	case len(parts) == 2 && parts[1] == "spotify-url":
+		s.handlePlaylistSpotifyURL(w, r, playlistID)
 	case len(parts) == 2 && parts[1] == "tracks":
 		s.handlePlaylistTracks(w, r, playlistID)
 	case len(parts) == 4 && parts[1] == "tracks" && parts[3] == "features":
@@ -608,6 +614,36 @@ func (s *server) handlePlaylistRoutes(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "playlist route not found"})
 	}
+}
+
+func (s *server) handlePlaylistSpotifyURL(w http.ResponseWriter, r *http.Request, playlistID string) {
+	if s.rejectShowcaseWrite(w) {
+		return
+	}
+	if r.Method != http.MethodPut {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	var req playlistSpotifyURLRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	spotifyURL, err := normalizeSpotifyPlaylistURL(req.SpotifyURL)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	playlist, err := s.repo.UpdatePlaylistSpotifyURL(r.Context(), playlistID, spotifyURL, recommendationsrepo.NowUTC())
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, recommendationsrepo.ErrPlaylistNotFound) {
+			status = http.StatusNotFound
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, playlistSummaryPayload(playlist))
 }
 
 func (s *server) handlePlaylistDetail(w http.ResponseWriter, r *http.Request, playlistID string) {
@@ -1589,7 +1625,11 @@ func (s *server) handleRecommendations(w http.ResponseWriter, r *http.Request) {
 	}
 
 	request := buildRecommendationsRequest(hydrated, target, req.MaxPerLane)
-	applyActiveSignaturesForReadyTracks(request, metadata.GetActiveSignatures())
+	if s.showcase {
+		applyActiveSignaturesForShowcase(request, metadata.GetActiveSignatures())
+	} else {
+		applyActiveSignaturesForReadyTracks(request, metadata.GetActiveSignatures())
+	}
 	response, err := s.runtime.GetRecommendations(r.Context(), request)
 	if err != nil {
 		switch {
@@ -2464,6 +2504,25 @@ func applyActiveSignaturesForReadyTracks(req *scoringv1.GetRecommendationsReques
 	}
 }
 
+func applyActiveSignaturesForShowcase(req *scoringv1.GetRecommendationsRequest, signatures *scoringv1.SignatureMetadata) {
+	if req == nil || signatures == nil {
+		return
+	}
+	active := &scoringv1.SignatureMetadata{
+		AnalysisSignature: signatures.GetAnalysisSignature(),
+		ConfigSignature:   signatures.GetConfigSignature(),
+		ScoringContractId: signatures.GetScoringContractId(),
+	}
+	if req.CurrentTrack != nil {
+		req.CurrentTrack.Signatures = active
+	}
+	for _, candidate := range req.Candidates {
+		if candidate != nil {
+			candidate.Signatures = active
+		}
+	}
+}
+
 func applyActiveSignatureIfCompatible(track *scoringv1.TrackContext, active *scoringv1.SignatureMetadata) {
 	if track == nil || active == nil || track.Signatures == nil {
 		return
@@ -3241,6 +3300,7 @@ func playlistSummaryPayload(playlist recommendationsrepo.PlaylistSummary) map[st
 	return map[string]any{
 		"playlist_id":            playlist.ID,
 		"name":                   playlist.Name,
+		"spotify_url":            nullIfEmpty(playlist.SpotifyURL),
 		"track_count":            playlist.TrackCount,
 		"created_at":             playlist.CreatedAt,
 		"updated_at":             playlist.UpdatedAt,
@@ -3251,6 +3311,21 @@ func playlistSummaryPayload(playlist recommendationsrepo.PlaylistSummary) map[st
 		"feedback_event_count":   playlist.FeedbackEventCount,
 		"feedback_last_tuned_at": stringOrNil(playlist.FeedbackLastTunedAt),
 	}
+}
+
+func normalizeSpotifyPlaylistURL(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme != "https" || strings.ToLower(parsed.Hostname()) != "open.spotify.com" {
+		return "", errors.New("use a Spotify HTTPS link")
+	}
+	if len(strings.Split(strings.Trim(parsed.EscapedPath(), "/"), "/")) == 0 || strings.Trim(parsed.EscapedPath(), "/") == "" {
+		return "", errors.New("use a Spotify link")
+	}
+	return parsed.String(), nil
 }
 
 func playlistStatsPayload(stats *recommendationsrepo.PlaylistStats) any {

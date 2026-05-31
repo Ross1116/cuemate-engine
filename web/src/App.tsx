@@ -9,6 +9,7 @@ import {
   ChevronDown,
   CircleHelp,
   Eye,
+  ExternalLink,
   FileAudio,
   FolderPlus,
   FolderOpen,
@@ -40,6 +41,7 @@ import {
 } from "./api";
 
 const targets = ["maintain", "build", "reset", "jump", "contrast"];
+const DEV_SPOTIFY_PLAYLIST_LINKS_KEY = "cuemate.devSpotifyPlaylistLinks";
 
 const targetDescriptions: Record<string, string> = {
   maintain: "Target mode: preserve the current energy and keep the handoff steady.",
@@ -88,6 +90,28 @@ function titleFor(track?: Pick<Track, "title" | "artist" | "track_id"> | null) {
   if (!track) return "No track selected";
   const title = track.title || track.track_id;
   return track.artist ? `${track.artist} - ${title}` : title;
+}
+
+function normalizedExternalUrl(value: unknown) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return "";
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== "https:") return "";
+    if (!url.hostname.endsWith("spotify.com")) return "";
+    return url.toString();
+  } catch {
+    return "";
+  }
+}
+
+function readDevSpotifyPlaylistLinks() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(DEV_SPOTIFY_PLAYLIST_LINKS_KEY) ?? "{}") as Record<string, unknown>;
+    return Object.fromEntries(Object.entries(parsed).map(([key, url]) => [key, normalizedExternalUrl(url)]).filter(([, url]) => url));
+  } catch {
+    return {} as Record<string, string>;
+  }
 }
 
 function helpFor(map: Record<string, string>, key: string, fallback: string) {
@@ -284,6 +308,7 @@ export function App() {
   const [remotePairQr, setRemotePairQr] = useState("");
   const [operationMessage, setOperationMessage] = useState("");
   const [activeRunId, setActiveRunId] = useState("");
+  const [devSpotifyPlaylistLinks, setDevSpotifyPlaylistLinks] = useState<Record<string, string>>(() => (import.meta.env.DEV ? readDevSpotifyPlaylistLinks() : {}));
   const consumedPairTokenRef = useRef("");
   const chainedWorkerRunRef = useRef("");
   const chainedWorkerPlaylistRef = useRef("");
@@ -546,6 +571,7 @@ export function App() {
   const selectedPlaylist = playlistItems.find((item) => item.playlist_id === selectedPlaylistId) ?? playlistItems[0];
   const currentTrack = playlistTracks.data?.items.find((item) => item.track_id === currentTrackId);
   const isShowcase = setupStatus.data?.mode === "showcase" || setupStatus.data?.read_only === true;
+  const spotifyPlaylistUrl = import.meta.env.DEV && selectedPlaylist ? (devSpotifyPlaylistLinks[selectedPlaylist.playlist_id] ?? "") : "";
   const canShutdown = !isShowcase && remoteStatus.data?.request_local === true;
   const apiUnavailable = !health.isLoading && (health.isError || health.data?.status !== "ok");
   const scorerUnavailable = !readiness.isLoading && (readiness.isError || readiness.data?.status !== "ready");
@@ -574,6 +600,20 @@ export function App() {
     },
     [advanceCurrentTrack, isShowcase, playMutation],
   );
+
+  const saveDevSpotifyPlaylistLink = useCallback((playlistId: string, rawUrl: string) => {
+    const url = normalizedExternalUrl(rawUrl);
+    setDevSpotifyPlaylistLinks((current) => {
+      const next = { ...current };
+      if (url) {
+        next[playlistId] = url;
+      } else {
+        delete next[playlistId];
+      }
+      localStorage.setItem(DEV_SPOTIFY_PLAYLIST_LINKS_KEY, JSON.stringify(next));
+      return next;
+    });
+  }, []);
 
   useEffect(() => {
     if (!playlists.data) return;
@@ -711,19 +751,25 @@ export function App() {
             ) : null}
           </div>
         ) : (
-          <PlaylistList
-            playlists={playlists.data?.items ?? []}
-            selectedId={selectedPlaylistId}
-            onSelect={(id) => {
-              setSelectedPlaylistId(id);
-              localStorage.setItem("cuemate.playlist", id);
-              setCurrentTrackId("");
-              setHistory([]);
-              setSelectedCandidate(null);
-              localStorage.removeItem("cuemate.current");
-              localStorage.removeItem("cuemate.history");
-            }}
-          />
+          <>
+            <PlaylistList
+              playlists={playlists.data?.items ?? []}
+              selectedId={selectedPlaylistId}
+              onSelect={(id) => {
+                setSelectedPlaylistId(id);
+                localStorage.setItem("cuemate.playlist", id);
+                setCurrentTrackId("");
+                setHistory([]);
+                setSelectedCandidate(null);
+                localStorage.removeItem("cuemate.current");
+                localStorage.removeItem("cuemate.history");
+              }}
+            />
+            {spotifyPlaylistUrl ? <SpotifyPlaylistLink url={spotifyPlaylistUrl} compact /> : null}
+            {import.meta.env.DEV && selectedPlaylist ? (
+              <DevSpotifyPlaylistEditor playlist={selectedPlaylist} value={spotifyPlaylistUrl} onSave={saveDevSpotifyPlaylistLink} />
+            ) : null}
+          </>
         )}
         <div className="searchbox">
           <Search size={16} />
@@ -750,7 +796,10 @@ export function App() {
       <main className="recommend-pane mobile-recommend">
         <section className="hero-panel">
           <div>
-            <p className="eyebrow">{selectedPlaylist?.name ?? "No playlist"}</p>
+            <div className="hero-eyebrow-row">
+              <p className="eyebrow">{selectedPlaylist?.name ?? "No playlist"}</p>
+              {spotifyPlaylistUrl ? <SpotifyPlaylistLink url={spotifyPlaylistUrl} /> : null}
+            </div>
             <h2>{titleFor(currentTrack)}</h2>
             <div className="meta-line">
               <span>{currentTrack?.bpm ? `${currentTrack.bpm.toFixed(1)} BPM` : "BPM pending"}</span>
@@ -965,6 +1014,39 @@ function PlaylistList({ playlists, selectedId, onSelect }: { playlists: Playlist
           </small>
         </button>
       ))}
+    </div>
+  );
+}
+
+function SpotifyPlaylistLink({ url, compact = false }: { url: string; compact?: boolean }) {
+  return (
+    <a className={compact ? "spotify-playlist-link compact" : "spotify-playlist-link"} href={url} target="_blank" rel="noreferrer">
+      <ListMusic size={16} />
+      <span>Open playlist on Spotify</span>
+      <ExternalLink size={14} />
+    </a>
+  );
+}
+
+function DevSpotifyPlaylistEditor({ playlist, value, onSave }: { playlist: Playlist; value: string; onSave: (playlistId: string, url: string) => void }) {
+  const [draft, setDraft] = useState(value);
+
+  useEffect(() => {
+    setDraft(value);
+  }, [playlist.playlist_id, value]);
+
+  const normalizedDraft = normalizedExternalUrl(draft);
+  const unchanged = normalizedDraft === value;
+  return (
+    <div className="dev-spotify-editor">
+      <label className="field-label">Dev Spotify playlist</label>
+      <div className="dev-spotify-row">
+        <input value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="https://open.spotify.com/playlist/..." />
+        <button className="wide-action secondary" disabled={unchanged || (draft.trim() !== "" && !normalizedDraft)} onClick={() => onSave(playlist.playlist_id, draft)}>
+          {normalizedDraft ? "Save" : value ? "Clear" : "Attach"}
+        </button>
+      </div>
+      {draft.trim() && !normalizedDraft ? <small className="selection-summary danger">Use a Spotify HTTPS playlist link.</small> : null}
     </div>
   );
 }

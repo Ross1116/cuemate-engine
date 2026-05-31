@@ -146,6 +146,58 @@ func TestRecommendationsHappyPath(t *testing.T) {
 	}
 }
 
+func TestRecommendationsNormalizesReadyCompatibleSignatures(t *testing.T) {
+	runtime := &fakeRuntimeClient{
+		metadataResp: &scoringv1.GetScoringMetadataResponse{
+			ActiveSignatures: &scoringv1.SignatureMetadata{
+				AnalysisSignature: "m1-newhash-tempo-tempocnn-modelA-auto-key-musicalkeycnn-modelB-auto-full_track-essentia-modelC",
+				ConfigSignature:   "default",
+				ScoringContractId: "m3-v1",
+			},
+			ExpectedRelativeSignature: "rel_sig_current",
+		},
+		recResp: &scoringv1.GetRecommendationsResponse{
+			RecommendationsStatus: "available",
+			CurrentTrack:          &scoringv1.TrackContext{TrackId: "trk_current"},
+			Meta:                  &scoringv1.RecommendationMeta{Target: "maintain", CurrentTrackId: "trk_current"},
+			LaneOrder:             []string{"maintain", "build", "reset", "jump", "contrast"},
+			ActiveSignatures:      &scoringv1.SignatureMetadata{ScoringContractId: "m3-v1"},
+			AppliedWeightAdaptation: &scoringv1.WeightAdaptation{
+				AdaptationId:     "static_weights",
+				ComponentWeights: map[string]float64{},
+			},
+		},
+	}
+	srv := newTestServer(t, false, "rel_sig_current", runtime)
+	if _, err := srv.repo.DB().Exec(`
+		UPDATE track_features_abs
+		SET analysis_signature = 'm1-oldhash-tempo-tempocnn-modelA-auto-key-musicalkeycnn-modelB-auto-full_track-essentia-modelC',
+		    config_signature = 'default',
+		    scoring_contract_id_at_analysis = 'm3-v1'
+	`); err != nil {
+		t.Fatalf("update signatures: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/recommendations", bytes.NewBufferString(`{"playlist_name":"Test Playlist","current_track_id":"trk_current"}`))
+	srv.handleRecommendations(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if runtime.lastRecReq == nil {
+		t.Fatalf("scorer request was not sent")
+	}
+	active := runtime.metadataResp.GetActiveSignatures().GetAnalysisSignature()
+	if got := runtime.lastRecReq.GetCurrentTrack().GetSignatures().GetAnalysisSignature(); got != active {
+		t.Fatalf("current analysis signature = %q, want active %q", got, active)
+	}
+	for _, candidate := range runtime.lastRecReq.GetCandidates() {
+		if got := candidate.GetSignatures().GetAnalysisSignature(); got != active {
+			t.Fatalf("candidate %s analysis signature = %q, want active %q", candidate.GetTrackId(), got, active)
+		}
+	}
+}
+
 func TestRecommendationsRequiresReanalysisWhenRelativeStatsAreStale(t *testing.T) {
 	srv := newTestServer(t, true, "rel_sig_current", &fakeRuntimeClient{
 		metadataResp: fakeMetadata("rel_sig_current"),
@@ -1584,7 +1636,7 @@ func TestQueuePlaylistAnalysisRequeuesStaleSignatures(t *testing.T) {
 		metadataResp: fakeMetadata("rel_sig_current"),
 	})
 
-	queued, err := srv.repo.QueuePlaylistAnalysis(context.Background(), "pl_1", "staged", false, "m1-ebd25381ebad", "default")
+	queued, err := srv.repo.QueuePlaylistAnalysis(context.Background(), "pl_1", "staged", false, "m1-ebd25381ebad", "default", "m3-v1")
 	if err != nil {
 		t.Fatalf("QueuePlaylistAnalysis(current signatures) error = %v", err)
 	}
@@ -1592,12 +1644,57 @@ func TestQueuePlaylistAnalysisRequeuesStaleSignatures(t *testing.T) {
 		t.Fatalf("queued current signatures = %d, want 0", queued)
 	}
 
-	queued, err = srv.repo.QueuePlaylistAnalysis(context.Background(), "pl_1", "staged", false, "m1-new", "default")
+	queued, err = srv.repo.QueuePlaylistAnalysis(context.Background(), "pl_1", "staged", false, "m1-new", "default", "m3-v1")
 	if err != nil {
 		t.Fatalf("QueuePlaylistAnalysis(stale signatures) error = %v", err)
 	}
 	if queued != 3 {
 		t.Fatalf("queued stale signatures = %d, want 3", queued)
+	}
+}
+
+func TestQueuePlaylistAnalysisKeepsCompatibleModelSignature(t *testing.T) {
+	srv := newTestServer(t, false, "rel_sig_current", &fakeRuntimeClient{
+		metadataResp: fakeMetadata("rel_sig_current"),
+	})
+	if _, err := srv.repo.DB().Exec(`
+		UPDATE track_features_abs
+		SET analysis_signature = 'm1-oldhash-tempo-tempocnn-modelA-auto-key-musicalkeycnn-modelB-auto-full_track-essentia-modelC',
+		    scoring_contract_id_at_analysis = 'm3-v1'
+	`); err != nil {
+		t.Fatalf("update signatures: %v", err)
+	}
+
+	queued, err := srv.repo.QueuePlaylistAnalysis(
+		context.Background(),
+		"pl_1",
+		"staged",
+		false,
+		"m1-newhash-tempo-tempocnn-modelA-auto-key-musicalkeycnn-modelB-auto-full_track-essentia-modelC",
+		"default",
+		"m3-v1",
+	)
+	if err != nil {
+		t.Fatalf("QueuePlaylistAnalysis(compatible model signature) error = %v", err)
+	}
+	if queued != 0 {
+		t.Fatalf("queued compatible model signature = %d, want 0", queued)
+	}
+
+	queued, err = srv.repo.QueuePlaylistAnalysis(
+		context.Background(),
+		"pl_1",
+		"staged",
+		false,
+		"m1-newhash-tempo-tempocnn-modelA-auto-key-musicalkeycnn-modelD-auto-full_track-essentia-modelC",
+		"default",
+		"m3-v1",
+	)
+	if err != nil {
+		t.Fatalf("QueuePlaylistAnalysis(changed model signature) error = %v", err)
+	}
+	if queued != 3 {
+		t.Fatalf("queued changed model signature = %d, want 3", queued)
 	}
 }
 

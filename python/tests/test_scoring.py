@@ -252,6 +252,39 @@ class TestScoringMetadata:
         assert status["requires_reanalysis"] is False
         assert status["reason"] == "compatible_but_not_exact"
 
+    def test_check_analysis_compatibility_accepts_same_model_signature(self):
+        metadata = get_scoring_metadata(
+            compatible_analysis_signatures=[
+                "m1-newhash-tempo-tempocnn-modelA-auto-key-musicalkeycnn-modelB-auto-full_track-essentia-modelC",
+            ],
+        )
+        status = check_analysis_compatibility(
+            "m1-oldhash-tempo-tempocnn-modelA-auto-key-musicalkeycnn-modelB-auto-full_track-essentia-modelC",
+            "default",
+            SCORING_CONTRACT_ID,
+            scoring_metadata=metadata,
+        )
+        assert status["exact_match"] is False
+        assert status["compatible"] is True
+        assert status["requires_reanalysis"] is False
+        assert status["reason"] == "compatible_but_not_exact"
+
+    def test_check_analysis_compatibility_rejects_changed_model_signature(self):
+        metadata = get_scoring_metadata(
+            compatible_analysis_signatures=[
+                "m1-newhash-tempo-tempocnn-modelA-auto-key-musicalkeycnn-modelB-auto-full_track-essentia-modelC",
+            ],
+        )
+        status = check_analysis_compatibility(
+            "m1-oldhash-tempo-tempocnn-modelA-auto-key-musicalkeycnn-modelD-auto-full_track-essentia-modelC",
+            "default",
+            SCORING_CONTRACT_ID,
+            scoring_metadata=metadata,
+        )
+        assert status["compatible"] is False
+        assert status["requires_reanalysis"] is True
+        assert status["reason"] == "analysis_signature_incompatible"
+
     def test_check_analysis_compatibility_rejects_missing_contract(self):
         metadata = get_scoring_metadata()
         active = metadata["active_signatures"]

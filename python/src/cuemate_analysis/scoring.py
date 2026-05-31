@@ -462,6 +462,29 @@ def get_scoring_metadata(
     }
 
 
+def _analysis_model_signature(signature: str | None) -> str | None:
+    signature = str(signature or "").strip()
+    if not signature.startswith("m1-"):
+        return None
+    rest = signature.removeprefix("m1-")
+    _, separator, model_signature = rest.partition("-")
+    if not separator or not model_signature:
+        return None
+    return model_signature
+
+
+def _analysis_signatures_compatible(track_signature: str, active_signature: str) -> bool:
+    if track_signature == active_signature or track_signature.startswith(f"{active_signature}-"):
+        return True
+    track_model_signature = _analysis_model_signature(track_signature)
+    active_model_signature = _analysis_model_signature(active_signature)
+    return (
+        track_model_signature is not None
+        and active_model_signature is not None
+        and track_model_signature == active_model_signature
+    )
+
+
 def check_analysis_compatibility(
     track_analysis_signature: str | None,
     track_config_signature: str | None,
@@ -508,9 +531,6 @@ def check_analysis_compatibility(
             ],
         }
 
-    def _analysis_family_match(track_sig: str, active_sig: str) -> bool:
-        return track_sig == active_sig or track_sig.startswith(f"{active_sig}-")
-
     analysis_exact = track_analysis_signature == active_analysis_signature
     config_exact = track_config_signature == active_config_signature
     if analysis_exact and config_exact:
@@ -525,7 +545,7 @@ def check_analysis_compatibility(
     notes: list[str] = []
     analysis_compatible = (
         track_analysis_signature in compatible_analysis_signatures
-        or any(_analysis_family_match(track_analysis_signature, sig) for sig in compatible_analysis_signatures)
+        or any(_analysis_signatures_compatible(track_analysis_signature, sig) for sig in compatible_analysis_signatures)
     )
     config_compatible = track_config_signature in compatible_config_signatures
     if not analysis_compatible:

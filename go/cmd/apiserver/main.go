@@ -1438,6 +1438,7 @@ func (s *server) handlePlaylistAnalysisEnqueue(w http.ResponseWriter, r *http.Re
 		req.Force,
 		active.GetAnalysisSignature(),
 		active.GetConfigSignature(),
+		active.GetScoringContractId(),
 	)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -1508,6 +1509,7 @@ func (s *server) handlePlaylistAnalysisRefresh(w http.ResponseWriter, r *http.Re
 		req.Force,
 		active.GetAnalysisSignature(),
 		active.GetConfigSignature(),
+		active.GetScoringContractId(),
 	)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -1587,9 +1589,7 @@ func (s *server) handleRecommendations(w http.ResponseWriter, r *http.Request) {
 	}
 
 	request := buildRecommendationsRequest(hydrated, target, req.MaxPerLane)
-	if s.showcase {
-		applyActiveSignaturesForShowcase(request, metadata.GetActiveSignatures())
-	}
+	applyActiveSignaturesForReadyTracks(request, metadata.GetActiveSignatures())
 	response, err := s.runtime.GetRecommendations(r.Context(), request)
 	if err != nil {
 		switch {
@@ -2445,7 +2445,7 @@ func signaturePayloadFromRecord(item recommendationsrepo.TrackContextRecord) *sc
 	}
 }
 
-func applyActiveSignaturesForShowcase(req *scoringv1.GetRecommendationsRequest, signatures *scoringv1.SignatureMetadata) {
+func applyActiveSignaturesForReadyTracks(req *scoringv1.GetRecommendationsRequest, signatures *scoringv1.SignatureMetadata) {
 	if req == nil || signatures == nil {
 		return
 	}
@@ -2455,12 +2455,33 @@ func applyActiveSignaturesForShowcase(req *scoringv1.GetRecommendationsRequest, 
 		ScoringContractId: signatures.GetScoringContractId(),
 	}
 	if req.CurrentTrack != nil {
-		req.CurrentTrack.Signatures = active
+		applyActiveSignatureIfCompatible(req.CurrentTrack, active)
 	}
 	for _, candidate := range req.Candidates {
 		if candidate != nil {
-			candidate.Signatures = active
+			applyActiveSignatureIfCompatible(candidate, active)
 		}
+	}
+}
+
+func applyActiveSignatureIfCompatible(track *scoringv1.TrackContext, active *scoringv1.SignatureMetadata) {
+	if track == nil || active == nil || track.Signatures == nil {
+		return
+	}
+	current := track.GetSignatures()
+	if !recommendationsrepo.AnalysisSignaturesCompatible(current.GetAnalysisSignature(), active.GetAnalysisSignature()) {
+		return
+	}
+	if current.GetConfigSignature() != active.GetConfigSignature() {
+		return
+	}
+	if current.GetScoringContractId() != active.GetScoringContractId() {
+		return
+	}
+	track.Signatures = &scoringv1.SignatureMetadata{
+		AnalysisSignature: active.GetAnalysisSignature(),
+		ConfigSignature:   active.GetConfigSignature(),
+		ScoringContractId: active.GetScoringContractId(),
 	}
 }
 

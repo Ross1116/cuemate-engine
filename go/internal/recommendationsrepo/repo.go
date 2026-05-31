@@ -699,7 +699,7 @@ func (r *Repository) GetPlaylistSnapshotTracks(ctx context.Context, playlistID s
 		switch {
 		case !analysisSig.Valid || !configSig.Valid || !scoringContract.Valid || !relTrackID.Valid:
 			track.AnalysisState = "unanalysed"
-		case strings.TrimSpace(analysisSignature) != "" && analysisSig.String != analysisSignature:
+		case strings.TrimSpace(analysisSignature) != "" && !AnalysisSignaturesCompatible(analysisSig.String, analysisSignature):
 			track.AnalysisState = "outdated"
 		case strings.TrimSpace(configSignature) != "" && configSig.String != configSignature:
 			track.AnalysisState = "outdated"
@@ -1071,6 +1071,7 @@ func (r *Repository) QueuePlaylistAnalysis(
 	force bool,
 	analysisSignature string,
 	configSignature string,
+	scoringContractID string,
 ) (int, error) {
 	if strings.TrimSpace(analysisMode) == "" {
 		analysisMode = "staged"
@@ -1083,6 +1084,7 @@ func (r *Repository) QueuePlaylistAnalysis(
 		  f.track_id,
 		  f.analysis_signature,
 		  f.config_signature,
+		  f.scoring_contract_id_at_analysis,
 		  EXISTS (
 		    SELECT 1
 		    FROM analysis_jobs aj
@@ -1113,6 +1115,7 @@ func (r *Repository) QueuePlaylistAnalysis(
 		activeJob         bool
 		storedAnalysisSig *string
 		storedConfigSig   *string
+		storedContractID  *string
 	}
 	var tracks []pendingTrack
 	for rows.Next() {
@@ -1121,8 +1124,9 @@ func (r *Repository) QueuePlaylistAnalysis(
 		var analyzedID sql.NullString
 		var storedAnalysisSig sql.NullString
 		var storedConfigSig sql.NullString
+		var storedContractID sql.NullString
 		var activeJobInt int
-		if err := rows.Scan(&item.id, &item.path, &fileHash, &analyzedID, &storedAnalysisSig, &storedConfigSig, &activeJobInt); err != nil {
+		if err := rows.Scan(&item.id, &item.path, &fileHash, &analyzedID, &storedAnalysisSig, &storedConfigSig, &storedContractID, &activeJobInt); err != nil {
 			return 0, err
 		}
 		if fileHash.Valid {
@@ -1133,6 +1137,9 @@ func (r *Repository) QueuePlaylistAnalysis(
 		}
 		if storedConfigSig.Valid {
 			item.storedConfigSig = &storedConfigSig.String
+		}
+		if storedContractID.Valid {
+			item.storedContractID = &storedContractID.String
 		}
 		item.analyzed = analyzedID.Valid
 		item.activeJob = activeJobInt != 0
@@ -1147,7 +1154,10 @@ func (r *Repository) QueuePlaylistAnalysis(
 		if track.activeJob {
 			continue
 		}
-		if track.analyzed && !force && stringPtrEqual(track.storedAnalysisSig, analysisSignature) && stringPtrEqual(track.storedConfigSig, configSignature) {
+		if track.analyzed && !force &&
+			stringPtrAnalysisCompatible(track.storedAnalysisSig, analysisSignature) &&
+			stringPtrEqual(track.storedConfigSig, configSignature) &&
+			stringPtrEqual(track.storedContractID, scoringContractID) {
 			continue
 		}
 		if _, err := r.CreateAnalysisJobWithKind(
@@ -1172,6 +1182,36 @@ func (r *Repository) QueuePlaylistAnalysis(
 
 func stringPtrEqual(value *string, expected string) bool {
 	return value != nil && *value == expected
+}
+
+func stringPtrAnalysisCompatible(value *string, expected string) bool {
+	return value != nil && AnalysisSignaturesCompatible(*value, expected)
+}
+
+func AnalysisSignaturesCompatible(stored, active string) bool {
+	stored = strings.TrimSpace(stored)
+	active = strings.TrimSpace(active)
+	if stored == "" || active == "" {
+		return false
+	}
+	if stored == active {
+		return true
+	}
+	storedModelSignature, storedOK := analysisModelSignature(stored)
+	activeModelSignature, activeOK := analysisModelSignature(active)
+	return storedOK && activeOK && storedModelSignature == activeModelSignature
+}
+
+func analysisModelSignature(signature string) (string, bool) {
+	if !strings.HasPrefix(signature, "m1-") {
+		return "", false
+	}
+	rest := strings.TrimPrefix(signature, "m1-")
+	idx := strings.Index(rest, "-")
+	if idx < 0 || idx == len(rest)-1 {
+		return "", false
+	}
+	return rest[idx+1:], true
 }
 
 func (r *Repository) ListAnalysisJobs(ctx context.Context, playlistID, status string, limit int) ([]AnalysisJobRecord, error) {

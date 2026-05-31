@@ -546,6 +546,75 @@ h1 {
   background: linear-gradient(180deg, var(--gradient-start), var(--gradient-end));
 }
 
+.spotify-playlist-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  width: fit-content;
+  max-width: 100%;
+  min-height: 30px;
+  margin-top: 0;
+  padding: 0 10px;
+  border: 1px solid rgba(127, 145, 82, 0.32);
+  border-radius: 8px;
+  color: var(--text);
+  background:
+    linear-gradient(135deg, rgba(30, 215, 96, 0.16), rgba(8, 32, 51, 0.24)),
+    rgba(231, 236, 235, 0.018);
+  font-size: 0.78rem;
+  font-weight: 900;
+  text-decoration: none;
+  transition: border-color 160ms ease, transform 160ms ease, filter 160ms ease;
+}
+
+.spotify-playlist-link:hover {
+  border-color: rgba(30, 215, 96, 0.42);
+  filter: brightness(1.06);
+  transform: translateY(-1px);
+}
+
+.spotify-playlist-link svg {
+  flex: 0 0 auto;
+  color: #8fca72;
+}
+
+.spotify-playlist-link span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.spotify-playlist-link.compact {
+  width: 100%;
+  margin-top: 0;
+  justify-content: center;
+}
+
+.dev-spotify-editor {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px dashed rgba(127, 145, 82, 0.28);
+  border-radius: 8px;
+  background: rgba(231, 236, 235, 0.018);
+}
+
+.dev-spotify-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.dev-spotify-row input {
+  min-width: 0;
+}
+
+.dev-spotify-row .wide-action {
+  min-height: 38px;
+  padding: 0 12px;
+}
+
 .searchbox {
   display: flex;
   align-items: center;
@@ -640,10 +709,10 @@ h1 {
   overflow: hidden;
   min-height: 148px;
   display: flex;
-  align-items: center;
+  align-items: stretch;
   justify-content: space-between;
-  gap: 20px;
-  padding: 22px 24px;
+  gap: 28px;
+  padding: 26px 28px;
   background:
     linear-gradient(115deg, rgba(127, 145, 82, 0.18), transparent 39%),
     linear-gradient(145deg, rgba(8, 32, 51, 0.54), transparent 61%),
@@ -670,14 +739,32 @@ h1 {
 .hero-panel > div:first-child {
   position: relative;
   z-index: 1;
+  display: grid;
+  align-content: center;
+  gap: 14px;
   min-width: 0;
-  padding-block: 2px;
+  padding-block: 4px;
+}
+
+.hero-eyebrow-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+}
+
+.hero-eyebrow-row .eyebrow {
+  margin: 0;
+}
+
+.hero-eyebrow-row .spotify-playlist-link {
+  margin-left: 2px;
 }
 
 .hero-panel h2 {
-  margin-bottom: 8px;
-  font-size: clamp(1.42rem, 2.08vw, 2.35rem);
-  line-height: 1.14;
+  margin: 0;
+  font-size: clamp(1.5rem, 2vw, 2.28rem);
+  line-height: 1.08;
   overflow-wrap: break-word;
   word-break: normal;
   text-wrap: balance;
@@ -686,6 +773,7 @@ h1 {
 .meta-line {
   flex-wrap: wrap;
   color: var(--muted);
+  gap: 8px;
 }
 
 .meta-line span {
@@ -704,6 +792,7 @@ h1 {
 .confidence-ring {
   position: relative;
   z-index: 1;
+  align-self: center;
   width: 116px;
   aspect-ratio: 1;
   border-radius: 50%;

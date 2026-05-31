@@ -1,6 +1,7 @@
 export type Playlist = {
   playlist_id: string;
   name: string;
+  spotify_url: string | null;
   track_count: number;
   track_count_analyzed: number;
   eligible_track_count: number;
@@ -319,6 +320,11 @@ export const api = {
     ),
   removePlaylist: (playlistId: string) =>
     request<{ removed: boolean; playlist_id: string }>(`/playlists/${encodeURIComponent(playlistId)}`, { method: "DELETE" }),
+  updatePlaylistSpotifyUrl: (playlistId: string, spotifyUrl: string) =>
+    request<Playlist>(`/playlists/${encodeURIComponent(playlistId)}/spotify-url`, {
+      method: "PUT",
+      body: JSON.stringify({ spotify_url: spotifyUrl }),
+    }),
   trackSearch: (playlistId: string, query: string) =>
     request<{ items: Track[] }>(
       `/tracks/search?playlist_id=${encodeURIComponent(playlistId)}&query=${encodeURIComponent(query)}&limit=50`,

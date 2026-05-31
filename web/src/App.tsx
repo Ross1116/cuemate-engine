@@ -41,7 +41,7 @@ import {
 } from "./api";
 
 const targets = ["maintain", "build", "reset", "jump", "contrast"];
-const DEV_SPOTIFY_PLAYLIST_LINKS_KEY = "cuemate.devSpotifyPlaylistLinks";
+const LEGACY_DEV_SPOTIFY_PLAYLIST_LINKS_KEY = "cuemate.devSpotifyPlaylistLinks";
 const SPOTIFY_ALLOWED_HOSTS = new Set(["open.spotify.com"]);
 
 const targetDescriptions: Record<string, string> = {
@@ -100,15 +100,16 @@ function normalizedExternalUrl(value: unknown) {
     const url = new URL(raw);
     if (url.protocol !== "https:") return "";
     if (!SPOTIFY_ALLOWED_HOSTS.has(url.hostname.toLowerCase())) return "";
+    if (url.pathname.split("/").filter(Boolean).length === 0) return "";
     return url.toString();
   } catch {
     return "";
   }
 }
 
-function readDevSpotifyPlaylistLinks() {
+function readLegacyDevSpotifyPlaylistLinks() {
   try {
-    const parsed = JSON.parse(localStorage.getItem(DEV_SPOTIFY_PLAYLIST_LINKS_KEY) ?? "{}") as Record<string, unknown>;
+    const parsed = JSON.parse(localStorage.getItem(LEGACY_DEV_SPOTIFY_PLAYLIST_LINKS_KEY) ?? "{}") as Record<string, unknown>;
     return Object.fromEntries(Object.entries(parsed).map(([key, url]) => [key, normalizedExternalUrl(url)]).filter(([, url]) => url));
   } catch {
     return {} as Record<string, string>;
@@ -309,13 +310,13 @@ export function App() {
   const [remotePairQr, setRemotePairQr] = useState("");
   const [operationMessage, setOperationMessage] = useState("");
   const [activeRunId, setActiveRunId] = useState("");
-  const [devSpotifyPlaylistLinks, setDevSpotifyPlaylistLinks] = useState<Record<string, string>>(() => (import.meta.env.DEV ? readDevSpotifyPlaylistLinks() : {}));
   const consumedPairTokenRef = useRef("");
   const chainedWorkerRunRef = useRef("");
   const chainedWorkerPlaylistRef = useRef("");
   const previousSelectedPlaylistRef = useRef("");
   const previousReadinessStatusRef = useRef<string | undefined>(undefined);
   const stopWorkerRequestedRef = useRef(false);
+  const migratedDevSpotifyLinksRef = useRef(false);
 
   const health = useQuery({ queryKey: ["health"], queryFn: api.health, refetchInterval: 15_000 });
   const readiness = useQuery({ queryKey: ["ready"], queryFn: api.readiness, refetchInterval: 15_000 });
@@ -511,6 +512,17 @@ export function App() {
     onError: (error) => setOperationMessage(`Stop failed: ${error instanceof Error ? error.message : "could not stop workers"}`),
   });
 
+  const spotifyPlaylistMutation = useMutation({
+    mutationFn: ({ playlistId, url }: { playlistId: string; url: string }) => api.updatePlaylistSpotifyUrl(playlistId, normalizedExternalUrl(url)),
+    onSuccess: (updated) => {
+      queryClient.setQueryData<{ items: Playlist[] }>(["playlists"], (current) =>
+        current ? { items: current.items.map((item) => (item.playlist_id === updated.playlist_id ? { ...item, ...updated } : item)) } : current,
+      );
+      setOperationMessage(updated.spotify_url ? "Spotify playlist link saved." : "Spotify playlist link cleared.");
+    },
+    onError: (error) => setOperationMessage(`Spotify link save failed: ${error instanceof Error ? error.message : "unknown error"}`),
+  });
+
   useEffect(() => {
     if (!activeToolRun.data || activeToolRun.data.status === "running") return;
     void queryClient.invalidateQueries({ queryKey: ["playlists"] });
@@ -568,11 +580,29 @@ export function App() {
     }
   }, [queryClient, readiness.data?.status]);
 
+  const isShowcase = setupStatus.data?.mode === "showcase" || setupStatus.data?.read_only === true;
+
+  useEffect(() => {
+    if (!import.meta.env.DEV || isShowcase || migratedDevSpotifyLinksRef.current || !playlists.data) return;
+    migratedDevSpotifyLinksRef.current = true;
+    const legacyLinks = readLegacyDevSpotifyPlaylistLinks();
+    const migrations = playlists.data.items
+      .filter((playlist) => !normalizedExternalUrl(playlist.spotify_url) && legacyLinks[playlist.playlist_id])
+      .map((playlist) => api.updatePlaylistSpotifyUrl(playlist.playlist_id, legacyLinks[playlist.playlist_id]));
+    if (!migrations.length) return;
+    void Promise.allSettled(migrations).then((results) => {
+      const savedCount = results.filter((result) => result.status === "fulfilled").length;
+      if (savedCount > 0) {
+        void queryClient.invalidateQueries({ queryKey: ["playlists"] });
+        setOperationMessage(`${savedCount} Spotify playlist link${savedCount === 1 ? "" : "s"} moved into the database.`);
+      }
+    });
+  }, [isShowcase, playlists.data, queryClient]);
+
   const playlistItems = useMemo(() => playlists.data?.items ?? [], [playlists.data]);
   const selectedPlaylist = playlistItems.find((item) => item.playlist_id === selectedPlaylistId) ?? playlistItems[0];
   const currentTrack = playlistTracks.data?.items.find((item) => item.track_id === currentTrackId);
-  const isShowcase = setupStatus.data?.mode === "showcase" || setupStatus.data?.read_only === true;
-  const spotifyPlaylistUrl = import.meta.env.DEV && selectedPlaylist ? (devSpotifyPlaylistLinks[selectedPlaylist.playlist_id] ?? "") : "";
+  const spotifyPlaylistUrl = selectedPlaylist ? normalizedExternalUrl(selectedPlaylist.spotify_url) : "";
   const canShutdown = !isShowcase && remoteStatus.data?.request_local === true;
   const apiUnavailable = !health.isLoading && (health.isError || health.data?.status !== "ok");
   const scorerUnavailable = !readiness.isLoading && (readiness.isError || readiness.data?.status !== "ready");
@@ -602,19 +632,12 @@ export function App() {
     [advanceCurrentTrack, isShowcase, playMutation],
   );
 
-  const saveDevSpotifyPlaylistLink = useCallback((playlistId: string, rawUrl: string) => {
-    const url = normalizedExternalUrl(rawUrl);
-    setDevSpotifyPlaylistLinks((current) => {
-      const next = { ...current };
-      if (url) {
-        next[playlistId] = url;
-      } else {
-        delete next[playlistId];
-      }
-      localStorage.setItem(DEV_SPOTIFY_PLAYLIST_LINKS_KEY, JSON.stringify(next));
-      return next;
-    });
-  }, []);
+  const saveDevSpotifyPlaylistLink = useCallback(
+    (playlistId: string, rawUrl: string) => {
+      spotifyPlaylistMutation.mutate({ playlistId, url: rawUrl });
+    },
+    [spotifyPlaylistMutation],
+  );
 
   useEffect(() => {
     if (!playlists.data) return;
@@ -767,8 +790,8 @@ export function App() {
               }}
             />
             {spotifyPlaylistUrl ? <SpotifyPlaylistLink url={spotifyPlaylistUrl} compact /> : null}
-            {import.meta.env.DEV && selectedPlaylist ? (
-              <DevSpotifyPlaylistEditor playlist={selectedPlaylist} value={spotifyPlaylistUrl} onSave={saveDevSpotifyPlaylistLink} />
+            {import.meta.env.DEV && !isShowcase && selectedPlaylist ? (
+              <DevSpotifyPlaylistEditor playlist={selectedPlaylist} value={spotifyPlaylistUrl} saving={spotifyPlaylistMutation.isPending} onSave={saveDevSpotifyPlaylistLink} />
             ) : null}
           </>
         )}
@@ -1023,13 +1046,23 @@ function SpotifyPlaylistLink({ url, compact = false }: { url: string; compact?: 
   return (
     <a className={compact ? "spotify-playlist-link compact" : "spotify-playlist-link"} href={url} target="_blank" rel="noreferrer">
       <ListMusic size={16} />
-      <span>Open playlist on Spotify</span>
+      <span>Open on Spotify</span>
       <ExternalLink size={14} />
     </a>
   );
 }
 
-function DevSpotifyPlaylistEditor({ playlist, value, onSave }: { playlist: Playlist; value: string; onSave: (playlistId: string, url: string) => void }) {
+function DevSpotifyPlaylistEditor({
+  playlist,
+  value,
+  saving,
+  onSave,
+}: {
+  playlist: Playlist;
+  value: string;
+  saving: boolean;
+  onSave: (playlistId: string, url: string) => void;
+}) {
   const [draft, setDraft] = useState(value);
 
   useEffect(() => {
@@ -1040,14 +1073,14 @@ function DevSpotifyPlaylistEditor({ playlist, value, onSave }: { playlist: Playl
   const unchanged = normalizedDraft === value;
   return (
     <div className="dev-spotify-editor">
-      <label className="field-label">Dev Spotify playlist</label>
+      <label className="field-label">Dev Spotify link</label>
       <div className="dev-spotify-row">
-        <input value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="https://open.spotify.com/playlist/..." />
-        <button className="wide-action secondary" disabled={unchanged || (draft.trim() !== "" && !normalizedDraft)} onClick={() => onSave(playlist.playlist_id, draft)}>
-          {normalizedDraft ? "Save" : value ? "Clear" : "Attach"}
+        <input value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="https://open.spotify.com/..." />
+        <button className="wide-action secondary" disabled={saving || unchanged || (draft.trim() !== "" && !normalizedDraft)} onClick={() => onSave(playlist.playlist_id, draft)}>
+          {saving ? "Saving" : normalizedDraft ? "Save" : value ? "Clear" : "Attach"}
         </button>
       </div>
-      {draft.trim() && !normalizedDraft ? <small className="selection-summary danger">Use a Spotify HTTPS playlist link.</small> : null}
+      {draft.trim() && !normalizedDraft ? <small className="selection-summary danger">Use a Spotify HTTPS link.</small> : null}
     </div>
   );
 }

@@ -24,6 +24,7 @@ CREATE TABLE playlists (
   id TEXT PRIMARY KEY,
   user_id TEXT NOT NULL DEFAULT 'local',
   name TEXT NOT NULL UNIQUE,
+  spotify_url TEXT,
   track_count INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL

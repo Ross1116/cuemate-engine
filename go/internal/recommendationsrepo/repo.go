@@ -29,6 +29,7 @@ type PlaylistRef struct {
 type PlaylistSummary struct {
 	ID                  string
 	Name                string
+	SpotifyURL          string
 	TrackCount          int
 	CreatedAt           string
 	UpdatedAt           string
@@ -319,6 +320,45 @@ func Open(path string) (*Repository, error) {
 	return &Repository{db: db}, nil
 }
 
+func playlistHasColumn(db *sql.DB, column string) (bool, error) {
+	rows, err := db.Query(`PRAGMA table_info("playlists")`)
+	if err != nil {
+		return false, fmt.Errorf("inspect playlists schema: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var cid int
+		var name, columnType string
+		var notNull int
+		var defaultValue any
+		var pk int
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
+			return false, fmt.Errorf("scan playlists schema: %w", err)
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("read playlists schema: %w", err)
+	}
+	return false, nil
+}
+
+func (r *Repository) ensurePlaylistSpotifyURLColumn(ctx context.Context) error {
+	hasSpotifyURL, err := playlistHasColumn(r.db, "spotify_url")
+	if err != nil {
+		return err
+	}
+	if !hasSpotifyURL {
+		if _, err := r.db.ExecContext(ctx, `ALTER TABLE playlists ADD COLUMN spotify_url TEXT`); err != nil {
+			return fmt.Errorf("add playlists.spotify_url: %w", err)
+		}
+	}
+	return nil
+}
+
 func (r *Repository) Close() error {
 	return r.db.Close()
 }
@@ -367,10 +407,19 @@ func (r *Repository) ResolvePlaylist(ctx context.Context, playlistID, playlistNa
 }
 
 func (r *Repository) ListPlaylists(ctx context.Context) ([]PlaylistSummary, error) {
-	rows, err := r.db.QueryContext(ctx, `
+	spotifyExpr := `''`
+	hasSpotifyURL, err := playlistHasColumn(r.db, "spotify_url")
+	if err != nil {
+		return nil, err
+	}
+	if hasSpotifyURL {
+		spotifyExpr = `COALESCE(p.spotify_url, '')`
+	}
+	rows, err := r.db.QueryContext(ctx, fmt.Sprintf(`
 		SELECT
 		  p.id,
 		  p.name,
+		  %s,
 		  p.track_count,
 		  p.created_at,
 		  p.updated_at,
@@ -383,7 +432,7 @@ func (r *Repository) ListPlaylists(ctx context.Context) ([]PlaylistSummary, erro
 		FROM playlists p
 		LEFT JOIN playlist_stats ps ON ps.playlist_id = p.id
 		ORDER BY p.updated_at DESC, p.name ASC
-	`)
+	`, spotifyExpr))
 	if err != nil {
 		return nil, err
 	}
@@ -397,6 +446,7 @@ func (r *Repository) ListPlaylists(ctx context.Context) ([]PlaylistSummary, erro
 		if err := rows.Scan(
 			&item.ID,
 			&item.Name,
+			&item.SpotifyURL,
 			&item.TrackCount,
 			&item.CreatedAt,
 			&item.UpdatedAt,
@@ -416,6 +466,39 @@ func (r *Repository) ListPlaylists(ctx context.Context) ([]PlaylistSummary, erro
 		out = append(out, item)
 	}
 	return out, rows.Err()
+}
+
+func (r *Repository) UpdatePlaylistSpotifyURL(ctx context.Context, playlistID, spotifyURL, updatedAt string) (PlaylistSummary, error) {
+	if err := r.ensurePlaylistSpotifyURLColumn(ctx); err != nil {
+		return PlaylistSummary{}, err
+	}
+	result, err := r.db.ExecContext(
+		ctx,
+		`UPDATE playlists SET spotify_url = NULLIF(?, ''), updated_at = ? WHERE id = ?`,
+		spotifyURL,
+		updatedAt,
+		playlistID,
+	)
+	if err != nil {
+		return PlaylistSummary{}, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return PlaylistSummary{}, err
+	}
+	if affected == 0 {
+		return PlaylistSummary{}, ErrPlaylistNotFound
+	}
+	playlists, err := r.ListPlaylists(ctx)
+	if err != nil {
+		return PlaylistSummary{}, err
+	}
+	for _, playlist := range playlists {
+		if playlist.ID == playlistID {
+			return playlist, nil
+		}
+	}
+	return PlaylistSummary{}, ErrPlaylistNotFound
 }
 
 func (r *Repository) GetPlaylistAnalysisStatus(ctx context.Context, playlistID string, analysisSignature string, configSignature string, scoringContractID string) (PlaylistAnalysisStatus, error) {

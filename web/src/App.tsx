@@ -789,7 +789,6 @@ export function App() {
                 localStorage.removeItem("cuemate.history");
               }}
             />
-            {spotifyPlaylistUrl ? <SpotifyPlaylistLink url={spotifyPlaylistUrl} compact /> : null}
             {import.meta.env.DEV && !isShowcase && selectedPlaylist ? (
               <DevSpotifyPlaylistEditor playlist={selectedPlaylist} value={spotifyPlaylistUrl} saving={spotifyPlaylistMutation.isPending} onSave={saveDevSpotifyPlaylistLink} />
             ) : null}

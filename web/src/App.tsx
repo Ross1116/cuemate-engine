@@ -42,6 +42,7 @@ import {
 
 const targets = ["maintain", "build", "reset", "jump", "contrast"];
 const DEV_SPOTIFY_PLAYLIST_LINKS_KEY = "cuemate.devSpotifyPlaylistLinks";
+const SPOTIFY_ALLOWED_HOSTS = new Set(["open.spotify.com"]);
 
 const targetDescriptions: Record<string, string> = {
   maintain: "Target mode: preserve the current energy and keep the handoff steady.",
@@ -98,7 +99,7 @@ function normalizedExternalUrl(value: unknown) {
   try {
     const url = new URL(raw);
     if (url.protocol !== "https:") return "";
-    if (!url.hostname.endsWith("spotify.com")) return "";
+    if (!SPOTIFY_ALLOWED_HOSTS.has(url.hostname.toLowerCase())) return "";
     return url.toString();
   } catch {
     return "";
